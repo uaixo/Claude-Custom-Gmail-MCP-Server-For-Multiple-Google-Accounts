@@ -1,6 +1,26 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { fileURLToPath } from "url";
+
+/**
+ * True when the module identified by `importMetaUrl` is the entry point Node was
+ * invoked with. Resolves symlinks on both sides, so it still works when launched
+ * via a bin shim (e.g. node_modules/.bin/...), where process.argv[1] is a
+ * symlink to the real module file. A plain path comparison would miss that case
+ * and the entry point would silently never run.
+ */
+export function isMainModule(importMetaUrl: string): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return (
+      fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(importMetaUrl))
+    );
+  } catch {
+    return false;
+  }
+}
 
 /** Maximum response size in characters before truncation. */
 export const CHARACTER_LIMIT = 25000;

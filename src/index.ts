@@ -10,8 +10,6 @@
  * Connect accounts with `npm run add-account` before starting the server.
  */
 
-import path from "path";
-import { fileURLToPath } from "url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -26,7 +24,11 @@ import {
   mapWithConcurrency,
   resolveAttachments,
 } from "./gmail.js";
-import { CHARACTER_LIMIT, THREAD_FETCH_CONCURRENCY } from "./constants.js";
+import {
+  CHARACTER_LIMIT,
+  isMainModule,
+  THREAD_FETCH_CONCURRENCY,
+} from "./constants.js";
 
 /**
  * Shared attachment schema. Each attachment provides exactly one of `path`
@@ -752,7 +754,7 @@ async function main(): Promise<void> {
 }
 
 // Only start the server when invoked directly (not when imported, e.g. by tests).
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     console.error("Server error:", error);
     process.exit(1);
