@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { google, gmail_v1 } from "googleapis";
 import { getAuthedClient, resolveAccount } from "./auth.js";
+import { MAX_MESSAGE_BYTES } from "./constants.js";
 
 /**
  * Map over items running at most `limit` operations concurrently, preserving
@@ -279,6 +280,26 @@ function makeBoundary(tag: string): string {
 }
 
 /**
+ * Join the assembled message lines, enforce Gmail's message-size limit, and
+ * base64url-encode for the API's `raw` field. Throws a clear error (rather than
+ * letting the API reject opaquely) when the message — body plus base64-encoded
+ * attachments — exceeds the limit.
+ */
+function finalizeMessage(lines: string[]): string {
+  const message = lines.join("\r\n");
+  const bytes = Buffer.byteLength(message, "utf-8");
+  if (bytes > MAX_MESSAGE_BYTES) {
+    const mb = (n: number) => (n / (1024 * 1024)).toFixed(1);
+    throw new Error(
+      `Message is ${mb(bytes)} MB, exceeding Gmail's ${mb(
+        MAX_MESSAGE_BYTES
+      )} MB limit. Reduce the size or number of attachments (note base64 encoding adds ~33%).`
+    );
+  }
+  return encodeBase64Url(message);
+}
+
+/**
  * Build a raw RFC 2822 message suitable for Gmail's `raw` field.
  *
  * Body can be plain text or HTML (`isHtml`). When attachments are present the
@@ -323,7 +344,7 @@ export function buildRawMessage(opts: {
       "",
       wrapBase64(Buffer.from(opts.body, "utf-8").toString("base64")),
     ];
-    return encodeBase64Url(lines.join("\r\n"));
+    return finalizeMessage(lines);
   }
 
   // Multipart/mixed: body part, then one part per attachment.
@@ -362,7 +383,7 @@ export function buildRawMessage(opts: {
     `--${boundary}--`,
     "",
   ];
-  return encodeBase64Url(lines.join("\r\n"));
+  return finalizeMessage(lines);
 }
 
 /** Format a Gmail API error into an actionable message. */
@@ -385,8 +406,10 @@ export function handleGmailError(error: unknown): string {
     case 429:
       return "Error: Rate limit exceeded. Wait before retrying.";
     default:
-      return `Error: Gmail API request failed${
-        status ? ` (status ${status})` : ""
-      }: ${detail}`;
+      // A status means it came from the Gmail API; without one it's a local
+      // error (e.g. attachment validation) and shouldn't claim an API failure.
+      return status
+        ? `Error: Gmail API request failed (status ${status}): ${detail}`
+        : `Error: ${detail}`;
   }
 }

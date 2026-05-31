@@ -12,6 +12,14 @@ export const CHARACTER_LIMIT = 25000;
  */
 export const THREAD_FETCH_CONCURRENCY = 5;
 
+/**
+ * Gmail's maximum message size (25 MB), applied to the full RFC 2822 message
+ * including base64-encoded attachments. We validate against this before calling
+ * the API so oversized messages fail with a clear, local error instead of an
+ * opaque API rejection.
+ */
+export const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
+
 /** Gmail OAuth scopes. Covers read, compose/send, and label management. */
 export const SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify", // read + labels + drafts
