@@ -26,6 +26,15 @@ export interface TokenStore {
   [email: string]: StoredAccount;
 }
 
+/**
+ * Cache of authenticated OAuth clients, one per account (keyed by lower-cased
+ * email). Sharing a single client across concurrent tool calls lets
+ * google-auth-library serialize token refreshes and ensures only one `tokens`
+ * listener performs the read-modify-write against the token store, avoiding
+ * lost updates.
+ */
+const authedClients = new Map<string, OAuth2Client>();
+
 interface OAuthClientConfig {
   client_id: string;
   client_secret: string;
@@ -66,13 +75,12 @@ export function loadClientConfig(file?: string): OAuthClientConfig {
 }
 
 /** Build a fresh OAuth2 client from a specific credential file. */
-export function newOAuthClient(file?: string): OAuth2Client {
+export function newOAuthClient(
+  file?: string,
+  redirectUri: string = OAUTH_REDIRECT_URI
+): OAuth2Client {
   const cfg = loadClientConfig(file);
-  return new google.auth.OAuth2(
-    cfg.client_id,
-    cfg.client_secret,
-    OAUTH_REDIRECT_URI
-  );
+  return new google.auth.OAuth2(cfg.client_id, cfg.client_secret, redirectUri);
 }
 
 /** Resolve a stored credentialsFile reference to an absolute path. */
@@ -125,13 +133,18 @@ export function saveTokens(store: TokenStore): void {
   const dir = dataDir();
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const file = tokensPath();
-  fs.writeFileSync(file, JSON.stringify(store, null, 2), { mode: 0o600 });
+  // Write to a temp file in the same directory, then atomically rename over the
+  // target. This prevents a concurrent reader (or a crash mid-write) from ever
+  // seeing a partial/corrupt token store.
+  const tmp = path.join(dir, `.tokens.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
   // Best-effort tighten permissions (no-op on platforms that ignore it).
   try {
-    fs.chmodSync(file, 0o600);
+    fs.chmodSync(tmp, 0o600);
   } catch {
     /* ignore */
   }
+  fs.renameSync(tmp, file);
 }
 
 /** Persist (or update) one account's tokens and credential-file reference. */
@@ -164,6 +177,7 @@ export function removeAccount(email: string): boolean {
   const key = email.toLowerCase();
   if (!(key in store)) return false;
   delete store[key];
+  authedClients.delete(key);
   saveTokens(store);
   return true;
 }
@@ -205,8 +219,11 @@ export function resolveAccount(requested?: string): string {
  * access tokens are persisted automatically.
  */
 export function getAuthedClient(account: string): OAuth2Client {
-  const store = loadTokens();
   const key = account.toLowerCase();
+  const cached = authedClients.get(key);
+  if (cached) return cached;
+
+  const store = loadTokens();
   const entry = store[key];
   if (!entry) {
     throw new Error(`No stored tokens for account '${account}'.`);
@@ -229,5 +246,6 @@ export function getAuthedClient(account: string): OAuth2Client {
       saveTokens(current);
     }
   });
+  authedClients.set(key, client);
   return client;
 }

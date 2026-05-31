@@ -21,9 +21,10 @@ import {
   gmailFor,
   handleGmailError,
   header,
+  mapWithConcurrency,
   resolveAttachments,
 } from "./gmail.js";
-import { CHARACTER_LIMIT } from "./constants.js";
+import { CHARACTER_LIMIT, THREAD_FETCH_CONCURRENCY } from "./constants.js";
 
 /**
  * Shared attachment schema. Each attachment provides exactly one of `path`
@@ -43,7 +44,7 @@ const attachmentSchema = z
       .string()
       .optional()
       .describe(
-        "Absolute or relative path to a local file on the machine running the server."
+        "Path to a local file on the machine running the server. Disabled unless the server sets GMAIL_MCP_ATTACHMENTS_DIR; the file must resolve to within an allowed directory. Otherwise use content_base64."
       ),
     content_base64: z
       .string()
@@ -77,6 +78,38 @@ function capText(text: string, note: string): string {
     text.slice(0, CHARACTER_LIMIT) +
     `\n\n[Truncated at ${CHARACTER_LIMIT} characters. ${note}]`
   );
+}
+
+/**
+ * Bound the combined size of message bodies so structuredContent (and its text
+ * rendering) can't balloon on a long thread. Bodies are kept in order until the
+ * budget is spent; the body that crosses the budget is truncated and any later
+ * bodies are omitted, each with a marker. Returns the trimmed messages and
+ * whether any truncation occurred.
+ */
+function capMessageBodies<T extends { body: string }>(
+  messages: T[],
+  budget: number
+): { messages: T[]; truncated: boolean } {
+  let remaining = budget;
+  let truncated = false;
+  const out = messages.map((m) => {
+    const body = m.body || "";
+    if (remaining <= 0) {
+      if (body) truncated = true;
+      return { ...m, body: body ? "[Body omitted: thread exceeds size limit]" : "" };
+    }
+    if (body.length > remaining) {
+      truncated = true;
+      const trimmed =
+        body.slice(0, remaining) + "\n[Body truncated: thread exceeds size limit]";
+      remaining = 0;
+      return { ...m, body: trimmed };
+    }
+    remaining -= body.length;
+    return m;
+  });
+  return { messages: out, truncated };
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +201,12 @@ Returns: JSON {
         maxResults: max_results,
       });
       const threads = list.data.threads || [];
-      // Fetch lightweight metadata for each thread's first message.
-      const detailed = await Promise.all(
-        threads.map(async (t) => {
+      // Fetch lightweight metadata for each thread's first message, bounding the
+      // fan-out so large result sets don't trip Gmail's rate limit.
+      const detailed = await mapWithConcurrency(
+        threads,
+        THREAD_FETCH_CONCURRENCY,
+        async (t) => {
           const full = await gmail.users.threads.get({
             userId: "me",
             id: t.id!,
@@ -185,7 +221,7 @@ Returns: JSON {
             date: header(first?.payload, "Date"),
             snippet: first?.snippet || t.snippet || "",
           };
-        })
+        }
       );
       const output = { account: acct, count: detailed.length, threads: detailed };
       const text =
@@ -239,7 +275,7 @@ Returns: JSON {
         id: thread_id,
         format: "full",
       });
-      const messages = (res.data.messages || []).map((m) => ({
+      const allMessages = (res.data.messages || []).map((m) => ({
         message_id: m.id!,
         from: header(m.payload, "From"),
         to: header(m.payload, "To"),
@@ -248,7 +284,14 @@ Returns: JSON {
         body: extractPlainText(m.payload),
         label_ids: m.labelIds || [],
       }));
-      const output = { account: acct, thread_id, messages };
+      // Bound the bodies so structuredContent stays within the size budget.
+      const { messages, truncated } = capMessageBodies(allMessages, CHARACTER_LIMIT);
+      const output = {
+        account: acct,
+        thread_id,
+        messages,
+        ...(truncated ? { truncated: true } : {}),
+      };
       const text = capText(
         JSON.stringify(output, null, 2),
         "Thread body was large; consider reading messages individually."

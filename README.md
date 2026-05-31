@@ -25,7 +25,7 @@ Every tool except `gmail_list_accounts` accepts `account: "you@gmail.com"`. If o
 
 - `is_html` (boolean): when true, `body` is sent as HTML instead of plain text.
 - `attachments` (array): each item supplies **exactly one** of:
-  - `path` — a local file the server reads from disk (filename and MIME type inferred if omitted), or
+  - `path` — a local file the server reads from disk (filename and MIME type inferred if omitted). **Disabled by default**: reading by `path` only works when you set `GMAIL_MCP_ATTACHMENTS_DIR` to one or more allowed directories, and the file must resolve to within one of them (symlinks and `../` are resolved before the check). This prevents the server from being coerced into emailing arbitrary local files such as SSH keys or `.env`.
   - `content_base64` — inline standard-base64 content (`filename` required; MIME type inferred from it if omitted).
 
   Optional `mime_type` overrides the inferred type on either form. With attachments, the message is assembled as `multipart/mixed`. Non-ASCII subjects and filenames are RFC 2047-encoded.
@@ -178,7 +178,7 @@ Restart Claude Desktop. Ask it to "list my connected Gmail accounts" to confirm.
 
 - **Scopes:** `gmail.modify` (read + labels + drafts), `gmail.send`, `gmail.compose`, `userinfo.email` (to identify the account). Drop `gmail.send` from `src/constants.ts` and re-consent if you want a send-disabled, draft-only setup.
 - **Body format:** send/draft take a single `body` plus an `is_html` flag (plain text by default). When `is_html` is true the message is `text/html`; there is no simultaneous plain-text + HTML alternative part.
-- **Attachments:** supplied per call via local `path` or inline `content_base64`. Inline base64 is impractical for large binaries the model can't see — prefer `path` for those. Gmail's total message size limit (~25 MB) applies.
+- **Attachments:** supplied per call via local `path` or inline `content_base64`. Reading by `path` is disabled unless `GMAIL_MCP_ATTACHMENTS_DIR` allowlists the directory it lives in (a guardrail against emailing arbitrary local files); inline base64 is impractical for large binaries the model can't see, so set the allowlist and use `path` for those. Gmail's total message size limit (~25 MB) applies.
 - **Local-only:** this runs over stdio on your machine; tokens never leave it. To expose it as a *remote* custom connector instead, swap the stdio transport for the streamable-HTTP transport, host it on the public internet over HTTPS, and add it in Claude under Settings → Connectors → Add custom connector.
 - **Token expiry:** access tokens refresh automatically. If a refresh token is revoked (password change, manual revocation, or long inactivity on an unverified app), re-run `npm run add-account` for that account.
 - **Multiple OAuth clients:** drop several `credentials*.json` files in the data dir; each account records which one authorized it and refreshes with that same client. Don't remove a credential file an account still depends on (the server returns an actionable error if it's missing). Legacy `tokens.json` files from before this feature are migrated automatically and assumed to use `credentials.json`.
@@ -189,3 +189,4 @@ Restart Claude Desktop. Ask it to "list my connected Gmail accounts" to confirm.
 | --- | --- | --- |
 | `GMAIL_MCP_DATA_DIR` | `~/.gmail-mcp` | Where tokens and `credentials*.json` files live |
 | `GMAIL_OAUTH_CREDENTIALS` | (unset) | Force a single OAuth client JSON path; disables `credentials*.json` auto-discovery |
+| `GMAIL_MCP_ATTACHMENTS_DIR` | (unset) | Allowlist of directories (separated by the platform path delimiter) that `path` attachments may be read from. Unset means `path` is disabled and only `content_base64` works |

@@ -5,6 +5,21 @@ import path from "path";
 /** Maximum response size in characters before truncation. */
 export const CHARACTER_LIMIT = 25000;
 
+/**
+ * Maximum number of per-thread metadata fetches to run concurrently when
+ * expanding search results. Bounds the fan-out so large result sets don't
+ * trip Gmail's per-user rate limit.
+ */
+export const THREAD_FETCH_CONCURRENCY = 5;
+
+/**
+ * Gmail's maximum message size (25 MB), applied to the full RFC 2822 message
+ * including base64-encoded attachments. We validate against this before calling
+ * the API so oversized messages fail with a clear, local error instead of an
+ * opaque API rejection.
+ */
+export const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
+
 /** Gmail OAuth scopes. Covers read, compose/send, and label management. */
 export const SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify", // read + labels + drafts
@@ -54,11 +69,39 @@ export function credentialsFiles(): string[] {
     .map((f) => path.join(dir, f));
 }
 
+/**
+ * Directories from which `path` attachments may be read, set via
+ * GMAIL_MCP_ATTACHMENTS_DIR (one or more, separated by the platform path
+ * delimiter). When unset, reading local files by path is disabled and callers
+ * must supply attachments inline as content_base64. This prevents the server
+ * from being coerced into emailing arbitrary local files (e.g. SSH keys, .env).
+ */
+export function attachmentDirs(): string[] {
+  const raw = process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+  if (!raw) return [];
+  return raw
+    .split(path.delimiter)
+    .map((d) => d.trim())
+    .filter(Boolean)
+    .map((d) => path.resolve(d));
+}
+
 /** Path to the token store keyed by account email. */
 export function tokensPath(): string {
   return path.join(dataDir(), "tokens.json");
 }
 
-/** Loopback port used during the OAuth consent flow. */
+/**
+ * Preferred loopback port for the OAuth consent flow. If it's busy, add-account
+ * falls back to an OS-assigned ephemeral port — Desktop-app OAuth clients accept
+ * any loopback port, so no extra Google config is needed.
+ */
 export const OAUTH_REDIRECT_PORT = 4773;
-export const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_REDIRECT_PORT}/oauth2callback`;
+
+/** Build the loopback redirect URI for a given port. */
+export function oauthRedirectUri(port: number = OAUTH_REDIRECT_PORT): string {
+  return `http://localhost:${port}/oauth2callback`;
+}
+
+/** Default redirect URI on the preferred port. */
+export const OAUTH_REDIRECT_URI = oauthRedirectUri();

@@ -2,6 +2,31 @@ import fs from "fs";
 import path from "path";
 import { google, gmail_v1 } from "googleapis";
 import { getAuthedClient, resolveAccount } from "./auth.js";
+import { attachmentDirs, MAX_MESSAGE_BYTES } from "./constants.js";
+
+/**
+ * Map over items running at most `limit` operations concurrently, preserving
+ * input order in the results. Used to fan out per-thread metadata fetches
+ * without issuing every request at once (which can trip rate limits).
+ */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) break;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 /** Build a Gmail API client for a resolved account. */
 export function gmailFor(account?: string): {
@@ -215,12 +240,38 @@ export function resolveAttachments(
     }
     if (hasPath) {
       const filePath = a.path!;
+      const allowedDirs = attachmentDirs();
+      if (allowedDirs.length === 0) {
+        throw new Error(
+          `Attachment ${i}: reading local files by 'path' is disabled. Set ` +
+            `GMAIL_MCP_ATTACHMENTS_DIR to one or more allowed directories, or ` +
+            `supply the file inline via 'content_base64'.`
+        );
+      }
       if (!fs.existsSync(filePath)) {
         throw new Error(`Attachment ${i}: file not found at '${filePath}'.`);
       }
+      // Resolve symlinks and "../" before checking containment so the file
+      // can't escape the allowed directories.
+      const resolved = fs.realpathSync(filePath);
+      const allowed = allowedDirs.some((dir) => {
+        let realDir: string;
+        try {
+          realDir = fs.realpathSync(dir);
+        } catch {
+          return false; // configured dir doesn't exist; it can't contain the file
+        }
+        return resolved === realDir || resolved.startsWith(realDir + path.sep);
+      });
+      if (!allowed) {
+        throw new Error(
+          `Attachment ${i}: '${filePath}' is outside the allowed attachment ` +
+            `directories (GMAIL_MCP_ATTACHMENTS_DIR). Refusing to read it.`
+        );
+      }
       const filename = a.filename || path.basename(filePath);
       const mimeType = a.mime_type || inferMimeType(filename);
-      const contentBase64 = fs.readFileSync(filePath).toString("base64");
+      const contentBase64 = fs.readFileSync(resolved).toString("base64");
       return { filename, mimeType, contentBase64 };
     }
     // Inline base64.
@@ -255,6 +306,26 @@ function makeBoundary(tag: string): string {
 }
 
 /**
+ * Join the assembled message lines, enforce Gmail's message-size limit, and
+ * base64url-encode for the API's `raw` field. Throws a clear error (rather than
+ * letting the API reject opaquely) when the message — body plus base64-encoded
+ * attachments — exceeds the limit.
+ */
+function finalizeMessage(lines: string[]): string {
+  const message = lines.join("\r\n");
+  const bytes = Buffer.byteLength(message, "utf-8");
+  if (bytes > MAX_MESSAGE_BYTES) {
+    const mb = (n: number) => (n / (1024 * 1024)).toFixed(1);
+    throw new Error(
+      `Message is ${mb(bytes)} MB, exceeding Gmail's ${mb(
+        MAX_MESSAGE_BYTES
+      )} MB limit. Reduce the size or number of attachments (note base64 encoding adds ~33%).`
+    );
+  }
+  return encodeBase64Url(message);
+}
+
+/**
  * Build a raw RFC 2822 message suitable for Gmail's `raw` field.
  *
  * Body can be plain text or HTML (`isHtml`). When attachments are present the
@@ -278,6 +349,8 @@ export function buildRawMessage(opts: {
   if (opts.from) headers.push(`From: ${opts.from}`);
   headers.push(`To: ${opts.to.join(", ")}`);
   if (opts.cc?.length) headers.push(`Cc: ${opts.cc.join(", ")}`);
+  // The Bcc header is how Gmail learns the blind recipients for a raw send; it
+  // strips the header before delivery, so it is not leaked to To/Cc. Keep it.
   if (opts.bcc?.length) headers.push(`Bcc: ${opts.bcc.join(", ")}`);
   headers.push(`Subject: ${encodeHeaderWord(opts.subject)}`);
   if (opts.inReplyTo) headers.push(`In-Reply-To: ${opts.inReplyTo}`);
@@ -299,7 +372,7 @@ export function buildRawMessage(opts: {
       "",
       wrapBase64(Buffer.from(opts.body, "utf-8").toString("base64")),
     ];
-    return encodeBase64Url(lines.join("\r\n"));
+    return finalizeMessage(lines);
   }
 
   // Multipart/mixed: body part, then one part per attachment.
@@ -338,7 +411,7 @@ export function buildRawMessage(opts: {
     `--${boundary}--`,
     "",
   ];
-  return encodeBase64Url(lines.join("\r\n"));
+  return finalizeMessage(lines);
 }
 
 /** Format a Gmail API error into an actionable message. */
@@ -361,8 +434,10 @@ export function handleGmailError(error: unknown): string {
     case 429:
       return "Error: Rate limit exceeded. Wait before retrying.";
     default:
-      return `Error: Gmail API request failed${
-        status ? ` (status ${status})` : ""
-      }: ${detail}`;
+      // A status means it came from the Gmail API; without one it's a local
+      // error (e.g. attachment validation) and shouldn't claim an API failure.
+      return status
+        ? `Error: Gmail API request failed (status ${status}): ${detail}`
+        : `Error: ${detail}`;
   }
 }
