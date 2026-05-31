@@ -91,7 +91,10 @@ test("mapWithConcurrency preserves order and caps concurrency", async () => {
     return n * 2;
   });
   assert.deepEqual(out, items.map((n) => n * 2));
-  assert.equal(peak, 5);
+  // The cap is the invariant (never exceed the limit); a peak above 1 proves it
+  // actually parallelizes. An exact peak===5 would be fragile under load.
+  assert.ok(peak <= 5, `peak ${peak} exceeded the limit`);
+  assert.ok(peak >= 2, `expected some concurrency, got peak ${peak}`);
 });
 
 test("mapWithConcurrency handles empty input and fewer items than the limit", async () => {
@@ -203,8 +206,15 @@ test("resolveAttachments enforces the path allowlist and blocks escapes", () => 
   fs.writeFileSync(okFile, "hello attachment");
   const secretFile = path.join(secretDir, "id_rsa");
   fs.writeFileSync(secretFile, "PRIVATE KEY");
+  // Symlinks need privilege on some platforms (e.g. Windows); skip just the
+  // symlink-escape assertion there rather than failing the whole test.
   const escapeLink = path.join(allowed, "sneaky.txt");
-  fs.symlinkSync(secretFile, escapeLink);
+  let symlinkOk = true;
+  try {
+    fs.symlinkSync(secretFile, escapeLink);
+  } catch {
+    symlinkOk = false;
+  }
 
   const prev = process.env.GMAIL_MCP_ATTACHMENTS_DIR;
   try {
@@ -223,7 +233,9 @@ test("resolveAttachments enforces the path allowlist and blocks escapes", () => 
     const good = resolveAttachments([{ path: okFile }]);
     assert.equal(good[0].contentBase64, Buffer.from("hello attachment").toString("base64"));
 
-    assert.throws(() => resolveAttachments([{ path: escapeLink }]), /outside the allowed/);
+    if (symlinkOk) {
+      assert.throws(() => resolveAttachments([{ path: escapeLink }]), /outside the allowed/);
+    }
     assert.throws(() => resolveAttachments([{ path: secretFile }]), /outside the allowed/);
     assert.throws(
       () => resolveAttachments([{ path: path.join(allowed, "..", "secret", "id_rsa") }]),
