@@ -91,6 +91,17 @@ export function tokensPath(): string {
   return path.join(dataDir(), "tokens.json");
 }
 
-/** Loopback port used during the OAuth consent flow. */
+/**
+ * Preferred loopback port for the OAuth consent flow. If it's busy, add-account
+ * falls back to an OS-assigned ephemeral port — Desktop-app OAuth clients accept
+ * any loopback port, so no extra Google config is needed.
+ */
 export const OAUTH_REDIRECT_PORT = 4773;
-export const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_REDIRECT_PORT}/oauth2callback`;
+
+/** Build the loopback redirect URI for a given port. */
+export function oauthRedirectUri(port: number = OAUTH_REDIRECT_PORT): string {
+  return `http://localhost:${port}/oauth2callback`;
+}
+
+/** Default redirect URI on the preferred port. */
+export const OAUTH_REDIRECT_URI = oauthRedirectUri();

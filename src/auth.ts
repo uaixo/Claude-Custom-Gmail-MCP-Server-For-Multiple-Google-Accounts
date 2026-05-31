@@ -75,13 +75,12 @@ export function loadClientConfig(file?: string): OAuthClientConfig {
 }
 
 /** Build a fresh OAuth2 client from a specific credential file. */
-export function newOAuthClient(file?: string): OAuth2Client {
+export function newOAuthClient(
+  file?: string,
+  redirectUri: string = OAUTH_REDIRECT_URI
+): OAuth2Client {
   const cfg = loadClientConfig(file);
-  return new google.auth.OAuth2(
-    cfg.client_id,
-    cfg.client_secret,
-    OAUTH_REDIRECT_URI
-  );
+  return new google.auth.OAuth2(cfg.client_id, cfg.client_secret, redirectUri);
 }
 
 /** Resolve a stored credentialsFile reference to an absolute path. */

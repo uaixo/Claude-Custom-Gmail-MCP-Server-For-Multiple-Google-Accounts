@@ -349,6 +349,8 @@ export function buildRawMessage(opts: {
   if (opts.from) headers.push(`From: ${opts.from}`);
   headers.push(`To: ${opts.to.join(", ")}`);
   if (opts.cc?.length) headers.push(`Cc: ${opts.cc.join(", ")}`);
+  // The Bcc header is how Gmail learns the blind recipients for a raw send; it
+  // strips the header before delivery, so it is not leaked to To/Cc. Keep it.
   if (opts.bcc?.length) headers.push(`Bcc: ${opts.bcc.join(", ")}`);
   headers.push(`Subject: ${encodeHeaderWord(opts.subject)}`);
   if (opts.inReplyTo) headers.push(`In-Reply-To: ${opts.inReplyTo}`);
