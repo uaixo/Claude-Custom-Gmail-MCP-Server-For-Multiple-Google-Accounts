@@ -9,3 +9,6 @@ tokens.json
 .gmail-mcp/
 *.pem
 .env
+
+# Local-only Claude Code project memory (private, never shared)
+CLAUDE.local.md
