@@ -69,6 +69,23 @@ export function credentialsFiles(): string[] {
     .map((f) => path.join(dir, f));
 }
 
+/**
+ * Directories from which `path` attachments may be read, set via
+ * GMAIL_MCP_ATTACHMENTS_DIR (one or more, separated by the platform path
+ * delimiter). When unset, reading local files by path is disabled and callers
+ * must supply attachments inline as content_base64. This prevents the server
+ * from being coerced into emailing arbitrary local files (e.g. SSH keys, .env).
+ */
+export function attachmentDirs(): string[] {
+  const raw = process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+  if (!raw) return [];
+  return raw
+    .split(path.delimiter)
+    .map((d) => d.trim())
+    .filter(Boolean)
+    .map((d) => path.resolve(d));
+}
+
 /** Path to the token store keyed by account email. */
 export function tokensPath(): string {
   return path.join(dataDir(), "tokens.json");

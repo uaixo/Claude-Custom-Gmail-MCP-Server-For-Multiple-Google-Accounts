@@ -44,7 +44,7 @@ const attachmentSchema = z
       .string()
       .optional()
       .describe(
-        "Absolute or relative path to a local file on the machine running the server."
+        "Path to a local file on the machine running the server. Disabled unless the server sets GMAIL_MCP_ATTACHMENTS_DIR; the file must resolve to within an allowed directory. Otherwise use content_base64."
       ),
     content_base64: z
       .string()

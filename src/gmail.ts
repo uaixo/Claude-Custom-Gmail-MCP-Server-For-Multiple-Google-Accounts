@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { google, gmail_v1 } from "googleapis";
 import { getAuthedClient, resolveAccount } from "./auth.js";
-import { MAX_MESSAGE_BYTES } from "./constants.js";
+import { attachmentDirs, MAX_MESSAGE_BYTES } from "./constants.js";
 
 /**
  * Map over items running at most `limit` operations concurrently, preserving
@@ -240,12 +240,38 @@ export function resolveAttachments(
     }
     if (hasPath) {
       const filePath = a.path!;
+      const allowedDirs = attachmentDirs();
+      if (allowedDirs.length === 0) {
+        throw new Error(
+          `Attachment ${i}: reading local files by 'path' is disabled. Set ` +
+            `GMAIL_MCP_ATTACHMENTS_DIR to one or more allowed directories, or ` +
+            `supply the file inline via 'content_base64'.`
+        );
+      }
       if (!fs.existsSync(filePath)) {
         throw new Error(`Attachment ${i}: file not found at '${filePath}'.`);
       }
+      // Resolve symlinks and "../" before checking containment so the file
+      // can't escape the allowed directories.
+      const resolved = fs.realpathSync(filePath);
+      const allowed = allowedDirs.some((dir) => {
+        let realDir: string;
+        try {
+          realDir = fs.realpathSync(dir);
+        } catch {
+          return false; // configured dir doesn't exist; it can't contain the file
+        }
+        return resolved === realDir || resolved.startsWith(realDir + path.sep);
+      });
+      if (!allowed) {
+        throw new Error(
+          `Attachment ${i}: '${filePath}' is outside the allowed attachment ` +
+            `directories (GMAIL_MCP_ATTACHMENTS_DIR). Refusing to read it.`
+        );
+      }
       const filename = a.filename || path.basename(filePath);
       const mimeType = a.mime_type || inferMimeType(filename);
-      const contentBase64 = fs.readFileSync(filePath).toString("base64");
+      const contentBase64 = fs.readFileSync(resolved).toString("base64");
       return { filename, mimeType, contentBase64 };
     }
     // Inline base64.
