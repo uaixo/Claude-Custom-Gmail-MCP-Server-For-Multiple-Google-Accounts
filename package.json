@@ -1,0 +1,35 @@
+{
+  "name": "gmail-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for Gmail with multi-account support (per-account OAuth)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "gmail-mcp-server": "dist/index.js",
+    "gmail-mcp-add-account": "dist/add-account.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "add-account": "node dist/add-account.js",
+    "list-accounts": "node dist/add-account.js --list",
+    "remove-account": "node dist/add-account.js --remove",
+    "dev": "tsx watch src/index.ts",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "google-auth-library": "^9.15.0",
+    "googleapis": "^144.0.0",
+    "open": "^10.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
