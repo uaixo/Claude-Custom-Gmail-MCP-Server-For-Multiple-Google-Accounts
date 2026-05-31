@@ -3,6 +3,30 @@ import path from "path";
 import { google, gmail_v1 } from "googleapis";
 import { getAuthedClient, resolveAccount } from "./auth.js";
 
+/**
+ * Map over items running at most `limit` operations concurrently, preserving
+ * input order in the results. Used to fan out per-thread metadata fetches
+ * without issuing every request at once (which can trip rate limits).
+ */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) break;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 /** Build a Gmail API client for a resolved account. */
 export function gmailFor(account?: string): {
   gmail: gmail_v1.Gmail;

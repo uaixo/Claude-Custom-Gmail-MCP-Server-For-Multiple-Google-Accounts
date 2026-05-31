@@ -5,6 +5,13 @@ import path from "path";
 /** Maximum response size in characters before truncation. */
 export const CHARACTER_LIMIT = 25000;
 
+/**
+ * Maximum number of per-thread metadata fetches to run concurrently when
+ * expanding search results. Bounds the fan-out so large result sets don't
+ * trip Gmail's per-user rate limit.
+ */
+export const THREAD_FETCH_CONCURRENCY = 5;
+
 /** Gmail OAuth scopes. Covers read, compose/send, and label management. */
 export const SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify", // read + labels + drafts

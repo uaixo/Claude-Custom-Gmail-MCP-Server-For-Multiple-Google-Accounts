@@ -21,9 +21,10 @@ import {
   gmailFor,
   handleGmailError,
   header,
+  mapWithConcurrency,
   resolveAttachments,
 } from "./gmail.js";
-import { CHARACTER_LIMIT } from "./constants.js";
+import { CHARACTER_LIMIT, THREAD_FETCH_CONCURRENCY } from "./constants.js";
 
 /**
  * Shared attachment schema. Each attachment provides exactly one of `path`
@@ -168,9 +169,12 @@ Returns: JSON {
         maxResults: max_results,
       });
       const threads = list.data.threads || [];
-      // Fetch lightweight metadata for each thread's first message.
-      const detailed = await Promise.all(
-        threads.map(async (t) => {
+      // Fetch lightweight metadata for each thread's first message, bounding the
+      // fan-out so large result sets don't trip Gmail's rate limit.
+      const detailed = await mapWithConcurrency(
+        threads,
+        THREAD_FETCH_CONCURRENCY,
+        async (t) => {
           const full = await gmail.users.threads.get({
             userId: "me",
             id: t.id!,
@@ -185,7 +189,7 @@ Returns: JSON {
             date: header(first?.payload, "Date"),
             snippet: first?.snippet || t.snippet || "",
           };
-        })
+        }
       );
       const output = { account: acct, count: detailed.length, threads: detailed };
       const text =
