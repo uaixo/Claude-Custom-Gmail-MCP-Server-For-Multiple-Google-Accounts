@@ -15,10 +15,9 @@
  */
 
 import http from "http";
-import path from "path";
 import readline from "readline";
 import { AddressInfo } from "net";
-import { URL, fileURLToPath } from "url";
+import { URL } from "url";
 import { google } from "googleapis";
 import open from "open";
 import {
@@ -34,6 +33,7 @@ import {
   OAUTH_REDIRECT_PORT,
   SCOPES,
   credentialsFiles,
+  isMainModule,
   oauthRedirectUri,
 } from "./constants.js";
 
@@ -214,7 +214,7 @@ async function main(): Promise<void> {
 }
 
 // Only run the CLI when invoked directly (not when imported, e.g. by tests).
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     console.error("Error:", error instanceof Error ? error.message : error);
     process.exit(1);

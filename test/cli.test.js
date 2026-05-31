@@ -11,6 +11,15 @@ import {
 } from "../dist/constants.js";
 
 const close = (s) => new Promise((r) => s.close(r));
+const listen = (s, port) => new Promise((r) => s.listen(port, r));
+// Bind an ephemeral port, read it, release it — a port we know was free.
+const aFreePort = async () => {
+  const s = http.createServer();
+  await listen(s, 0);
+  const { port } = s.address();
+  await close(s);
+  return port;
+};
 
 // --------------------------------------------------------------------------
 // oauthRedirectUri / attachmentDirs  (config helpers)
@@ -38,10 +47,12 @@ test("attachmentDirs is empty when unset and splits the env var on the path deli
 // listenWithFallback  (OAuth port nit)
 // --------------------------------------------------------------------------
 test("listenWithFallback binds the preferred port when it is free", async () => {
+  // Use a port we just confirmed free, rather than assuming 4773 is available.
+  const free = await aFreePort();
   const s = http.createServer();
   try {
-    const port = await listenWithFallback(s, OAUTH_REDIRECT_PORT);
-    assert.equal(port, OAUTH_REDIRECT_PORT);
+    const port = await listenWithFallback(s, free);
+    assert.equal(port, free);
     assert.equal(s.listening, true);
   } finally {
     await close(s);
@@ -52,11 +63,12 @@ test("listenWithFallback falls back to an ephemeral port when the preferred one 
   const holder = http.createServer();
   const fallback = http.createServer();
   try {
-    const held = await listenWithFallback(holder, OAUTH_REDIRECT_PORT);
-    assert.equal(held, OAUTH_REDIRECT_PORT);
+    // Occupy a port, then ask listenWithFallback to prefer that same busy port.
+    await listen(holder, 0);
+    const busy = holder.address().port;
 
-    const port = await listenWithFallback(fallback, OAUTH_REDIRECT_PORT);
-    assert.notEqual(port, OAUTH_REDIRECT_PORT);
+    const port = await listenWithFallback(fallback, busy);
+    assert.notEqual(port, busy);
     assert.ok(port > 0);
     assert.equal(fallback.listening, true);
   } finally {

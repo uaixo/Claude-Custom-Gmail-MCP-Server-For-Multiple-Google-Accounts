@@ -10,14 +10,14 @@
  * Connect accounts with `npm run add-account` before starting the server.
  */
 
-import path from "path";
-import { fileURLToPath } from "url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { listAccounts } from "./auth.js";
 import {
   buildRawMessage,
+  capMessageBodies,
+  capText,
   extractPlainText,
   getThreadReplyHeaders,
   gmailFor,
@@ -26,7 +26,11 @@ import {
   mapWithConcurrency,
   resolveAttachments,
 } from "./gmail.js";
-import { CHARACTER_LIMIT, THREAD_FETCH_CONCURRENCY } from "./constants.js";
+import {
+  CHARACTER_LIMIT,
+  isMainModule,
+  THREAD_FETCH_CONCURRENCY,
+} from "./constants.js";
 
 /**
  * Shared attachment schema. Each attachment provides exactly one of `path`
@@ -72,47 +76,6 @@ const accountField = z
   .describe(
     "Email address of the connected Gmail account to use. Optional when only one account is connected; required to disambiguate when several are."
   );
-
-/** Truncate an oversized text payload with a clear note. */
-function capText(text: string, note: string): string {
-  if (text.length <= CHARACTER_LIMIT) return text;
-  return (
-    text.slice(0, CHARACTER_LIMIT) +
-    `\n\n[Truncated at ${CHARACTER_LIMIT} characters. ${note}]`
-  );
-}
-
-/**
- * Bound the combined size of message bodies so structuredContent (and its text
- * rendering) can't balloon on a long thread. Bodies are kept in order until the
- * budget is spent; the body that crosses the budget is truncated and any later
- * bodies are omitted, each with a marker. Returns the trimmed messages and
- * whether any truncation occurred.
- */
-export function capMessageBodies<T extends { body: string }>(
-  messages: T[],
-  budget: number
-): { messages: T[]; truncated: boolean } {
-  let remaining = budget;
-  let truncated = false;
-  const out = messages.map((m) => {
-    const body = m.body || "";
-    if (remaining <= 0) {
-      if (body) truncated = true;
-      return { ...m, body: body ? "[Body omitted: thread exceeds size limit]" : "" };
-    }
-    if (body.length > remaining) {
-      truncated = true;
-      const trimmed =
-        body.slice(0, remaining) + "\n[Body truncated: thread exceeds size limit]";
-      remaining = 0;
-      return { ...m, body: trimmed };
-    }
-    remaining -= body.length;
-    return m;
-  });
-  return { messages: out, truncated };
-}
 
 // ---------------------------------------------------------------------------
 // gmail_list_accounts
@@ -752,7 +715,7 @@ async function main(): Promise<void> {
 }
 
 // Only start the server when invoked directly (not when imported, e.g. by tests).
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     console.error("Server error:", error);
     process.exit(1);

@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { google, gmail_v1 } from "googleapis";
 import { getAuthedClient, resolveAccount } from "./auth.js";
-import { attachmentDirs, MAX_MESSAGE_BYTES } from "./constants.js";
+import { attachmentDirs, CHARACTER_LIMIT, MAX_MESSAGE_BYTES } from "./constants.js";
 
 /**
  * Map over items running at most `limit` operations concurrently, preserving
@@ -440,4 +440,45 @@ export function handleGmailError(error: unknown): string {
         ? `Error: Gmail API request failed (status ${status}): ${detail}`
         : `Error: ${detail}`;
   }
+}
+
+/** Truncate an oversized text payload with a clear note. */
+export function capText(text: string, note: string): string {
+  if (text.length <= CHARACTER_LIMIT) return text;
+  return (
+    text.slice(0, CHARACTER_LIMIT) +
+    `\n\n[Truncated at ${CHARACTER_LIMIT} characters. ${note}]`
+  );
+}
+
+/**
+ * Bound the combined size of message bodies so structuredContent (and its text
+ * rendering) can't balloon on a long thread. Bodies are kept in order until the
+ * budget is spent; the body that crosses the budget is truncated and any later
+ * bodies are omitted, each with a marker. Returns the trimmed messages and
+ * whether any truncation occurred.
+ */
+export function capMessageBodies<T extends { body: string }>(
+  messages: T[],
+  budget: number
+): { messages: T[]; truncated: boolean } {
+  let remaining = budget;
+  let truncated = false;
+  const out = messages.map((m) => {
+    const body = m.body || "";
+    if (remaining <= 0) {
+      if (body) truncated = true;
+      return { ...m, body: body ? "[Body omitted: thread exceeds size limit]" : "" };
+    }
+    if (body.length > remaining) {
+      truncated = true;
+      const trimmed =
+        body.slice(0, remaining) + "\n[Body truncated: thread exceeds size limit]";
+      remaining = 0;
+      return { ...m, body: trimmed };
+    }
+    remaining -= body.length;
+    return m;
+  });
+  return { messages: out, truncated };
 }
