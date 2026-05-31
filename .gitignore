@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+
+# Local secrets / tokens — NEVER commit these
+credentials*.json
+client_secret*.json
+tokens.json
+.gmail-mcp/
+*.pem
+.env
