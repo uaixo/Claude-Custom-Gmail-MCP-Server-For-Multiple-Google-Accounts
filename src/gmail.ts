@@ -36,25 +36,72 @@ export function header(
   return found?.value || "";
 }
 
-/** Recursively collect the plain-text body from a message payload. */
+/** Recursively return the first part body matching an exact MIME type. */
+function findPartBody(
+  payload: gmail_v1.Schema$MessagePart | undefined,
+  mimeType: string
+): string {
+  if (!payload) return "";
+  if (payload.mimeType === mimeType && payload.body?.data) {
+    return decodeBase64Url(payload.body.data);
+  }
+  for (const part of payload.parts || []) {
+    const found = findPartBody(part, mimeType);
+    if (found) return found;
+  }
+  return "";
+}
+
+/** Decode the handful of HTML entities that commonly appear in email bodies. */
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;|&apos;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
+      String.fromCodePoint(parseInt(hex, 16))
+    )
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
+}
+
+/**
+ * Strip an HTML email body down to readable plain text. Drops style/script
+ * blocks, turns block-level closes and <br> into newlines, removes remaining
+ * tags, decodes common entities, and collapses excess blank lines. This is a
+ * best-effort fallback for messages with no text/plain part — not a full
+ * HTML-to-text renderer.
+ */
+export function htmlToText(html: string): string {
+  return decodeHtmlEntities(
+    html
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(p|div|h[1-6]|li|tr|table|blockquote)>/gi, "\n")
+      .replace(/<[^>]+>/g, "")
+  )
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Extract a readable plain-text body from a message payload. Prefers a
+ * text/plain part anywhere in the MIME tree; if none exists, falls back to the
+ * first text/html part stripped to text via htmlToText. Returns "" when no
+ * textual body is found.
+ */
 export function extractPlainText(
   payload: gmail_v1.Schema$MessagePart | undefined
 ): string {
   if (!payload) return "";
-  if (payload.mimeType === "text/plain" && payload.body?.data) {
-    return decodeBase64Url(payload.body.data);
-  }
-  if (payload.parts) {
-    // Prefer text/plain parts; fall back to recursing into everything.
-    const text = payload.parts
-      .map((p) => extractPlainText(p))
-      .filter(Boolean)
-      .join("\n");
-    if (text) return text;
-  }
-  if (payload.body?.data && payload.mimeType?.startsWith("text/")) {
-    return decodeBase64Url(payload.body.data);
-  }
+  const plain = findPartBody(payload, "text/plain");
+  if (plain) return plain;
+  const html = findPartBody(payload, "text/html");
+  if (html) return htmlToText(html);
   return "";
 }
 
