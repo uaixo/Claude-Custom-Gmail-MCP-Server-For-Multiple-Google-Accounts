@@ -10,6 +10,8 @@
  * Connect accounts with `npm run add-account` before starting the server.
  */
 
+import path from "path";
+import { fileURLToPath } from "url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -87,7 +89,7 @@ function capText(text: string, note: string): string {
  * bodies are omitted, each with a marker. Returns the trimmed messages and
  * whether any truncation occurred.
  */
-function capMessageBodies<T extends { body: string }>(
+export function capMessageBodies<T extends { body: string }>(
   messages: T[],
   budget: number
 ): { messages: T[]; truncated: boolean } {
@@ -749,7 +751,10 @@ async function main(): Promise<void> {
   );
 }
 
-main().catch((error) => {
-  console.error("Server error:", error);
-  process.exit(1);
-});
+// Only start the server when invoked directly (not when imported, e.g. by tests).
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error("Server error:", error);
+    process.exit(1);
+  });
+}

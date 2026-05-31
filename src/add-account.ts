@@ -41,7 +41,7 @@ import {
  * Listen on the preferred port, falling back to an OS-assigned ephemeral port
  * if it's already in use. Resolves with the port actually bound.
  */
-function listenWithFallback(
+export function listenWithFallback(
   server: http.Server,
   preferredPort: number
 ): Promise<number> {

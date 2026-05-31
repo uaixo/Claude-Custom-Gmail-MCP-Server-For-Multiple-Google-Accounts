@@ -15,7 +15,9 @@
     "list-accounts": "node dist/add-account.js --list",
     "remove-account": "node dist/add-account.js --remove",
     "dev": "tsx watch src/index.ts",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "pretest": "npm run build",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18"
