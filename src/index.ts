@@ -80,6 +80,38 @@ function capText(text: string, note: string): string {
   );
 }
 
+/**
+ * Bound the combined size of message bodies so structuredContent (and its text
+ * rendering) can't balloon on a long thread. Bodies are kept in order until the
+ * budget is spent; the body that crosses the budget is truncated and any later
+ * bodies are omitted, each with a marker. Returns the trimmed messages and
+ * whether any truncation occurred.
+ */
+function capMessageBodies<T extends { body: string }>(
+  messages: T[],
+  budget: number
+): { messages: T[]; truncated: boolean } {
+  let remaining = budget;
+  let truncated = false;
+  const out = messages.map((m) => {
+    const body = m.body || "";
+    if (remaining <= 0) {
+      if (body) truncated = true;
+      return { ...m, body: body ? "[Body omitted: thread exceeds size limit]" : "" };
+    }
+    if (body.length > remaining) {
+      truncated = true;
+      const trimmed =
+        body.slice(0, remaining) + "\n[Body truncated: thread exceeds size limit]";
+      remaining = 0;
+      return { ...m, body: trimmed };
+    }
+    remaining -= body.length;
+    return m;
+  });
+  return { messages: out, truncated };
+}
+
 // ---------------------------------------------------------------------------
 // gmail_list_accounts
 // ---------------------------------------------------------------------------
@@ -243,7 +275,7 @@ Returns: JSON {
         id: thread_id,
         format: "full",
       });
-      const messages = (res.data.messages || []).map((m) => ({
+      const allMessages = (res.data.messages || []).map((m) => ({
         message_id: m.id!,
         from: header(m.payload, "From"),
         to: header(m.payload, "To"),
@@ -252,7 +284,14 @@ Returns: JSON {
         body: extractPlainText(m.payload),
         label_ids: m.labelIds || [],
       }));
-      const output = { account: acct, thread_id, messages };
+      // Bound the bodies so structuredContent stays within the size budget.
+      const { messages, truncated } = capMessageBodies(allMessages, CHARACTER_LIMIT);
+      const output = {
+        account: acct,
+        thread_id,
+        messages,
+        ...(truncated ? { truncated: true } : {}),
+      };
       const text = capText(
         JSON.stringify(output, null, 2),
         "Thread body was large; consider reading messages individually."
