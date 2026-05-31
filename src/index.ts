@@ -193,7 +193,10 @@ Returns: JSON {
           : capText(JSON.stringify(output, null, 2), "Refine your query.");
       return { content: [{ type: "text", text }], structuredContent: output };
     } catch (error) {
-      return { content: [{ type: "text", text: handleGmailError(error) }] };
+      return {
+        content: [{ type: "text", text: handleGmailError(error) }],
+        isError: true,
+      };
     }
   }
 );
@@ -251,7 +254,10 @@ Returns: JSON {
       );
       return { content: [{ type: "text", text }], structuredContent: output };
     } catch (error) {
-      return { content: [{ type: "text", text: handleGmailError(error) }] };
+      return {
+        content: [{ type: "text", text: handleGmailError(error) }],
+        isError: true,
+      };
     }
   }
 );
@@ -342,7 +348,10 @@ Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
         structuredContent: output,
       };
     } catch (error) {
-      return { content: [{ type: "text", text: handleGmailError(error) }] };
+      return {
+        content: [{ type: "text", text: handleGmailError(error) }],
+        isError: true,
+      };
     }
   }
 );
@@ -447,7 +456,10 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
         structuredContent: output,
       };
     } catch (error) {
-      return { content: [{ type: "text", text: handleGmailError(error) }] };
+      return {
+        content: [{ type: "text", text: handleGmailError(error) }],
+        isError: true,
+      };
     }
   }
 );
@@ -490,7 +502,10 @@ Returns: JSON { "account": string, "labels": [ { "id": string, "name": string, "
         structuredContent: output,
       };
     } catch (error) {
-      return { content: [{ type: "text", text: handleGmailError(error) }] };
+      return {
+        content: [{ type: "text", text: handleGmailError(error) }],
+        isError: true,
+      };
     }
   }
 );
@@ -542,7 +557,10 @@ Returns: JSON { "account": string, "id": string, "name": string }`,
         structuredContent: output,
       };
     } catch (error) {
-      return { content: [{ type: "text", text: handleGmailError(error) }] };
+      return {
+        content: [{ type: "text", text: handleGmailError(error) }],
+        isError: true,
+      };
     }
   }
 );
@@ -596,6 +614,7 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
               text: "Error: provide exactly one of thread_id or message_id.",
             },
           ],
+          isError: true,
         };
       }
       if (!add_label_ids?.length && !remove_label_ids?.length) {
@@ -606,6 +625,7 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
               text: "Error: provide at least one of add_label_ids or remove_label_ids.",
             },
           ],
+          isError: true,
         };
       }
       const { gmail, account: acct } = gmailFor(account);
@@ -648,7 +668,10 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
         structuredContent: output,
       };
     } catch (error) {
-      return { content: [{ type: "text", text: handleGmailError(error) }] };
+      return {
+        content: [{ type: "text", text: handleGmailError(error) }],
+        isError: true,
+      };
     }
   }
 );
