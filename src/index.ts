@@ -17,6 +17,7 @@ import { listAccounts } from "./auth.js";
 import {
   buildRawMessage,
   extractPlainText,
+  getThreadReplyHeaders,
   gmailFor,
   handleGmailError,
   header,
@@ -317,6 +318,11 @@ Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
     try {
       const { gmail, account: acct } = gmailFor(account);
       const resolvedAttachments = resolveAttachments(attachments);
+      // When drafting into a thread, derive threading headers from it so Gmail
+      // associates the draft as a reply.
+      const reply = thread_id
+        ? await getThreadReplyHeaders(gmail, thread_id)
+        : undefined;
       const raw = buildRawMessage({
         from: acct,
         to,
@@ -326,6 +332,8 @@ Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
         body,
         isHtml: is_html,
         attachments: resolvedAttachments,
+        inReplyTo: reply?.inReplyTo,
+        references: reply?.references,
       });
       const res = await gmail.users.drafts.create({
         userId: "me",
@@ -425,6 +433,14 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
     try {
       const { gmail, account: acct } = gmailFor(account);
       const resolvedAttachments = resolveAttachments(attachments);
+      // When sending into a thread, derive threading headers from it. An
+      // explicit in_reply_to still wins for In-Reply-To; the References chain
+      // comes from the thread when available so Gmail keeps the conversation.
+      const reply = thread_id
+        ? await getThreadReplyHeaders(gmail, thread_id)
+        : undefined;
+      const inReplyTo = in_reply_to || reply?.inReplyTo;
+      const references = reply?.references || in_reply_to;
       const raw = buildRawMessage({
         from: acct,
         to,
@@ -434,8 +450,8 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
         body,
         isHtml: is_html,
         attachments: resolvedAttachments,
-        inReplyTo: in_reply_to,
-        references: in_reply_to,
+        inReplyTo,
+        references,
       });
       const res = await gmail.users.messages.send({
         userId: "me",

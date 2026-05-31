@@ -36,6 +36,44 @@ export function header(
   return found?.value || "";
 }
 
+/**
+ * Threading headers for replying into an existing thread, derived from its
+ * last message: the Message-ID to use as In-Reply-To, the accumulated
+ * References chain, and the thread's subject. Fields are empty strings when the
+ * corresponding header can't be read.
+ */
+export interface ThreadReplyHeaders {
+  inReplyTo: string;
+  references: string;
+  subject: string;
+}
+
+/**
+ * Fetch the headers needed to reply within an existing thread. Gmail only
+ * threads a sent/drafted message when it references the thread via
+ * In-Reply-To/References (or a matching Subject), so callers that pass a
+ * thread_id must supply these. We reference the thread's most recent message
+ * and append it to that message's existing References chain.
+ */
+export async function getThreadReplyHeaders(
+  gmail: gmail_v1.Gmail,
+  threadId: string
+): Promise<ThreadReplyHeaders> {
+  const res = await gmail.users.threads.get({
+    userId: "me",
+    id: threadId,
+    format: "metadata",
+    metadataHeaders: ["Message-ID", "References", "Subject"],
+  });
+  const messages = res.data.messages || [];
+  const last = messages[messages.length - 1];
+  const messageId = header(last?.payload, "Message-ID");
+  const priorReferences = header(last?.payload, "References");
+  const subject = header(messages[0]?.payload, "Subject");
+  const references = [priorReferences, messageId].filter(Boolean).join(" ");
+  return { inReplyTo: messageId, references, subject };
+}
+
 /** Recursively return the first part body matching an exact MIME type. */
 function findPartBody(
   payload: gmail_v1.Schema$MessagePart | undefined,
