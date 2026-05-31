@@ -13,6 +13,7 @@ import {
   handleGmailError,
   resolveAttachments,
   decodeBase64Url,
+  capMessageBodies,
 } from "../dist/gmail.js";
 
 const b64url = (s) => Buffer.from(s, "utf-8").toString("base64url");
@@ -241,4 +242,47 @@ test("resolveAttachments requires exactly one of path or content_base64", () => 
     () => resolveAttachments([{ path: "/x", content_base64: "QQ==" }]),
     /exactly one of 'path' or 'content_base64'/
   );
+});
+
+// --------------------------------------------------------------------------
+// capMessageBodies  (review item #7)
+// --------------------------------------------------------------------------
+test("capMessageBodies keeps bodies that fit within the budget", () => {
+  const r = capMessageBodies([{ body: "aaa" }, { body: "bbb" }], 100);
+  assert.equal(r.truncated, false);
+  assert.equal(r.messages[0].body, "aaa");
+  assert.equal(r.messages[1].body, "bbb");
+});
+
+test("capMessageBodies truncates the crossing body and omits later ones", () => {
+  const big = [{ body: "x".repeat(30) }, { body: "y".repeat(30) }, { body: "z".repeat(30) }];
+  const r = capMessageBodies(big, 20);
+  assert.equal(r.truncated, true);
+  assert.ok(r.messages[0].body.startsWith("x".repeat(20)));
+  assert.match(r.messages[0].body, /truncated/);
+  assert.match(r.messages[1].body, /omitted/);
+  // First body is the 20-char budget plus a single marker line; later bodies
+  // are a single fixed marker. Bound the total against those known sizes.
+  const marker = "\n[Body truncated: thread exceeds size limit]";
+  const omitted = "[Body omitted: thread exceeds size limit]";
+  const total = r.messages.reduce((n, m) => n + m.body.length, 0);
+  assert.ok(total <= 20 + marker.length + 2 * omitted.length);
+});
+
+test("capMessageBodies treats an exact-fit body as not truncated", () => {
+  const r = capMessageBodies([{ body: "a".repeat(20) }], 20);
+  assert.equal(r.truncated, false);
+  assert.equal(r.messages[0].body, "a".repeat(20));
+});
+
+test("capMessageBodies does not flag a trailing empty body", () => {
+  const r = capMessageBodies([{ body: "a".repeat(20) }, { body: "" }], 20);
+  assert.equal(r.truncated, false);
+  assert.equal(r.messages[1].body, "");
+});
+
+test("capMessageBodies preserves non-body fields", () => {
+  const r = capMessageBodies([{ body: "x".repeat(50), message_id: "m1", from: "a@b" }], 10);
+  assert.equal(r.messages[0].message_id, "m1");
+  assert.equal(r.messages[0].from, "a@b");
 });
