@@ -22,6 +22,7 @@ import { google } from "googleapis";
 import open from "open";
 import {
   accountCredentials,
+  cleanupStaleTokenTemps,
   credentialsRefFor,
   listAccounts,
   loadTokens,
@@ -218,12 +219,13 @@ async function addAccount(): Promise<void> {
     tokens.refresh_token = existing.tokens.refresh_token;
   }
 
-  saveAccount(email, tokens, credentialsRefFor(credFile));
+  await saveAccount(email, tokens, credentialsRefFor(credFile));
   console.log(`\nConnected: ${email}  [${credentialsRefFor(credFile)}]`);
   printAccounts();
 }
 
 async function main(): Promise<void> {
+  cleanupStaleTokenTemps();
   const args = process.argv.slice(2);
   if (args.includes("--list")) {
     printAccounts();
@@ -237,7 +239,9 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     console.log(
-      removeAccount(email) ? `Removed ${email}.` : `${email} was not connected.`
+      (await removeAccount(email))
+        ? `Removed ${email}.`
+        : `${email} was not connected.`
     );
     return;
   }

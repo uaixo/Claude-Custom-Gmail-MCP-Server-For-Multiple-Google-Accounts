@@ -13,7 +13,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { listAccounts } from "./auth.js";
+import { cleanupStaleTokenTemps, listAccounts } from "./auth.js";
 import {
   buildRawMessage,
   capMessageBodies,
@@ -29,6 +29,7 @@ import {
 import {
   CHARACTER_LIMIT,
   isMainModule,
+  MAX_THREAD_MESSAGES,
   THREAD_FETCH_CONCURRENCY,
 } from "./constants.js";
 
@@ -220,7 +221,9 @@ Returns: JSON {
   "account": string,
   "thread_id": string,
   "messages": [ { "message_id": string, "from": string, "to": string, "date": string, "subject": string, "body": string, "label_ids": string[] } ]
-}`,
+}
+
+For very large threads the result may be truncated: "truncated": true is set, and "omitted_message_count" reports how many trailing messages were dropped.`,
     inputSchema: {
       thread_id: z.string().min(1).describe("Thread ID to fetch"),
       account: accountField,
@@ -240,7 +243,11 @@ Returns: JSON {
         id: thread_id,
         format: "full",
       });
-      const allMessages = (res.data.messages || []).map((m) => ({
+      // Bound the message count first (slice the raw list before decoding, so
+      // we don't waste work parsing bodies we'll drop), then bound the bodies.
+      const rawMessages = res.data.messages || [];
+      const omittedMessages = Math.max(0, rawMessages.length - MAX_THREAD_MESSAGES);
+      const allMessages = rawMessages.slice(0, MAX_THREAD_MESSAGES).map((m) => ({
         message_id: m.id!,
         from: header(m.payload, "From"),
         to: header(m.payload, "To"),
@@ -249,13 +256,17 @@ Returns: JSON {
         body: extractPlainText(m.payload),
         label_ids: m.labelIds || [],
       }));
-      // Bound the bodies so structuredContent stays within the size budget.
-      const { messages, truncated } = capMessageBodies(allMessages, CHARACTER_LIMIT);
+      const { messages, truncated: bodyTruncated } = capMessageBodies(
+        allMessages,
+        CHARACTER_LIMIT
+      );
+      const truncated = bodyTruncated || omittedMessages > 0;
       const output = {
         account: acct,
         thread_id,
         messages,
         ...(truncated ? { truncated: true } : {}),
+        ...(omittedMessages > 0 ? { omitted_message_count: omittedMessages } : {}),
       };
       const text = capText(
         JSON.stringify(output, null, 2),
@@ -704,6 +715,7 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
 // Startup
 // ---------------------------------------------------------------------------
 async function main(): Promise<void> {
+  cleanupStaleTokenTemps();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const accounts = listAccounts();

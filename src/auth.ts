@@ -147,15 +147,105 @@ export function saveTokens(store: TokenStore): void {
   fs.renameSync(tmp, file);
 }
 
+/**
+ * Async millisecond sleep used between lock-acquisition retries. Unlike a
+ * synchronous spin (Atomics.wait), this yields the event loop, so the server
+ * stays responsive while waiting for a contended lock.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Run `fn` while holding a best-effort cross-process lock on the token store, so
+ * a load-modify-write here isn't clobbered by a concurrent writer (e.g. the
+ * server refreshing a token while add-account connects another account, which
+ * would otherwise lose one account's update). The lock is advisory: if it can't
+ * be acquired within a short window we proceed anyway, so behavior never
+ * regresses below the previous unlocked baseline. Waiting is async so the event
+ * loop is never blocked. `fn` itself is synchronous (load/mutate/save).
+ */
+async function withTokenLock<T>(fn: () => T): Promise<T> {
+  const dir = dataDir();
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const lockPath = `${tokensPath()}.lock`;
+  let held = false;
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    try {
+      fs.closeSync(fs.openSync(lockPath, "wx")); // atomic exclusive create
+      held = true;
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") break; // unexpected → proceed unlocked
+      try {
+        // Steal an obviously-stale lock left behind by a crashed process.
+        if (Date.now() - fs.statSync(lockPath).mtimeMs > 10_000) {
+          fs.unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        continue; // lock vanished between stat and unlink → retry immediately
+      }
+      await sleep(25);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (held) {
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/** Atomically (under the token lock) load the store, mutate it, and save it. */
+async function updateTokens(mutate: (store: TokenStore) => void): Promise<void> {
+  await withTokenLock(() => {
+    const store = loadTokens();
+    mutate(store);
+    saveTokens(store);
+  });
+}
+
+/**
+ * Best-effort removal of stale atomic-write temp files (`.tokens.*.tmp`) left
+ * behind if a process crashed between writing and renaming. Only files older
+ * than `maxAgeMs` are removed, to avoid racing a concurrent write in progress.
+ */
+export function cleanupStaleTokenTemps(maxAgeMs = 60_000): void {
+  const dir = dataDir();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const name of entries) {
+    if (!/^\.tokens\..*\.tmp$/.test(name)) continue;
+    const p = path.join(dir, name);
+    try {
+      if (now - fs.statSync(p).mtimeMs > maxAgeMs) fs.unlinkSync(p);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 /** Persist (or update) one account's tokens and credential-file reference. */
-export function saveAccount(
+export async function saveAccount(
   email: string,
   tokens: Credentials,
   credentialsFile: string
-): void {
-  const store = loadTokens();
-  store[email.toLowerCase()] = { tokens, credentialsFile };
-  saveTokens(store);
+): Promise<void> {
+  await updateTokens((store) => {
+    store[email.toLowerCase()] = { tokens, credentialsFile };
+  });
 }
 
 export function listAccounts(): string[] {
@@ -172,14 +262,17 @@ export function accountCredentials(): Record<string, string> {
   return out;
 }
 
-export function removeAccount(email: string): boolean {
-  const store = loadTokens();
+export async function removeAccount(email: string): Promise<boolean> {
   const key = email.toLowerCase();
-  if (!(key in store)) return false;
-  delete store[key];
+  let existed = false;
+  await updateTokens((store) => {
+    if (key in store) {
+      delete store[key];
+      existed = true;
+    }
+  });
   authedClients.delete(key);
-  saveTokens(store);
-  return true;
+  return existed;
 }
 
 /**
@@ -237,14 +330,16 @@ export function getAuthedClient(account: string): OAuth2Client {
   }
   const client = newOAuthClient(credFile);
   client.setCredentials(entry.tokens);
-  // Persist refreshed tokens whenever the library rotates them.
+  // Persist refreshed tokens whenever the library rotates them, under the lock
+  // so a concurrent writer's update isn't lost. Fire-and-forget: the library
+  // doesn't await listeners, and persistence is best-effort.
   client.on("tokens", (fresh) => {
-    const current = loadTokens();
-    const cur = current[key];
-    if (cur) {
-      cur.tokens = { ...cur.tokens, ...fresh };
-      saveTokens(current);
-    }
+    void updateTokens((store) => {
+      const cur = store[key];
+      if (cur) cur.tokens = { ...cur.tokens, ...fresh };
+    }).catch(() => {
+      /* best-effort persistence; ignore write failures */
+    });
   });
   authedClients.set(key, client);
   return client;

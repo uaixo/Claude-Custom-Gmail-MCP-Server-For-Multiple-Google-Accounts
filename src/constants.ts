@@ -40,6 +40,13 @@ export const THREAD_FETCH_CONCURRENCY = 5;
  */
 export const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
 
+/**
+ * Maximum number of messages returned from a single thread. Bounds the
+ * structuredContent payload (per-message metadata) for pathologically large
+ * threads, independent of the body-character budget.
+ */
+export const MAX_THREAD_MESSAGES = 100;
+
 /** Gmail OAuth scopes. Covers read, compose/send, and label management. */
 export const SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify", // read + labels + drafts
