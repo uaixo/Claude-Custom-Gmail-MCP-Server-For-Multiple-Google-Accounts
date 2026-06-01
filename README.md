@@ -47,7 +47,7 @@ These steps are identical on Windows and Mac.
 4. Create credentials → **OAuth client ID** → application type **Desktop app** → Create.
 5. Click **Download JSON** in the dialog.
 
-> Note: this server uses a loopback redirect on `http://localhost:4773/oauth2callback`. The **Desktop app** client type allows loopback redirects automatically, so no extra redirect-URI configuration is needed. Don't pick "Web application."
+> Note: this server uses a loopback redirect on `http://127.0.0.1:4773/oauth2callback` (with PKCE and a CSRF `state` check). The **Desktop app** client type allows loopback redirects automatically, so no extra redirect-URI configuration is needed. Don't pick "Web application."
 
 ### 2. Place the credentials
 

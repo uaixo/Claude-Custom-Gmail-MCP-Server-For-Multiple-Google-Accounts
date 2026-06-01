@@ -99,12 +99,30 @@ export async function getThreadReplyHeaders(
   return { inReplyTo: messageId, references, subject };
 }
 
-/** Recursively return the first part body matching an exact MIME type. */
+/**
+ * True when a message part is an attachment rather than body content. Body
+ * extraction must skip these: an HTML-only email that also carries a text/plain
+ * or text/html attachment (e.g. a .csv or .txt) would otherwise have the
+ * attachment's bytes returned as the message body. A part counts as an
+ * attachment when its Content-Disposition is "attachment", or when it has a
+ * filename and isn't explicitly "inline".
+ */
+function isAttachmentPart(part: gmail_v1.Schema$MessagePart): boolean {
+  const disposition = header(part, "Content-Disposition").trim().toLowerCase();
+  if (disposition.startsWith("attachment")) return true;
+  if (disposition.startsWith("inline")) return false;
+  return !!part.filename;
+}
+
+/** Recursively return the first non-attachment part body matching a MIME type. */
 function findPartBody(
   payload: gmail_v1.Schema$MessagePart | undefined,
   mimeType: string
 ): string {
   if (!payload) return "";
+  // Don't read an attachment's body, and don't descend into it (e.g. a
+  // forwarded message/rfc822 part): its contents aren't this message's body.
+  if (isAttachmentPart(payload)) return "";
   if (payload.mimeType === mimeType && payload.body?.data) {
     return decodeBase64Url(payload.body.data);
   }

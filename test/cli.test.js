@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import path from "node:path";
 
-import { listenWithFallback, escapeHtml } from "../dist/add-account.js";
+import {
+  listenWithFallback,
+  escapeHtml,
+  validateCallback,
+} from "../dist/add-account.js";
 import {
   oauthRedirectUri,
   OAUTH_REDIRECT_PORT,
@@ -11,7 +15,11 @@ import {
 } from "../dist/constants.js";
 
 const close = (s) => new Promise((r) => s.close(r));
-const listen = (s, port) => new Promise((r) => s.listen(port, r));
+// Bind on the loopback interface, matching listenWithFallback. A wildcard
+// (0.0.0.0) holder would not reliably collide with a specific 127.0.0.1 bind on
+// the same port on macOS/Windows (only Linux returns EADDRINUSE there), which
+// would make the "port is busy" fallback test pass on Linux but fail elsewhere.
+const listen = (s, port) => new Promise((r) => s.listen(port, "127.0.0.1", r));
 // Bind an ephemeral port, read it, release it — a port we know was free.
 const aFreePort = async () => {
   const s = http.createServer();
@@ -25,8 +33,33 @@ const aFreePort = async () => {
 // oauthRedirectUri / attachmentDirs  (config helpers)
 // --------------------------------------------------------------------------
 test("oauthRedirectUri formats per-port and defaults to the preferred port", () => {
-  assert.equal(oauthRedirectUri(12345), "http://localhost:12345/oauth2callback");
-  assert.equal(oauthRedirectUri(), `http://localhost:${OAUTH_REDIRECT_PORT}/oauth2callback`);
+  assert.equal(oauthRedirectUri(12345), "http://127.0.0.1:12345/oauth2callback");
+  assert.equal(oauthRedirectUri(), `http://127.0.0.1:${OAUTH_REDIRECT_PORT}/oauth2callback`);
+});
+
+// --------------------------------------------------------------------------
+// validateCallback  (OAuth state / CSRF guard)
+// --------------------------------------------------------------------------
+test("validateCallback returns the code when state matches", () => {
+  const params = new URLSearchParams({ state: "abc123", code: "auth-code" });
+  assert.deepEqual(validateCallback(params, "abc123"), { code: "auth-code" });
+});
+
+test("validateCallback rejects a mismatched state (CSRF guard)", () => {
+  const params = new URLSearchParams({ state: "attacker", code: "auth-code" });
+  const r = validateCallback(params, "abc123");
+  assert.ok("error" in r);
+  assert.match(r.error, /State mismatch/);
+});
+
+test("validateCallback surfaces an OAuth error param before anything else", () => {
+  const params = new URLSearchParams({ error: "access_denied", state: "abc123" });
+  assert.deepEqual(validateCallback(params, "abc123"), { error: "access_denied" });
+});
+
+test("validateCallback rejects a missing code even when state matches", () => {
+  const params = new URLSearchParams({ state: "abc123" });
+  assert.ok("error" in validateCallback(params, "abc123"));
 });
 
 test("escapeHtml neutralizes HTML metacharacters in the OAuth callback page", () => {
@@ -58,6 +91,8 @@ test("listenWithFallback binds the preferred port when it is free", async () => 
     const port = await listenWithFallback(s, free);
     assert.equal(port, free);
     assert.equal(s.listening, true);
+    // Must bind to loopback, not all interfaces, so it isn't LAN-reachable.
+    assert.equal(s.address().address, "127.0.0.1");
   } finally {
     await close(s);
   }
