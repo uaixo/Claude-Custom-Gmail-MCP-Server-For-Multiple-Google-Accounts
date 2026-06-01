@@ -29,8 +29,12 @@ test("saveAccount/loadTokens roundtrip, atomic write, 0600 perms, no temp leftov
   assert.equal(store["a@b.com"].tokens.access_token, "x");
   assert.equal(store["a@b.com"].credentialsFile, "credentials.json");
 
-  const mode = fs.statSync(path.join(dataDir, "tokens.json")).mode & 0o777;
-  assert.equal(mode, 0o600);
+  // Unix permission bits are meaningless on Windows, where file mode doesn't
+  // map to 0o600; only assert on POSIX platforms.
+  if (process.platform !== "win32") {
+    const mode = fs.statSync(path.join(dataDir, "tokens.json")).mode & 0o777;
+    assert.equal(mode, 0o600);
+  }
 
   const leftover = fs.readdirSync(dataDir).filter((f) => f.includes(".tmp"));
   assert.deepEqual(leftover, []);
