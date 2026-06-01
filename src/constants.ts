@@ -125,9 +125,14 @@ export function tokensPath(): string {
  */
 export const OAUTH_REDIRECT_PORT = 4773;
 
-/** Build the loopback redirect URI for a given port. */
+/**
+ * Build the loopback redirect URI for a given port. Uses the loopback IP
+ * (127.0.0.1) rather than "localhost": Desktop-app OAuth clients accept both,
+ * and the literal IP avoids a name-resolution mismatch when the callback server
+ * binds to 127.0.0.1 but "localhost" resolves to ::1 (IPv6) on some systems.
+ */
 export function oauthRedirectUri(port: number = OAUTH_REDIRECT_PORT): string {
-  return `http://localhost:${port}/oauth2callback`;
+  return `http://127.0.0.1:${port}/oauth2callback`;
 }
 
 /** Default redirect URI on the preferred port. */

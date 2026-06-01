@@ -72,6 +72,54 @@ test("extractPlainText finds a text/plain part deep in a nested tree", () => {
   assert.equal(extractPlainText(payload), "Deep plain");
 });
 
+test("extractPlainText skips a text attachment and returns the real HTML body", () => {
+  // HTML-only message that also carries a text/plain attachment (e.g. a .csv).
+  // The attachment's bytes must not be surfaced as the body.
+  const payload = {
+    mimeType: "multipart/mixed",
+    parts: [
+      {
+        mimeType: "text/plain",
+        filename: "report.csv",
+        headers: [
+          { name: "Content-Disposition", value: 'attachment; filename="report.csv"' },
+        ],
+        body: { data: b64url("col1,col2\n1,2") },
+      },
+      { mimeType: "text/html", body: { data: b64url("<p>The <b>real</b> body</p>") } },
+    ],
+  };
+  const out = extractPlainText(payload);
+  assert.doesNotMatch(out, /col1,col2/);
+  assert.match(out, /The real body/);
+});
+
+test("extractPlainText skips a text/plain attachment that precedes the body part", () => {
+  const payload = {
+    mimeType: "multipart/mixed",
+    parts: [
+      {
+        mimeType: "text/plain",
+        filename: "notes.txt",
+        headers: [{ name: "Content-Disposition", value: "attachment" }],
+        body: { data: b64url("ATTACHMENT TEXT") },
+      },
+      { mimeType: "text/plain", body: { data: b64url("ACTUAL BODY") } },
+    ],
+  };
+  assert.equal(extractPlainText(payload), "ACTUAL BODY");
+});
+
+test("extractPlainText keeps an inline text part as the body", () => {
+  // Content-Disposition: inline must NOT be treated as an attachment.
+  const payload = {
+    mimeType: "text/plain",
+    headers: [{ name: "Content-Disposition", value: "inline" }],
+    body: { data: b64url("inline body") },
+  };
+  assert.equal(extractPlainText(payload), "inline body");
+});
+
 test("htmlToText converts <br> to a newline", () => {
   assert.equal(htmlToText("a<br>b"), "a\nb");
 });

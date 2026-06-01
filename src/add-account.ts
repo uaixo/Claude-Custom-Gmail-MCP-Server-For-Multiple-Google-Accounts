@@ -14,10 +14,12 @@
  * Tokens are stored per account email in <dataDir>/tokens.json.
  */
 
+import crypto from "crypto";
 import http from "http";
 import readline from "readline";
 import { AddressInfo } from "net";
 import { URL } from "url";
+import { CodeChallengeMethod } from "google-auth-library";
 import { google } from "googleapis";
 import open from "open";
 import {
@@ -53,29 +55,52 @@ export function escapeHtml(s: string): string {
 
 /**
  * Listen on the preferred port, falling back to an OS-assigned ephemeral port
- * if it's already in use. Resolves with the port actually bound.
+ * if it's already in use. Resolves with the port actually bound. Binds to the
+ * loopback interface by default so the OAuth callback server isn't reachable
+ * from the local network during the consent window.
  */
 export function listenWithFallback(
   server: http.Server,
-  preferredPort: number
+  preferredPort: number,
+  host: string = "127.0.0.1"
 ): Promise<number> {
   return new Promise((resolve, reject) => {
     const boundPort = () => (server.address() as AddressInfo).port;
     const onFirstError = (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
         server.once("error", reject);
-        server.listen(0, () => resolve(boundPort()));
+        server.listen(0, host, () => resolve(boundPort()));
       } else {
         reject(err);
       }
     };
     server.once("error", onFirstError);
-    server.listen(preferredPort, () => {
+    server.listen(preferredPort, host, () => {
       server.removeListener("error", onFirstError);
       server.once("error", reject);
       resolve(boundPort());
     });
   });
+}
+
+/**
+ * Validate the OAuth redirect's query parameters. Rejects when Google returned
+ * an error, when `state` doesn't match the value we generated (a CSRF /
+ * code-injection guard, per RFC 8252 §8.9), or when no code is present; returns
+ * the authorization code on success.
+ */
+export function validateCallback(
+  params: URLSearchParams,
+  expectedState: string
+): { code: string } | { error: string } {
+  const err = params.get("error");
+  if (err) return { error: err };
+  if (params.get("state") !== expectedState) {
+    return { error: "State mismatch — possible CSRF; aborting sign-in." };
+  }
+  const code = params.get("code");
+  if (!code) return { error: "No authorization code returned." };
+  return { code };
 }
 
 function printAccounts(): void {
@@ -135,47 +160,55 @@ async function addAccount(): Promise<void> {
     rejectCode = reject;
   });
 
+  // CSRF guard: a random state we round-trip through Google and verify on the
+  // callback, so a stray request to the loopback server can't inject a code.
+  const state = crypto.randomBytes(16).toString("hex");
+
   const serverHttp = http.createServer((req, res) => {
     try {
       if (!req.url) return;
-      const url = new URL(req.url, "http://localhost");
+      const url = new URL(req.url, "http://127.0.0.1");
       if (url.pathname !== "/oauth2callback") {
         res.writeHead(404);
         res.end();
         return;
       }
-      const err = url.searchParams.get("error");
-      const authCode = url.searchParams.get("code");
+      const result = validateCallback(url.searchParams, state);
       res.writeHead(200, { "Content-Type": "text/html" });
-      if (err || !authCode) {
+      if ("error" in result) {
         res.end(
-          `<h2>Authorization failed</h2><p>${escapeHtml(
-            err || "No code returned."
-          )}</p>`
+          `<h2>Authorization failed</h2><p>${escapeHtml(result.error)}</p>`
         );
         serverHttp.close();
-        rejectCode(new Error(err || "No authorization code returned."));
+        rejectCode(new Error(result.error));
         return;
       }
       res.end(
         "<h2>Account connected.</h2><p>You can close this tab and return to the terminal.</p>"
       );
       serverHttp.close();
-      resolveCode(authCode);
+      resolveCode(result.code);
     } catch (e) {
       serverHttp.close();
       rejectCode(e instanceof Error ? e : new Error(String(e)));
     }
   });
 
-  // Bind first so we know the actual port, then build the redirect URI and
-  // auth URL to match it.
+  // Bind to loopback first so we know the actual port, then build the redirect
+  // URI and auth URL to match it.
   const port = await listenWithFallback(serverHttp, OAUTH_REDIRECT_PORT);
   const oAuth2Client = newOAuthClient(credFile, oauthRedirectUri(port));
+  // PKCE (RFC 7636): bind the auth code to this process, so an intercepted code
+  // can't be exchanged for tokens without the matching verifier.
+  const { codeVerifier, codeChallenge } =
+    await oAuth2Client.generateCodeVerifierAsync();
   const authUrl = oAuth2Client.generateAuthUrl({
     access_type: "offline", // request a refresh token
     prompt: "consent", // force refresh-token issuance on re-consent
     scope: SCOPES,
+    state,
+    code_challenge_method: CodeChallengeMethod.S256,
+    code_challenge: codeChallenge,
   });
 
   if (port !== OAUTH_REDIRECT_PORT) {
@@ -204,7 +237,7 @@ async function addAccount(): Promise<void> {
     clearTimeout(timeout);
   }
 
-  const { tokens } = await oAuth2Client.getToken(code);
+  const { tokens } = await oAuth2Client.getToken({ code, codeVerifier });
   oAuth2Client.setCredentials(tokens);
 
   // Identify which account just authorized.
