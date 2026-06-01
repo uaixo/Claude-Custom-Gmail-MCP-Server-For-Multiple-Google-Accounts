@@ -113,3 +113,28 @@ test("loadTokens returns empty without throwing on a corrupt store (#8)", () => 
     fs.writeFileSync(file, saved); // restore for any later readers
   }
 });
+
+test("getAuthedClient rebuilds when the on-disk refresh token changes (#1)", async () => {
+  await auth.saveAccount(
+    "rotate@x.com",
+    { access_token: "a1", refresh_token: "r1" },
+    "credentials.json"
+  );
+  const first = auth.getAuthedClient("rotate@x.com");
+  // Unchanged tokens on disk → the same cached client is reused.
+  assert.equal(auth.getAuthedClient("rotate@x.com"), first);
+
+  // Simulate re-consent in a separate process: tokens.json is rewritten with a
+  // new refresh token WITHOUT going through removeAccount (which clears the
+  // cache). A long-running server must notice and rebuild rather than keep
+  // using the stale client holding the now-dead token.
+  await auth.saveAccount(
+    "rotate@x.com",
+    { access_token: "a2", refresh_token: "r2" },
+    "credentials.json"
+  );
+  const rebuilt = auth.getAuthedClient("rotate@x.com");
+  assert.notEqual(rebuilt, first, "a changed refresh token must invalidate the cache");
+  // The rebuilt client must still carry exactly one persistence listener.
+  assert.equal(rebuilt.listenerCount("tokens"), 1);
+});

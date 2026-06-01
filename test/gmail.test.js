@@ -15,9 +15,12 @@ import {
   decodeBase64Url,
   capMessageBodies,
   deriveReplySubject,
+  requireField,
 } from "../dist/gmail.js";
 
 const b64url = (s) => Buffer.from(s, "utf-8").toString("base64url");
+// base64url of raw bytes, for exercising non-UTF-8 charset decoding.
+const b64urlBytes = (bytes) => Buffer.from(bytes).toString("base64url");
 
 // --------------------------------------------------------------------------
 // extractPlainText / htmlToText  (review item #1)
@@ -121,6 +124,48 @@ test("extractPlainText keeps an inline text part as the body", () => {
   assert.equal(extractPlainText(payload), "inline body");
 });
 
+// --------------------------------------------------------------------------
+// decodeBase64Url charset handling  (review item #2)
+// --------------------------------------------------------------------------
+test("decodeBase64Url defaults to UTF-8 and is unchanged for ASCII/UTF-8", () => {
+  assert.equal(decodeBase64Url(b64url("Hello world")), "Hello world");
+  assert.equal(decodeBase64Url(b64url("café"), "UTF-8"), "café");
+  assert.equal(decodeBase64Url(b64url("café"), "us-ascii"), "café");
+});
+
+test("decodeBase64Url honors a declared non-UTF-8 charset (ISO-8859-1)", () => {
+  // "Salut été" encoded as ISO-8859-1: é is the single byte 0xE9.
+  const data = b64urlBytes([0x53, 0x61, 0x6c, 0x75, 0x74, 0x20, 0xe9, 0x74, 0xe9]);
+  assert.equal(decodeBase64Url(data, "ISO-8859-1"), "Salut été");
+  // Decoding the same bytes as UTF-8 must NOT yield the correct text (0xE9 is
+  // an invalid lone byte) — this is exactly the bug the charset arg fixes.
+  assert.notEqual(decodeBase64Url(data), "Salut été");
+});
+
+test("decodeBase64Url accepts the windows-1252 label and decodes high bytes", () => {
+  // Use a Latin-1-range byte (0xE9 = é), which every ICU build maps identically.
+  // The C1 range (0x80–0x9F, e.g. € at 0x80) is ICU-version-dependent — Node
+  // bundles differ — so we deliberately don't assert on it here.
+  assert.equal(
+    decodeBase64Url(b64urlBytes([0x63, 0x61, 0x66, 0xe9]), "windows-1252"),
+    "café"
+  );
+});
+
+test("decodeBase64Url falls back to UTF-8 for an unknown charset label", () => {
+  const data = b64url("café");
+  assert.equal(decodeBase64Url(data, "totally-bogus-charset"), "café");
+});
+
+test("extractPlainText decodes a text/plain part using its declared charset", () => {
+  const payload = {
+    mimeType: "text/plain",
+    headers: [{ name: "Content-Type", value: 'text/plain; charset="ISO-8859-1"' }],
+    body: { data: b64urlBytes([0x63, 0x61, 0x66, 0xe9]) }, // "café" in ISO-8859-1
+  };
+  assert.equal(extractPlainText(payload), "café");
+});
+
 test("htmlToText converts <br> to a newline", () => {
   assert.equal(htmlToText("a<br>b"), "a\nb");
 });
@@ -200,6 +245,45 @@ test("getThreadReplyHeaders derives In-Reply-To, accumulated References, and sub
 test("getThreadReplyHeaders returns empty strings for an empty thread", async () => {
   const reply = await getThreadReplyHeaders(mockGmailThread([]), "t");
   assert.deepEqual(reply, { inReplyTo: "", references: "", subject: "" });
+});
+
+test("getThreadReplyHeaders keeps In-Reply-To consistent with the References tail", async () => {
+  // Threading is only well-formed when In-Reply-To names the message the reply
+  // answers and References ends with that same Message-ID. Verify both: the
+  // last message's id is used, and the accumulated chain terminates with it.
+  const gmail = mockGmailThread([
+    {
+      payload: {
+        headers: [
+          { name: "Subject", value: "Topic" },
+          { name: "Message-ID", value: "<a@x>" },
+        ],
+      },
+    },
+    {
+      payload: {
+        headers: [
+          { name: "Message-ID", value: "<b@x>" },
+          { name: "References", value: "<a@x>" },
+        ],
+      },
+    },
+    {
+      payload: {
+        headers: [
+          { name: "Message-ID", value: "<c@x>" },
+          { name: "References", value: "<a@x> <b@x>" },
+        ],
+      },
+    },
+  ]);
+  const reply = await getThreadReplyHeaders(gmail, "t");
+  assert.equal(reply.inReplyTo, "<c@x>"); // the thread's most recent message
+  assert.equal(reply.references, "<a@x> <b@x> <c@x>");
+  assert.ok(
+    reply.references.endsWith(reply.inReplyTo),
+    "References chain must end with the In-Reply-To message id"
+  );
 });
 
 // --------------------------------------------------------------------------
@@ -349,6 +433,14 @@ test("handleGmailError distinguishes local errors from API errors", () => {
   assert.match(api, /Gmail API request failed \(status 500\)/);
 
   assert.match(handleGmailError({ code: 401 }), /Re-run `npm run add-account`/);
+});
+
+test("requireField returns present values and throws on null/undefined", () => {
+  assert.equal(requireField("abc", "thread.id"), "abc");
+  assert.equal(requireField(0, "n"), 0); // falsy-but-present must pass through
+  assert.equal(requireField("", "s"), "");
+  assert.throws(() => requireField(undefined, "label.id"), /missing expected field: label\.id/);
+  assert.throws(() => requireField(null, "message.id"), /missing expected field: message\.id/);
 });
 
 // --------------------------------------------------------------------------

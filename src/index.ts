@@ -25,6 +25,7 @@ import {
   handleGmailError,
   header,
   mapWithConcurrency,
+  requireField,
   resolveAttachments,
 } from "./gmail.js";
 import {
@@ -174,15 +175,16 @@ Returns: JSON {
         threads,
         THREAD_FETCH_CONCURRENCY,
         async (t) => {
+          const threadId = requireField(t.id, "thread.id");
           const full = await gmail.users.threads.get({
             userId: "me",
-            id: t.id!,
+            id: threadId,
             format: "metadata",
             metadataHeaders: ["Subject", "From", "Date"],
           });
           const first = full.data.messages?.[0];
           return {
-            thread_id: t.id!,
+            thread_id: threadId,
             subject: header(first?.payload, "Subject"),
             from: header(first?.payload, "From"),
             date: header(first?.payload, "Date"),
@@ -249,7 +251,7 @@ For very large threads the result may be truncated: "truncated": true is set, an
       const rawMessages = res.data.messages || [];
       const omittedMessages = Math.max(0, rawMessages.length - MAX_THREAD_MESSAGES);
       const allMessages = rawMessages.slice(0, MAX_THREAD_MESSAGES).map((m) => ({
-        message_id: m.id!,
+        message_id: requireField(m.id, "message.id"),
         from: header(m.payload, "From"),
         to: header(m.payload, "To"),
         date: header(m.payload, "Date"),
@@ -368,7 +370,7 @@ Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
       });
       const output = {
         account: acct,
-        draft_id: res.data.id!,
+        draft_id: requireField(res.data.id, "draft.id"),
         message_id: res.data.message?.id || "",
       };
       return {
@@ -489,7 +491,7 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
       });
       const output = {
         account: acct,
-        message_id: res.data.id!,
+        message_id: requireField(res.data.id, "message.id"),
         thread_id: res.data.threadId || "",
       };
       return {
@@ -538,8 +540,8 @@ Returns: JSON { "account": string, "labels": [ { "id": string, "name": string, "
       const { gmail, account: acct } = gmailFor(account);
       const res = await gmail.users.labels.list({ userId: "me" });
       const labels = (res.data.labels || []).map((l) => ({
-        id: l.id!,
-        name: l.name!,
+        id: requireField(l.id, "label.id"),
+        name: requireField(l.name, "label.name"),
         type: l.type || "user",
       }));
       const output = { account: acct, labels };
@@ -592,7 +594,11 @@ Returns: JSON { "account": string, "id": string, "name": string }`,
           messageListVisibility: "show",
         },
       });
-      const output = { account: acct, id: res.data.id!, name: res.data.name! };
+      const output = {
+        account: acct,
+        id: requireField(res.data.id, "label.id"),
+        name: requireField(res.data.name, "label.name"),
+      };
       return {
         content: [
           {
@@ -687,7 +693,7 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
           id: thread_id,
           requestBody,
         });
-        id = res.data.id!;
+        id = requireField(res.data.id, "thread.id");
         labelIds = res.data.messages?.[0]?.labelIds || [];
       } else {
         const res = await gmail.users.messages.modify({
@@ -695,7 +701,7 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
           id: message_id!,
           requestBody,
         });
-        id = res.data.id!;
+        id = requireField(res.data.id, "message.id");
         labelIds = res.data.labelIds || [];
       }
       const output = {

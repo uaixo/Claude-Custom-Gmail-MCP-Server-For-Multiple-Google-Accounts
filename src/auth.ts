@@ -27,13 +27,26 @@ export interface TokenStore {
 }
 
 /**
+ * A cached authenticated client plus the refresh token it was built with. The
+ * refresh token acts as a freshness signature: if tokens.json is rewritten out
+ * from under a long-running server — e.g. the user re-runs `add-account` in a
+ * separate process to re-consent after a revoked token — the refresh token on
+ * disk changes, and comparing against it lets getAuthedClient rebuild the
+ * client instead of using a stale one that holds a dead token until restart.
+ */
+interface CachedClient {
+  client: OAuth2Client;
+  refreshToken: string | null | undefined;
+}
+
+/**
  * Cache of authenticated OAuth clients, one per account (keyed by lower-cased
  * email). Sharing a single client across concurrent tool calls lets
  * google-auth-library serialize token refreshes and ensures only one `tokens`
  * listener performs the read-modify-write against the token store, avoiding
  * lost updates.
  */
-const authedClients = new Map<string, OAuth2Client>();
+const authedClients = new Map<string, CachedClient>();
 
 interface OAuthClientConfig {
   client_id: string;
@@ -331,14 +344,19 @@ export function resolveAccount(requested?: string): string {
  */
 export function getAuthedClient(account: string): OAuth2Client {
   const key = account.toLowerCase();
-  const cached = authedClients.get(key);
-  if (cached) return cached;
-
   const store = loadTokens();
   const entry = store[key];
   if (!entry) {
     throw new Error(`No stored tokens for account '${account}'.`);
   }
+  // Reuse the cached client only while the on-disk refresh token still matches
+  // the one it was built with; otherwise the stored credentials changed (e.g.
+  // a re-consent in another process) and we must rebuild (see CachedClient).
+  const cached = authedClients.get(key);
+  if (cached && cached.refreshToken === entry.tokens.refresh_token) {
+    return cached.client;
+  }
+
   const credFile = resolveCredentialsFile(entry.credentialsFile);
   if (!fs.existsSync(credFile)) {
     throw new Error(
@@ -359,6 +377,6 @@ export function getAuthedClient(account: string): OAuth2Client {
       /* best-effort persistence; ignore write failures */
     });
   });
-  authedClients.set(key, client);
+  authedClients.set(key, { client, refreshToken: entry.tokens.refresh_token });
   return client;
 }

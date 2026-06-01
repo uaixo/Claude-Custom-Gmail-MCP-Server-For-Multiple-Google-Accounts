@@ -39,9 +39,34 @@ export function gmailFor(account?: string): {
   return { gmail, account: resolved };
 }
 
-/** Decode a base64url string to UTF-8. */
-export function decodeBase64Url(data: string): string {
-  return Buffer.from(data, "base64url").toString("utf-8");
+/**
+ * Decode a base64url-encoded body to a string. Gmail returns part bytes in the
+ * part's original charset (it does not transcode to UTF-8), so honor the
+ * Content-Type charset when one is supplied. ASCII/UTF-8 take a fast path;
+ * legacy charsets (windows-1252, iso-8859-*, shift_jis, ...) go through
+ * TextDecoder. An unknown/unsupported label falls back to UTF-8 rather than
+ * throwing, so a body is always returned.
+ */
+export function decodeBase64Url(data: string, charset = "utf-8"): string {
+  const buf = Buffer.from(data, "base64url");
+  const label = charset.trim().toLowerCase();
+  if (
+    label === "" ||
+    label === "utf-8" ||
+    label === "utf8" ||
+    label === "us-ascii" ||
+    label === "ascii"
+  ) {
+    return buf.toString("utf-8");
+  }
+  try {
+    // TextDecoder is ICU-backed (Node 18+ ships full ICU); fatal:false (default)
+    // maps malformed bytes to U+FFFD instead of throwing.
+    return new TextDecoder(label).decode(buf);
+  } catch {
+    // Unknown/unsupported charset label — fall back to UTF-8.
+    return buf.toString("utf-8");
+  }
 }
 
 /** Encode a UTF-8 string to base64url (RFC 4648, no padding). */
@@ -130,6 +155,15 @@ function isAttachmentPart(part: gmail_v1.Schema$MessagePart): boolean {
   return !!part.filename;
 }
 
+/** Extract the charset from a part's Content-Type header, if one is declared. */
+function partCharset(
+  part: gmail_v1.Schema$MessagePart | undefined
+): string | undefined {
+  const ct = header(part, "Content-Type");
+  const m = /charset\s*=\s*"?([^";\s]+)"?/i.exec(ct);
+  return m?.[1];
+}
+
 /** Recursively return the first non-attachment part body matching a MIME type. */
 function findPartBody(
   payload: gmail_v1.Schema$MessagePart | undefined,
@@ -140,7 +174,7 @@ function findPartBody(
   // forwarded message/rfc822 part): its contents aren't this message's body.
   if (isAttachmentPart(payload)) return "";
   if (payload.mimeType === mimeType && payload.body?.data) {
-    return decodeBase64Url(payload.body.data);
+    return decodeBase64Url(payload.body.data, partCharset(payload));
   }
   for (const part of payload.parts || []) {
     const found = findPartBody(part, mimeType);
@@ -556,6 +590,19 @@ export function buildRawMessage(opts: {
     "",
   ];
   return finalizeMessage(lines);
+}
+
+/**
+ * Assert that a field the Gmail API is expected to return is actually present.
+ * Gmail's generated types make ids/names `string | null | undefined`; rather
+ * than scatter non-null assertions (`!`), which silently propagate a bad value,
+ * fail fast with an actionable message that handleGmailError surfaces cleanly.
+ */
+export function requireField<T>(value: T | null | undefined, what: string): T {
+  if (value === null || value === undefined) {
+    throw new Error(`Gmail API response missing expected field: ${what}.`);
+  }
+  return value;
 }
 
 /** Format a Gmail API error into an actionable message. */
