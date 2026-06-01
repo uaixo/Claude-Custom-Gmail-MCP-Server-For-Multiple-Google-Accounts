@@ -281,7 +281,19 @@ export function resolveAttachments(
       );
     }
     const mimeType = a.mime_type || inferMimeType(a.filename);
-    return { filename: a.filename, mimeType, contentBase64: a.content_base64! };
+    // Validate, and normalize base64url -> standard base64, so we never embed a
+    // silently-corrupt attachment. Buffer.from is lenient (it drops invalid
+    // chars), so the regex is what actually rejects garbage; re-encoding the
+    // decoded bytes yields canonical padding for the wire.
+    const cleaned = a
+      .content_base64!.replace(/\s+/g, "")
+      .replace(/-/g, "+")
+      .replace(/_/g, "/");
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned)) {
+      throw new Error(`Attachment ${i}: 'content_base64' is not valid base64.`);
+    }
+    const contentBase64 = Buffer.from(cleaned, "base64").toString("base64");
+    return { filename: a.filename, mimeType, contentBase64 };
   });
 }
 

@@ -300,6 +300,24 @@ test("resolveAttachments requires exactly one of path or content_base64", () => 
   );
 });
 
+test("resolveAttachments rejects invalid base64 and normalizes base64url", () => {
+  // Garbage is rejected rather than silently shipped corrupt.
+  assert.throws(
+    () => resolveAttachments([{ filename: "a.bin", content_base64: "not valid base64!!" }]),
+    /not valid base64/
+  );
+  // base64url input (with - and _) is accepted and canonicalized to standard
+  // base64, decoding back to the original bytes.
+  const bytes = Buffer.from([0xfb, 0xff, 0xbf]); // -> "-_-_"-style in base64url
+  const urlSafe = bytes.toString("base64url");
+  const out = resolveAttachments([{ filename: "a.bin", content_base64: urlSafe }]);
+  assert.doesNotMatch(out[0].contentBase64, /[-_]/);
+  assert.equal(
+    Buffer.from(out[0].contentBase64, "base64").toString("hex"),
+    bytes.toString("hex")
+  );
+});
+
 // --------------------------------------------------------------------------
 // capMessageBodies  (review item #7)
 // --------------------------------------------------------------------------

@@ -37,6 +37,19 @@ import {
   oauthRedirectUri,
 } from "./constants.js";
 
+/** Minutes to wait for the user to complete Google consent before giving up. */
+const CONSENT_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Escape text for safe interpolation into the loopback callback HTML. */
+export function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 /**
  * Listen on the preferred port, falling back to an OS-assigned ephemeral port
  * if it's already in use. Resolves with the port actually bound.
@@ -135,7 +148,9 @@ async function addAccount(): Promise<void> {
       res.writeHead(200, { "Content-Type": "text/html" });
       if (err || !authCode) {
         res.end(
-          `<h2>Authorization failed</h2><p>${err || "No code returned."}</p>`
+          `<h2>Authorization failed</h2><p>${escapeHtml(
+            err || "No code returned."
+          )}</p>`
         );
         serverHttp.close();
         rejectCode(new Error(err || "No authorization code returned."));
@@ -169,8 +184,24 @@ async function addAccount(): Promise<void> {
   console.log(`If it doesn't open, visit:\n${authUrl}\n`);
   void open(authUrl);
 
-  // Wait for Google to redirect back to our loopback server with the code.
-  const code = await codePromise;
+  // Wait for Google to redirect back to our loopback server with the code, but
+  // don't hang forever if the user abandons consent.
+  const timeout = setTimeout(() => {
+    serverHttp.close();
+    rejectCode(
+      new Error(
+        `Timed out after ${
+          CONSENT_TIMEOUT_MS / 60000
+        } minutes waiting for Google consent. Re-run and complete sign-in in the browser.`
+      )
+    );
+  }, CONSENT_TIMEOUT_MS);
+  let code: string;
+  try {
+    code = await codePromise;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const { tokens } = await oAuth2Client.getToken(code);
   oAuth2Client.setCredentials(tokens);
