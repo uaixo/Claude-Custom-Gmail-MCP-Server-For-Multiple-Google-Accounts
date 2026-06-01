@@ -18,6 +18,7 @@ import {
   buildRawMessage,
   capMessageBodies,
   capText,
+  deriveReplySubject,
   extractPlainText,
   getThreadReplyHeaders,
   gmailFor,
@@ -295,7 +296,7 @@ Use for composing messages the user will review/send manually, or as a safe alte
 
 Args:
   - to (string[]): Recipient email addresses. Required.
-  - subject (string): Subject line. Required.
+  - subject (string, optional): Subject line. When omitted on a reply (thread_id set), defaults to the thread's subject, prefixed with "Re:".
   - body (string): Message body. Plain text by default, or HTML when is_html is true. Required.
   - is_html (boolean, optional): Treat body as HTML (default false).
   - attachments (object[], optional): Files to attach. Each item provides exactly one of 'path' (local file the server reads) or 'content_base64' (inline base64). 'filename' defaults to the basename for path, required for content_base64; 'mime_type' inferred from extension if omitted.
@@ -306,7 +307,12 @@ Args:
 Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
     inputSchema: {
       to: z.array(z.string().email()).min(1).describe("Recipient email addresses"),
-      subject: z.string().describe("Subject line"),
+      subject: z
+        .string()
+        .optional()
+        .describe(
+          "Subject line. Optional when replying (thread_id set): defaults to the thread's subject prefixed with 'Re:'."
+        ),
       body: z
         .string()
         .describe("Message body (plain text, or HTML when is_html is true)"),
@@ -347,7 +353,7 @@ Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
         to,
         cc,
         bcc,
-        subject,
+        subject: deriveReplySubject(subject, reply?.subject),
         body,
         isHtml: is_html,
         attachments: resolvedAttachments,
@@ -394,7 +400,7 @@ server.registerTool(
 
 Args:
   - to (string[]): Recipient email addresses. Required.
-  - subject (string): Subject line. Required.
+  - subject (string, optional): Subject line. When omitted on a reply (thread_id set), defaults to the thread's subject, prefixed with "Re:".
   - body (string): Message body. Plain text by default, or HTML when is_html is true. Required.
   - is_html (boolean, optional): Treat body as HTML (default false).
   - attachments (object[], optional): Files to attach. Each item provides exactly one of 'path' (local file the server reads) or 'content_base64' (inline base64). 'filename' defaults to the basename for path, required for content_base64; 'mime_type' inferred from extension if omitted.
@@ -406,7 +412,12 @@ Args:
 Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
     inputSchema: {
       to: z.array(z.string().email()).min(1).describe("Recipient email addresses"),
-      subject: z.string().describe("Subject line"),
+      subject: z
+        .string()
+        .optional()
+        .describe(
+          "Subject line. Optional when replying (thread_id set): defaults to the thread's subject prefixed with 'Re:'."
+        ),
       body: z
         .string()
         .describe("Message body (plain text, or HTML when is_html is true)"),
@@ -465,7 +476,7 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
         to,
         cc,
         bcc,
-        subject,
+        subject: deriveReplySubject(subject, reply?.subject),
         body,
         isHtml: is_html,
         attachments: resolvedAttachments,

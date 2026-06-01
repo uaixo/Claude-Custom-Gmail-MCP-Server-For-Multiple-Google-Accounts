@@ -100,6 +100,13 @@ export function credentialsRefFor(file: string): string {
 }
 
 /**
+ * Whether we've already warned about an unparseable token store this process.
+ * loadTokens runs on nearly every tool call, so we warn once (and re-arm on a
+ * successful parse) rather than spamming the log on every read.
+ */
+let warnedCorruptTokenStore = false;
+
+/**
  * Load the token store, migrating any legacy entries (raw Credentials written
  * before per-account credential files) to the current shape, defaulting their
  * credential file to the basename of the default credentials path.
@@ -110,7 +117,18 @@ export function loadTokens(): TokenStore {
   let raw: Record<string, unknown>;
   try {
     raw = JSON.parse(fs.readFileSync(file, "utf-8"));
-  } catch {
+    warnedCorruptTokenStore = false;
+  } catch (e) {
+    // A corrupt store shouldn't crash the server, but failing silently here
+    // makes every account look disconnected with no explanation — surface it.
+    if (!warnedCorruptTokenStore) {
+      warnedCorruptTokenStore = true;
+      console.error(
+        `Warning: could not parse token store at ${file} (${
+          (e as Error).message
+        }). Treating it as empty; connected accounts will be unavailable until it is repaired or re-created with \`npm run add-account\`.`
+      );
+    }
     return {};
   }
   const defaultRef = path.basename(credentialsPath());
