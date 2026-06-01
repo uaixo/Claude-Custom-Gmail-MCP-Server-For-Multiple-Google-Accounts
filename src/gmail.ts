@@ -281,7 +281,19 @@ export function resolveAttachments(
       );
     }
     const mimeType = a.mime_type || inferMimeType(a.filename);
-    return { filename: a.filename, mimeType, contentBase64: a.content_base64! };
+    // Validate, and normalize base64url -> standard base64, so we never embed a
+    // silently-corrupt attachment. Buffer.from is lenient (it drops invalid
+    // chars), so the regex is what actually rejects garbage; re-encoding the
+    // decoded bytes yields canonical padding for the wire.
+    const cleaned = a
+      .content_base64!.replace(/\s+/g, "")
+      .replace(/-/g, "+")
+      .replace(/_/g, "/");
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned)) {
+      throw new Error(`Attachment ${i}: 'content_base64' is not valid base64.`);
+    }
+    const contentBase64 = Buffer.from(cleaned, "base64").toString("base64");
+    return { filename: a.filename, mimeType, contentBase64 };
   });
 }
 
@@ -291,6 +303,27 @@ function encodeHeaderWord(value: string): string {
   // eslint-disable-next-line no-control-regex
   if (/^[\x00-\x7F]*$/.test(value)) return value;
   return `=?UTF-8?B?${Buffer.from(value, "utf-8").toString("base64")}?=`;
+}
+
+/**
+ * Remove CR/LF from a header value to prevent header injection. RFC 2822
+ * headers are CRLF-delimited, so an embedded newline in a user-supplied value
+ * (subject, recipients, message-id, mime type, ...) could otherwise inject
+ * additional headers. CR/LF is collapsed to a space rather than rejected so a
+ * value with a stray newline still sends.
+ */
+function sanitizeHeaderValue(value: string): string {
+  return value.replace(/[\r\n]+/g, " ");
+}
+
+/**
+ * Sanitize a filename for use inside a quoted MIME parameter
+ * (name="…" / filename="…"): strip CR/LF and neutralize the quote and backslash
+ * characters that would otherwise terminate or escape the quoted string.
+ * Non-ASCII still goes through RFC 2047 encoding via encodeHeaderWord.
+ */
+function sanitizeFilename(name: string): string {
+  return name.replace(/[\r\n]+/g, " ").replace(/["\\]/g, "_");
 }
 
 /** Wrap a long base64 string into 76-char lines per RFC 2045. */
@@ -346,15 +379,18 @@ export function buildRawMessage(opts: {
   references?: string;
 }): string {
   const headers: string[] = [];
-  if (opts.from) headers.push(`From: ${opts.from}`);
-  headers.push(`To: ${opts.to.join(", ")}`);
-  if (opts.cc?.length) headers.push(`Cc: ${opts.cc.join(", ")}`);
+  if (opts.from) headers.push(`From: ${sanitizeHeaderValue(opts.from)}`);
+  headers.push(`To: ${sanitizeHeaderValue(opts.to.join(", "))}`);
+  if (opts.cc?.length) headers.push(`Cc: ${sanitizeHeaderValue(opts.cc.join(", "))}`);
   // The Bcc header is how Gmail learns the blind recipients for a raw send; it
   // strips the header before delivery, so it is not leaked to To/Cc. Keep it.
-  if (opts.bcc?.length) headers.push(`Bcc: ${opts.bcc.join(", ")}`);
-  headers.push(`Subject: ${encodeHeaderWord(opts.subject)}`);
-  if (opts.inReplyTo) headers.push(`In-Reply-To: ${opts.inReplyTo}`);
-  if (opts.references) headers.push(`References: ${opts.references}`);
+  if (opts.bcc?.length)
+    headers.push(`Bcc: ${sanitizeHeaderValue(opts.bcc.join(", "))}`);
+  headers.push(`Subject: ${encodeHeaderWord(sanitizeHeaderValue(opts.subject))}`);
+  if (opts.inReplyTo)
+    headers.push(`In-Reply-To: ${sanitizeHeaderValue(opts.inReplyTo)}`);
+  if (opts.references)
+    headers.push(`References: ${sanitizeHeaderValue(opts.references)}`);
   headers.push("MIME-Version: 1.0");
 
   const bodyContentType = opts.isHtml
@@ -390,11 +426,12 @@ export function buildRawMessage(opts: {
   );
 
   for (const att of attachments) {
-    const encodedName = encodeHeaderWord(att.filename);
+    const encodedName = encodeHeaderWord(sanitizeFilename(att.filename));
+    const safeMime = sanitizeHeaderValue(att.mimeType);
     parts.push(
       [
         `--${boundary}`,
-        `Content-Type: ${att.mimeType}; name="${encodedName}"`,
+        `Content-Type: ${safeMime}; name="${encodedName}"`,
         "Content-Transfer-Encoding: base64",
         `Content-Disposition: attachment; filename="${encodedName}"`,
         "",

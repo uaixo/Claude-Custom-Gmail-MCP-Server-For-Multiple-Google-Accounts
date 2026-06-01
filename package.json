@@ -4,6 +4,9 @@
   "description": "MCP server for Gmail with multi-account support (per-account OAuth)",
   "type": "module",
   "main": "dist/index.js",
+  "files": [
+    "dist"
+  ],
   "bin": {
     "gmail-mcp-server": "dist/index.js",
     "gmail-mcp-add-account": "dist/add-account.js"
@@ -16,6 +19,7 @@
     "remove-account": "node dist/add-account.js --remove",
     "dev": "tsx watch src/index.ts",
     "clean": "rm -rf dist",
+    "prepare": "npm run build",
     "pretest": "npm run build",
     "test": "node --test"
   },

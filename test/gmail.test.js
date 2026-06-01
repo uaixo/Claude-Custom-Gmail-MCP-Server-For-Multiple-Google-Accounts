@@ -166,6 +166,50 @@ test("buildRawMessage emits threading headers when provided", () => {
   assert.match(mime, /References: <msg-1@mail\.example> <msg-2@mail\.example>/);
 });
 
+test("buildRawMessage neutralizes CRLF header injection via subject", () => {
+  const raw = buildRawMessage({
+    to: ["a@b.com"],
+    subject: "Hello\r\nBcc: evil@attacker.com",
+    body: "hi",
+  });
+  const mime = decodeBase64Url(raw);
+  // The injected text must NOT become its own header line...
+  assert.doesNotMatch(mime, /^Bcc: evil@attacker\.com/m);
+  // ...it stays folded into the Subject value (CRLF collapsed to a space).
+  assert.match(mime, /^Subject: Hello Bcc: evil@attacker\.com$/m);
+});
+
+test("buildRawMessage neutralizes injection via attachment filename and mime type", () => {
+  const raw = buildRawMessage({
+    to: ["a@b.com"],
+    subject: "s",
+    body: "b",
+    attachments: [
+      {
+        filename: 'evil"\r\nX-Injected: 1.txt',
+        mimeType: "text/plain\r\nX-Evil: 1",
+        contentBase64: "QQ==",
+      },
+    ],
+  });
+  const mime = decodeBase64Url(raw);
+  assert.doesNotMatch(mime, /^X-Injected:/m);
+  assert.doesNotMatch(mime, /^X-Evil:/m);
+  // The raw quote in the filename is neutralized, so it can't break the quoting.
+  assert.doesNotMatch(mime, /filename="evil"/);
+});
+
+test("buildRawMessage neutralizes CRLF injection via in_reply_to", () => {
+  const raw = buildRawMessage({
+    to: ["a@b.com"],
+    subject: "s",
+    body: "b",
+    inReplyTo: "<x@y>\r\nBcc: evil@attacker.com",
+    references: "<x@y>",
+  });
+  assert.doesNotMatch(decodeBase64Url(raw), /^Bcc:/m);
+});
+
 test("buildRawMessage rejects a message over the 25 MB limit with a clear error", () => {
   const overB64 = Buffer.alloc(26 * 1024 * 1024, 0x41).toString("base64");
   assert.throws(
@@ -253,6 +297,24 @@ test("resolveAttachments requires exactly one of path or content_base64", () => 
   assert.throws(
     () => resolveAttachments([{ path: "/x", content_base64: "QQ==" }]),
     /exactly one of 'path' or 'content_base64'/
+  );
+});
+
+test("resolveAttachments rejects invalid base64 and normalizes base64url", () => {
+  // Garbage is rejected rather than silently shipped corrupt.
+  assert.throws(
+    () => resolveAttachments([{ filename: "a.bin", content_base64: "not valid base64!!" }]),
+    /not valid base64/
+  );
+  // base64url input (with - and _) is accepted and canonicalized to standard
+  // base64, decoding back to the original bytes.
+  const bytes = Buffer.from([0xfb, 0xff, 0xbf]); // -> "-_-_"-style in base64url
+  const urlSafe = bytes.toString("base64url");
+  const out = resolveAttachments([{ filename: "a.bin", content_base64: urlSafe }]);
+  assert.doesNotMatch(out[0].contentBase64, /[-_]/);
+  assert.equal(
+    Buffer.from(out[0].contentBase64, "base64").toString("hex"),
+    bytes.toString("hex")
   );
 });
 

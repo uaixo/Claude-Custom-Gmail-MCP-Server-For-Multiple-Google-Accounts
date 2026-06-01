@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import path from "node:path";
 
-import { listenWithFallback } from "../dist/add-account.js";
+import { listenWithFallback, escapeHtml } from "../dist/add-account.js";
 import {
   oauthRedirectUri,
   OAUTH_REDIRECT_PORT,
@@ -27,6 +27,10 @@ const aFreePort = async () => {
 test("oauthRedirectUri formats per-port and defaults to the preferred port", () => {
   assert.equal(oauthRedirectUri(12345), "http://localhost:12345/oauth2callback");
   assert.equal(oauthRedirectUri(), `http://localhost:${OAUTH_REDIRECT_PORT}/oauth2callback`);
+});
+
+test("escapeHtml neutralizes HTML metacharacters in the OAuth callback page", () => {
+  assert.equal(escapeHtml(`<script>"&'`), "&lt;script&gt;&quot;&amp;&#39;");
 });
 
 test("attachmentDirs is empty when unset and splits the env var on the path delimiter", () => {
