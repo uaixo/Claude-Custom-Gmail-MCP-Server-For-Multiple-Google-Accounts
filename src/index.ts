@@ -13,7 +13,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { listAccounts } from "./auth.js";
+import { cleanupStaleTokenTemps, listAccounts } from "./auth.js";
 import {
   buildRawMessage,
   capMessageBodies,
@@ -715,6 +715,7 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
 // Startup
 // ---------------------------------------------------------------------------
 async function main(): Promise<void> {
+  cleanupStaleTokenTemps();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const accounts = listAccounts();
