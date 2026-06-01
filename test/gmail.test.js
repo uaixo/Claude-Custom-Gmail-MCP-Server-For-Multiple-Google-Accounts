@@ -14,6 +14,7 @@ import {
   resolveAttachments,
   decodeBase64Url,
   capMessageBodies,
+  deriveReplySubject,
 } from "../dist/gmail.js";
 
 const b64url = (s) => Buffer.from(s, "utf-8").toString("base64url");
@@ -122,6 +123,17 @@ test("extractPlainText keeps an inline text part as the body", () => {
 
 test("htmlToText converts <br> to a newline", () => {
   assert.equal(htmlToText("a<br>b"), "a\nb");
+});
+
+test("htmlToText removes HTML comments even when they contain '>'", () => {
+  // The generic <[^>]+> pass stops at the first '>', so comments are stripped
+  // up front instead. Collapse internal whitespace just for the comparison.
+  assert.equal(
+    htmlToText("Hello <!-- a > b --> World").replace(/\s+/g, " ").trim(),
+    "Hello World"
+  );
+  // A script hidden inside a comment is removed with the comment.
+  assert.doesNotMatch(htmlToText("x<!-- <script>evil()</script> -->y"), /evil/);
 });
 
 // --------------------------------------------------------------------------
@@ -256,6 +268,60 @@ test("buildRawMessage neutralizes CRLF injection via in_reply_to", () => {
     references: "<x@y>",
   });
   assert.doesNotMatch(decodeBase64Url(raw), /^Bcc:/m);
+});
+
+test("buildRawMessage folds long header lines to <=78 octets, unfolding intact", () => {
+  const to = Array.from({ length: 80 }, (_, i) => `user${i}@example.com`);
+  const references = Array.from(
+    { length: 60 },
+    (_, i) => `<msg-${i}@example.com>`
+  ).join(" ");
+  const mime = decodeBase64Url(buildRawMessage({ to, subject: "s", body: "b", references }));
+  const headerBlock = mime.split("\r\n\r\n")[0];
+  for (const line of headerBlock.split("\r\n")) {
+    assert.ok(line.length <= 78, `header line exceeds 78 octets (${line.length}): ${line}`);
+  }
+  // Unfolding (drop a CRLF that is followed by a space) restores the originals.
+  const unfolded = mime.replace(/\r\n /g, " ");
+  assert.ok(unfolded.includes(`To: ${to.join(", ")}`), "To did not unfold to the original");
+  assert.ok(
+    unfolded.includes(`References: ${references}`),
+    "References did not unfold to the original"
+  );
+});
+
+test("buildRawMessage splits a long non-ASCII subject into RFC 2047 words within 75 chars", () => {
+  const subject = "テスト".repeat(40); // long, multi-byte
+  const mime = decodeBase64Url(buildRawMessage({ to: ["a@b.com"], subject, body: "b" }));
+  const words = mime.match(/=\?UTF-8\?B\?[^?]*\?=/g) || [];
+  assert.ok(words.length >= 2, "expected the subject to span multiple encoded-words");
+  for (const w of words) {
+    assert.ok(w.length <= 75, `encoded-word exceeds 75 chars: ${w.length}`);
+  }
+  // The encoded-words decode and concatenate back to the original subject.
+  const decoded = words
+    .map((w) => Buffer.from(w.slice(10, -2), "base64").toString("utf-8"))
+    .join("");
+  assert.equal(decoded, subject);
+});
+
+test("buildRawMessage keeps a short non-ASCII filename as a single encoded-word", () => {
+  const mime = decodeBase64Url(
+    buildRawMessage({
+      to: ["a@b.com"],
+      subject: "s",
+      body: "b",
+      attachments: [
+        { filename: "résumé.pdf", mimeType: "application/pdf", contentBase64: "QQ==" },
+      ],
+    })
+  );
+  const distinct = new Set(mime.match(/=\?UTF-8\?B\?[^?]*\?=/g));
+  assert.equal(distinct.size, 1, "filename should be exactly one encoded-word");
+  assert.ok(
+    !distinct.values().next().value.includes(" "),
+    "the filename encoded-word must not contain a space"
+  );
 });
 
 test("buildRawMessage rejects a message over the 25 MB limit with a clear error", () => {
@@ -407,4 +473,17 @@ test("capMessageBodies preserves non-body fields", () => {
   const r = capMessageBodies([{ body: "x".repeat(50), message_id: "m1", from: "a@b" }], 10);
   assert.equal(r.messages[0].message_id, "m1");
   assert.equal(r.messages[0].from, "a@b");
+});
+
+// --------------------------------------------------------------------------
+// deriveReplySubject  (review item #6)
+// --------------------------------------------------------------------------
+test("deriveReplySubject prefers an explicit subject, else derives from the thread", () => {
+  assert.equal(deriveReplySubject("Custom", "Thread topic"), "Custom");
+  assert.equal(deriveReplySubject("", "Thread topic"), ""); // explicit empty is honored
+  assert.equal(deriveReplySubject(undefined, "Thread topic"), "Re: Thread topic");
+  assert.equal(deriveReplySubject(undefined, "Re: Thread topic"), "Re: Thread topic");
+  assert.equal(deriveReplySubject(undefined, "RE: shouting"), "RE: shouting");
+  assert.equal(deriveReplySubject(undefined, "   "), "");
+  assert.equal(deriveReplySubject(undefined, undefined), "");
 });

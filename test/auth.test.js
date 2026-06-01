@@ -98,3 +98,18 @@ test("token store mutations steal a stale lock and release it (#7)", async () =>
   assert.ok(auth.listAccounts().includes("lock@test.com"), "write should succeed");
   assert.ok(!fs.existsSync(lock), "lock should be released after the write");
 });
+
+test("loadTokens returns empty without throwing on a corrupt store (#8)", () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.readFileSync(file, "utf-8");
+  try {
+    fs.writeFileSync(file, "{ not valid json");
+    let result;
+    assert.doesNotThrow(() => {
+      result = auth.loadTokens();
+    });
+    assert.deepEqual(result, {});
+  } finally {
+    fs.writeFileSync(file, saved); // restore for any later readers
+  }
+});

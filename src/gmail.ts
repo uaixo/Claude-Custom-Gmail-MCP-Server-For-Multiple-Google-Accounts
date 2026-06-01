@@ -100,6 +100,22 @@ export async function getThreadReplyHeaders(
 }
 
 /**
+ * Choose the subject line for a (possibly reply) message. An explicit subject
+ * always wins. When it's omitted and we're replying into a thread, fall back to
+ * the thread's subject, prefixing "Re: " unless it already has one. Returns ""
+ * when there's nothing to derive from (Gmail shows that as "(no subject)").
+ */
+export function deriveReplySubject(
+  explicit: string | undefined,
+  threadSubject: string | undefined
+): string {
+  if (explicit !== undefined) return explicit;
+  const base = (threadSubject || "").trim();
+  if (!base) return "";
+  return /^re:/i.test(base) ? base : `Re: ${base}`;
+}
+
+/**
  * True when a message part is an attachment rather than body content. Body
  * extraction must skip these: an HTML-only email that also carries a text/plain
  * or text/html attachment (e.g. a .csv or .txt) would otherwise have the
@@ -158,6 +174,9 @@ function decodeHtmlEntities(text: string): string {
 export function htmlToText(html: string): string {
   return decodeHtmlEntities(
     html
+      // Strip comments first: a comment can contain '>' (e.g. "<!-- a > b -->"),
+      // which the generic tag pass below would only partially remove.
+      .replace(/<!--[\s\S]*?-->/g, "")
       .replace(/<style[\s\S]*?<\/style>/gi, "")
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<br\s*\/?>/gi, "\n")
@@ -315,12 +334,42 @@ export function resolveAttachments(
   });
 }
 
-/** RFC 2047 base64-encode a header value so non-ASCII survives. */
+/**
+ * Cap each encoded-word at 45 UTF-8 bytes: base64 of 45 bytes is 60 chars, and
+ * with the `=?UTF-8?B?` ... `?=` overhead (12 chars) that's 72 — within RFC
+ * 2047's 75-char-per-encoded-word limit.
+ */
+const MAX_ENCODED_WORD_BYTES = 45;
+
+/**
+ * RFC 2047 base64-encode a header value so non-ASCII survives. A long value is
+ * split into multiple encoded-words (each within the 75-char limit), broken on
+ * code-point boundaries so a multi-byte character is never split across words.
+ * Adjacent encoded-words are space-separated; decoders concatenate them and
+ * ignore the separating whitespace. Pure-ASCII values are returned unchanged so
+ * plain subjects stay readable on the wire.
+ */
 function encodeHeaderWord(value: string): string {
-  // Only encode if it contains non-ASCII; keeps plain subjects readable on the wire.
   // eslint-disable-next-line no-control-regex
   if (/^[\x00-\x7F]*$/.test(value)) return value;
-  return `=?UTF-8?B?${Buffer.from(value, "utf-8").toString("base64")}?=`;
+  const words: string[] = [];
+  let chunk = "";
+  let chunkBytes = 0;
+  const flush = () => {
+    if (chunk === "") return;
+    words.push(`=?UTF-8?B?${Buffer.from(chunk, "utf-8").toString("base64")}?=`);
+    chunk = "";
+    chunkBytes = 0;
+  };
+  for (const ch of value) {
+    // for...of iterates by code point, so `ch` is never half a surrogate pair.
+    const n = Buffer.byteLength(ch, "utf-8");
+    if (chunkBytes + n > MAX_ENCODED_WORD_BYTES) flush();
+    chunk += ch;
+    chunkBytes += n;
+  }
+  flush();
+  return words.join(" ");
 }
 
 /**
@@ -342,6 +391,42 @@ function sanitizeHeaderValue(value: string): string {
  */
 function sanitizeFilename(name: string): string {
   return name.replace(/[\r\n]+/g, " ").replace(/["\\]/g, "_");
+}
+
+/**
+ * Fold a header line so no line exceeds 78 octets (RFC 5322 recommends ≤78; the
+ * hard limit is 998). Folds only at existing spaces — inserting a CRLF before a
+ * space, which then serves as the continuation line's indent — so unfolding
+ * restores the value byte-for-byte. This keeps long recipient lists, References
+ * chains, and multi-word encoded subjects within spec; a single token longer
+ * than the limit (e.g. one very long address) is left intact rather than broken.
+ */
+function foldHeaderLine(line: string): string {
+  const LIMIT = 78;
+  if (line.length <= LIMIT) return line;
+  const segments: string[] = [];
+  let start = 0;
+  while (line.length - start > LIMIT) {
+    // Prefer the last space within the limit; otherwise the first space past it
+    // (never break inside a token).
+    let foldAt = -1;
+    for (let i = Math.min(start + LIMIT, line.length - 1); i > start; i--) {
+      if (line[i] === " ") {
+        foldAt = i;
+        break;
+      }
+    }
+    if (foldAt === -1) {
+      let i = start + LIMIT;
+      while (i < line.length && line[i] !== " ") i++;
+      if (i >= line.length) break; // no more fold points; emit the rest as-is
+      foldAt = i;
+    }
+    segments.push(line.slice(start, foldAt));
+    start = foldAt; // the space at foldAt becomes the next line's leading indent
+  }
+  segments.push(line.slice(start));
+  return segments.join("\r\n");
 }
 
 /** Wrap a long base64 string into 76-char lines per RFC 2045. */
@@ -411,6 +496,10 @@ export function buildRawMessage(opts: {
     headers.push(`References: ${sanitizeHeaderValue(opts.references)}`);
   headers.push("MIME-Version: 1.0");
 
+  // Fold long header lines (recipient lists, References chains, multi-word
+  // encoded subjects) to stay within RFC 5322's line-length limit.
+  const foldedHeaders = headers.map(foldHeaderLine);
+
   const bodyContentType = opts.isHtml
     ? 'text/html; charset="UTF-8"'
     : 'text/plain; charset="UTF-8"';
@@ -420,7 +509,7 @@ export function buildRawMessage(opts: {
   // Simple case: no attachments → single body part.
   if (attachments.length === 0) {
     const lines = [
-      ...headers,
+      ...foldedHeaders,
       `Content-Type: ${bodyContentType}`,
       "Content-Transfer-Encoding: base64",
       "",
@@ -459,7 +548,7 @@ export function buildRawMessage(opts: {
   }
 
   const lines = [
-    ...headers,
+    ...foldedHeaders,
     `Content-Type: multipart/mixed; boundary="${boundary}"`,
     "",
     parts.join("\r\n"),
