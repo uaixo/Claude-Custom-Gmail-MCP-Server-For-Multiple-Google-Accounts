@@ -166,6 +166,50 @@ test("buildRawMessage emits threading headers when provided", () => {
   assert.match(mime, /References: <msg-1@mail\.example> <msg-2@mail\.example>/);
 });
 
+test("buildRawMessage neutralizes CRLF header injection via subject", () => {
+  const raw = buildRawMessage({
+    to: ["a@b.com"],
+    subject: "Hello\r\nBcc: evil@attacker.com",
+    body: "hi",
+  });
+  const mime = decodeBase64Url(raw);
+  // The injected text must NOT become its own header line...
+  assert.doesNotMatch(mime, /^Bcc: evil@attacker\.com/m);
+  // ...it stays folded into the Subject value (CRLF collapsed to a space).
+  assert.match(mime, /^Subject: Hello Bcc: evil@attacker\.com$/m);
+});
+
+test("buildRawMessage neutralizes injection via attachment filename and mime type", () => {
+  const raw = buildRawMessage({
+    to: ["a@b.com"],
+    subject: "s",
+    body: "b",
+    attachments: [
+      {
+        filename: 'evil"\r\nX-Injected: 1.txt',
+        mimeType: "text/plain\r\nX-Evil: 1",
+        contentBase64: "QQ==",
+      },
+    ],
+  });
+  const mime = decodeBase64Url(raw);
+  assert.doesNotMatch(mime, /^X-Injected:/m);
+  assert.doesNotMatch(mime, /^X-Evil:/m);
+  // The raw quote in the filename is neutralized, so it can't break the quoting.
+  assert.doesNotMatch(mime, /filename="evil"/);
+});
+
+test("buildRawMessage neutralizes CRLF injection via in_reply_to", () => {
+  const raw = buildRawMessage({
+    to: ["a@b.com"],
+    subject: "s",
+    body: "b",
+    inReplyTo: "<x@y>\r\nBcc: evil@attacker.com",
+    references: "<x@y>",
+  });
+  assert.doesNotMatch(decodeBase64Url(raw), /^Bcc:/m);
+});
+
 test("buildRawMessage rejects a message over the 25 MB limit with a clear error", () => {
   const overB64 = Buffer.alloc(26 * 1024 * 1024, 0x41).toString("base64");
   assert.throws(
