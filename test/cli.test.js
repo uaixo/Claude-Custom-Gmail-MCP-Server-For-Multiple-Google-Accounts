@@ -15,7 +15,11 @@ import {
 } from "../dist/constants.js";
 
 const close = (s) => new Promise((r) => s.close(r));
-const listen = (s, port) => new Promise((r) => s.listen(port, r));
+// Bind on the loopback interface, matching listenWithFallback. A wildcard
+// (0.0.0.0) holder would not reliably collide with a specific 127.0.0.1 bind on
+// the same port on macOS/Windows (only Linux returns EADDRINUSE there), which
+// would make the "port is busy" fallback test pass on Linux but fail elsewhere.
+const listen = (s, port) => new Promise((r) => s.listen(port, "127.0.0.1", r));
 // Bind an ephemeral port, read it, release it — a port we know was free.
 const aFreePort = async () => {
   const s = http.createServer();
