@@ -89,6 +89,16 @@ If all your accounts are under a *single* OAuth client, ignore this — one `cre
 
 > Setting `GMAIL_OAUTH_CREDENTIALS` forces that single file and disables auto-discovery.
 
+### One-command setup
+
+Once `credentials.json` is in place (step 2 above), a single command installs dependencies, builds, and connects your first account:
+
+```bash
+npm run setup
+```
+
+This runs `npm install` → `npm run build` → `npm run add-account` in sequence; the last step opens a browser consent screen. To connect additional mailboxes afterwards, run `npm run add-account` again per account. The manual steps below are equivalent if you'd rather run them individually.
+
 ### 3. Install and build
 
 Same commands on both platforms, run in the project folder:
