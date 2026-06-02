@@ -211,6 +211,10 @@ export function htmlToText(html: string): string {
       // Strip comments first: a comment can contain '>' (e.g. "<!-- a > b -->"),
       // which the generic tag pass below would only partially remove.
       .replace(/<!--[\s\S]*?-->/g, "")
+      // Drop the document head (title, meta, etc.) so its non-visible text
+      // doesn't leak into the body. A stray <title> outside <head> is handled too.
+      .replace(/<head[\s\S]*?<\/head>/gi, "")
+      .replace(/<title[\s\S]*?<\/title>/gi, "")
       .replace(/<style[\s\S]*?<\/style>/gi, "")
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<br\s*\/?>/gi, "\n")
@@ -368,6 +372,14 @@ export function resolveAttachments(
   });
 }
 
+/** True when every character of `value` is in the ASCII range (≤ U+007F). */
+function isAscii(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    if (value.charCodeAt(i) > 0x7f) return false;
+  }
+  return true;
+}
+
 /**
  * Cap each encoded-word at 45 UTF-8 bytes: base64 of 45 bytes is 60 chars, and
  * with the `=?UTF-8?B?` ... `?=` overhead (12 chars) that's 72 — within RFC
@@ -384,8 +396,9 @@ const MAX_ENCODED_WORD_BYTES = 45;
  * plain subjects stay readable on the wire.
  */
 function encodeHeaderWord(value: string): string {
-  // eslint-disable-next-line no-control-regex
-  if (/^[\x00-\x7F]*$/.test(value)) return value;
+  // Pure-ASCII values need no encoding. Checked by code unit rather than a
+  // control-char regex so the function carries no lint-suppression baggage.
+  if (isAscii(value)) return value;
   const words: string[] = [];
   let chunk = "";
   let chunkBytes = 0;
@@ -633,12 +646,19 @@ export function handleGmailError(error: unknown): string {
   }
 }
 
-/** Truncate an oversized text payload with a clear note. */
-export function capText(text: string, note: string): string {
-  if (text.length <= CHARACTER_LIMIT) return text;
+/**
+ * Render a structured result as pretty JSON for the text channel without ever
+ * emitting *invalid* JSON. Slicing a serialized object mid-string (the old
+ * behavior) produced unparseable text; when the JSON would exceed the character
+ * budget we instead return a short plain-text notice pointing at
+ * structuredContent, which always carries the authoritative, complete result.
+ */
+export function renderJsonText(value: unknown, note: string): string {
+  const json = JSON.stringify(value, null, 2);
+  if (json.length <= CHARACTER_LIMIT) return json;
   return (
-    text.slice(0, CHARACTER_LIMIT) +
-    `\n\n[Truncated at ${CHARACTER_LIMIT} characters. ${note}]`
+    `[Result too large to render as text (${json.length} characters); the ` +
+    `complete result is available in structuredContent. ${note}]`
   );
 }
 
