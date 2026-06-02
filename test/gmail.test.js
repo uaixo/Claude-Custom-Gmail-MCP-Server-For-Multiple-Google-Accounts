@@ -10,6 +10,7 @@ import {
   mapWithConcurrency,
   getThreadReplyHeaders,
   buildReplyHeaders,
+  summarizeThread,
   buildRawMessage,
   handleGmailError,
   resolveAttachments,
@@ -189,6 +190,22 @@ test("htmlToText drops a stray <title> outside <head>", () => {
   assert.equal(htmlToText("<title>Just a title</title>Body text"), "Body text");
 });
 
+test("htmlToText decodes entities in one pass without double-decoding (#B)", () => {
+  // &amp;lt; must render as the literal &lt;, not < (the old chained-replace bug).
+  assert.equal(htmlToText("x &amp;lt; y"), "x &lt; y");
+  // A plain &amp; still decodes to a single &.
+  assert.equal(htmlToText("a &amp; b"), "a & b");
+  // Decimal and hex numeric character references.
+  assert.equal(htmlToText("&#65;&#x42;&#67;"), "ABC");
+  assert.equal(htmlToText("&#039;"), "'"); // leading zeros, decimal apostrophe
+});
+
+test("htmlToText survives an out-of-range numeric entity without throwing (#B)", () => {
+  // > 0x10FFFF would make String.fromCodePoint throw; must be swallowed.
+  assert.doesNotThrow(() => htmlToText("hello &#x110000; world"));
+  assert.match(htmlToText("hello &#x110000; world"), /hello/);
+});
+
 test("htmlToText removes HTML comments even when they contain '>'", () => {
   // The generic <[^>]+> pass stops at the first '>', so comments are stripped
   // up front instead. Collapse internal whitespace just for the comparison.
@@ -338,6 +355,80 @@ test("buildReplyHeaders threads on an explicit in_reply_to with no thread", () =
     inReplyTo: "<only@x>",
     references: "<only@x>",
   });
+});
+
+// --------------------------------------------------------------------------
+// summarizeThread — per-thread degradation on search  (review item #A)
+// --------------------------------------------------------------------------
+function mockGmailGet(handler) {
+  return { users: { threads: { get: handler } } };
+}
+
+test("summarizeThread returns first-message metadata for a thread", async () => {
+  const gmail = mockGmailGet(async () => ({
+    data: {
+      messages: [
+        {
+          snippet: "real snippet",
+          payload: {
+            headers: [
+              { name: "Subject", value: "Hello" },
+              { name: "From", value: "a@b.com" },
+              { name: "Date", value: "Mon, 1 Jan 2026 00:00:00 -0000" },
+            ],
+          },
+        },
+      ],
+    },
+  }));
+  const out = await summarizeThread(gmail, { id: "t1", snippet: "list snippet" });
+  assert.equal(out.thread_id, "t1");
+  assert.equal(out.subject, "Hello");
+  assert.equal(out.from, "a@b.com");
+  assert.equal(out.snippet, "real snippet"); // prefers the fetched snippet
+  assert.equal(out.error, undefined);
+});
+
+test("summarizeThread degrades to an error entry when the fetch fails (#A)", async () => {
+  const gmail = mockGmailGet(async () => {
+    const e = new Error("boom");
+    e.code = 429;
+    throw e;
+  });
+  const out = await summarizeThread(gmail, { id: "t2", snippet: "fallback" });
+  assert.equal(out.thread_id, "t2"); // still identified from the list result
+  assert.equal(out.snippet, "fallback"); // falls back to the list snippet
+  assert.equal(out.subject, "");
+  assert.match(out.error, /Rate limit/);
+});
+
+test("summarizeThread captures a missing thread id instead of throwing (#A)", async () => {
+  const gmail = mockGmailGet(async () => {
+    throw new Error("get should not be called without an id");
+  });
+  const out = await summarizeThread(gmail, { snippet: "s" });
+  assert.equal(out.thread_id, "");
+  assert.ok(out.error, "a missing id is reported as an error, not thrown");
+});
+
+test("one failing thread does not sink the whole search batch (#A)", async () => {
+  const gmail = mockGmailGet(async ({ id }) => {
+    if (id === "bad") {
+      const e = new Error("server error");
+      e.code = 500;
+      throw e;
+    }
+    return {
+      data: { messages: [{ payload: { headers: [{ name: "Subject", value: `S-${id}` }] } }] },
+    };
+  });
+  const threads = [{ id: "a" }, { id: "bad" }, { id: "c" }];
+  const out = await mapWithConcurrency(threads, 5, (t) => summarizeThread(gmail, t));
+  assert.equal(out.length, 3);
+  assert.equal(out[0].subject, "S-a");
+  assert.ok(out[1].error, "the failing thread carries an error");
+  assert.equal(out[1].subject, "");
+  assert.equal(out[2].subject, "S-c");
 });
 
 // --------------------------------------------------------------------------

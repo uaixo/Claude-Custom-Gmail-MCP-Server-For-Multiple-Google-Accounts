@@ -124,6 +124,57 @@ export async function getThreadReplyHeaders(
   return { inReplyTo: messageId, references, subject };
 }
 
+/** Lightweight per-thread summary returned by a search. */
+export interface ThreadSummary {
+  thread_id: string;
+  subject: string;
+  from: string;
+  date: string;
+  snippet: string;
+  /** Set only when this thread's details couldn't be fetched. */
+  error?: string;
+}
+
+/**
+ * Fetch lightweight metadata (first message's Subject/From/Date) for one thread
+ * in a search result. A per-thread failure — a transient 429/5xx, or a thread
+ * deleted between the list and this get — is captured as an `error` field on a
+ * degraded entry rather than thrown, so one bad thread doesn't sink the whole
+ * search. Falls back to the list snippet when the full fetch is unavailable.
+ */
+export async function summarizeThread(
+  gmail: gmail_v1.Gmail,
+  thread: gmail_v1.Schema$Thread
+): Promise<ThreadSummary> {
+  const threadId = thread.id || "";
+  try {
+    const id = requireField(thread.id, "thread.id");
+    const full = await gmail.users.threads.get({
+      userId: "me",
+      id,
+      format: "metadata",
+      metadataHeaders: ["Subject", "From", "Date"],
+    });
+    const first = full.data.messages?.[0];
+    return {
+      thread_id: id,
+      subject: header(first?.payload, "Subject"),
+      from: header(first?.payload, "From"),
+      date: header(first?.payload, "Date"),
+      snippet: first?.snippet || thread.snippet || "",
+    };
+  } catch (error) {
+    return {
+      thread_id: threadId,
+      subject: "",
+      from: "",
+      date: "",
+      snippet: thread.snippet || "",
+      error: handleGmailError(error),
+    };
+  }
+}
+
 /**
  * Combine an explicit In-Reply-To with a thread's derived reply headers into a
  * consistent pair for buildRawMessage. RFC 5322 threading is only well-formed
@@ -214,19 +265,45 @@ function findPartBody(
   return "";
 }
 
-/** Decode the handful of HTML entities that commonly appear in email bodies. */
+/** The handful of named HTML entities that commonly appear in email bodies. */
+const NAMED_ENTITIES: Record<string, string> = {
+  nbsp: " ",
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+};
+
+/** String.fromCodePoint, but yields "" instead of throwing on an invalid code point. */
+function safeFromCodePoint(code: number): string {
+  try {
+    return String.fromCodePoint(code);
+  } catch {
+    return ""; // out of range (> 0x10FFFF) or otherwise invalid — drop it
+  }
+}
+
+/**
+ * Decode the handful of HTML entities that commonly appear in email bodies. A
+ * single left-to-right pass (rather than chained .replace() calls) avoids
+ * double-decoding: e.g. "&amp;lt;" decodes to the literal "&lt;", not "<",
+ * because scanning resumes after each match instead of re-reading the "&".
+ * Numeric references are bounds-checked so a malformed value can't throw.
+ */
 function decodeHtmlEntities(text: string): string {
-  return text
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#0*39;|&apos;/gi, "'")
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
-      String.fromCodePoint(parseInt(hex, 16))
-    )
-    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
+  return text.replace(
+    /&(#x[0-9a-f]+|#\d+|nbsp|amp|lt|gt|quot|apos);/gi,
+    (match, body: string) => {
+      const b = body.toLowerCase();
+      if (b[0] === "#") {
+        const code =
+          b[1] === "x" ? parseInt(b.slice(2), 16) : parseInt(b.slice(1), 10);
+        return Number.isNaN(code) ? match : safeFromCodePoint(code);
+      }
+      return NAMED_ENTITIES[b] ?? match;
+    }
+  );
 }
 
 /**
