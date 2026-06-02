@@ -200,3 +200,98 @@ Restart Claude Desktop. Ask it to "list my connected Gmail accounts" to confirm.
 | `GMAIL_MCP_DATA_DIR` | `~/.gmail-mcp` | Where tokens and `credentials*.json` files live |
 | `GMAIL_OAUTH_CREDENTIALS` | (unset) | Force a single OAuth client JSON path; disables `credentials*.json` auto-discovery |
 | `GMAIL_MCP_ATTACHMENTS_DIR` | (unset) | Allowlist of directories (separated by the platform path delimiter) that `path` attachments may be read from. Unset means `path` is disabled and only `content_base64` works |
+
+## Architecture
+
+How the pieces fit together, for anyone reading or extending the code. The server is five TypeScript modules:
+
+- `src/index.ts` — registers the MCP tools and wires up the stdio transport.
+- `src/gmail.ts` — the Gmail mechanics: MIME building, body extraction, reply threading, and error mapping.
+- `src/auth.ts` — the token store (load/save under a lock) and the per-account OAuth client cache.
+- `src/add-account.ts` — the OAuth consent-flow CLI for connecting, listing, and removing accounts.
+- `src/constants.ts` — paths, scopes, size limits, and environment-variable resolution.
+
+The diagrams below render on GitHub.
+
+### One-time OAuth setup
+
+`add-account` runs a loopback OAuth consent flow. It binds a short-lived HTTP server on `127.0.0.1` (port 4773, or an OS-assigned fallback if it's busy), then sends you to Google's consent screen with two guards: a random `state` that's round-tripped and verified on the callback (CSRF protection), and PKCE so an intercepted authorization code can't be exchanged for tokens. The resulting tokens — plus a reference to *which* `credentials*.json` client authorized them — are written to `tokens.json` under a cross-process lock via an atomic rename at mode `600`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant CLI as add-account CLI
+    participant LB as Loopback 127.0.0.1:4773
+    participant BR as Browser
+    participant G as Google OAuth
+    participant TS as tokens.json
+    User->>CLI: npm run add-account
+    CLI->>CLI: pick credentials*.json (credentialsFiles)
+    CLI->>LB: listenWithFallback (4773, else ephemeral)
+    CLI->>CLI: gen PKCE verifier/challenge + random state
+    CLI->>BR: open authUrl (state + code_challenge)
+    BR->>G: sign in, approve scopes
+    G->>LB: redirect /oauth2callback?code&state
+    LB->>LB: validateCallback — verify state (CSRF), get code
+    LB-->>CLI: resolve(code)
+    CLI->>G: getToken(code, codeVerifier) [PKCE]
+    G-->>CLI: tokens (access + refresh)
+    CLI->>G: userinfo.get — which email?
+    G-->>CLI: email
+    CLI->>TS: saveAccount(email, tokens, credFile)
+    Note over TS: withTokenLock -> temp write -> atomic rename (0600)
+    CLI-->>User: Connected: email [credentials.json]
+```
+
+### Runtime: token resolution & auto-refresh
+
+Every tool call enters through `gmailFor()`, which loads the token store once, resolves which account to use (`resolveAccount` implements the optional `account` parameter behavior), and hands back an authenticated client. Clients are cached per account, but the cache is reused only while its refresh token still matches the one on disk — so re-running `add-account` to re-consent in another process is picked up on the next call without a server restart. Rotated access tokens are persisted by a `tokens` event listener, under the same lock.
+
+```mermaid
+flowchart TD
+    A["Tool call (e.g. gmail_search_threads)"] --> B["gmailFor(account?)"]
+    B --> C["loadTokens() — read tokens.json once"]
+    C --> D{"resolveAccount()"}
+    D -->|"none connected"| E["Error: run add-account"]
+    D -->|"account given but unknown"| F["Error: not connected"]
+    D -->|"several connected, none given"| H["Error: specify account"]
+    D -->|"1 account, none given"| G["use that account"]
+    D -->|"account given + valid"| G
+    G --> I["getAuthedClient()"]
+    I --> J{"cached client AND refresh_token matches disk?"}
+    J -->|yes| K["reuse cached OAuth2Client"]
+    J -->|no| L["resolve credentialsFile -> newOAuthClient()"]
+    L --> M["setCredentials(tokens)"]
+    M --> N["on 'tokens' event: updateTokens under lock, persist refreshed access token"]
+    N --> O["cache client keyed by email"]
+    K --> P["google.gmail v1 client"]
+    O --> P
+    P --> Q["Gmail API call"]
+```
+
+### Reply threading
+
+When `gmail_send_message` or `gmail_create_draft` is given a `thread_id`, the server derives RFC 5322 threading headers so Gmail files the message into the existing conversation. It reads the thread's metadata, then `buildReplyHeaders` assembles a consistent `In-Reply-To` / `References` pair: an explicit `in_reply_to` wins, and the `References` chain is made to terminate at the answered message (truncated if found mid-chain, appended otherwise). `deriveReplySubject` carries the thread's subject forward, prepending `Re:` when needed.
+
+```mermaid
+flowchart TD
+    A["send / draft with thread_id"] --> B["getThreadReplyHeaders(thread_id)"]
+    B --> C["threads.get format=metadata: Message-ID, References, Subject"]
+    C --> D["last msg Message-ID -> inReplyTo; prior References + Message-ID -> references; first msg Subject -> subject"]
+    D --> E["buildReplyHeaders(reply, explicit in_reply_to?)"]
+    E --> F{"explicit in_reply_to given?"}
+    F -->|yes| G["inReplyTo = explicit"]
+    F -->|no| H["inReplyTo = reply.inReplyTo"]
+    G --> I{"inReplyTo present in References chain?"}
+    H --> I
+    I -->|yes| J["truncate chain at that id (drop later msgs)"]
+    I -->|no| K["append inReplyTo so References ends with it"]
+    J --> L{"explicit subject?"}
+    K --> L
+    L -->|yes| N["use explicit subject"]
+    L -->|no| O["thread subject, prepend 'Re:' if missing"]
+    N --> P["buildRawMessage: In-Reply-To + References headers"]
+    O --> P
+    P --> Q["messages.send / drafts.create with threadId"]
+```
