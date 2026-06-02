@@ -340,14 +340,22 @@ test("buildReplyHeaders passes a consistent thread chain through unchanged", () 
   });
 });
 
-test("buildReplyHeaders makes References end with an explicit in_reply_to (#3)", () => {
+test("buildReplyHeaders truncates the chain at an explicit in_reply_to (#3/#C)", () => {
   // Replying to an earlier message in the thread: In-Reply-To and the
-  // References tail must agree, not point at different messages.
+  // References tail must agree. The chain is truncated at the answered message
+  // (its ancestor path), not reordered — messages after it aren't ancestors.
   const reply = { inReplyTo: "<c@x>", references: "<a@x> <b@x> <c@x>", subject: "T" };
   const out = buildReplyHeaders(reply, "<b@x>");
   assert.equal(out.inReplyTo, "<b@x>");
   assert.ok(out.references.endsWith("<b@x>"), "References must end with In-Reply-To");
-  assert.equal(out.references, "<a@x> <c@x> <b@x>"); // de-duped, moved to the tail
+  assert.equal(out.references, "<a@x> <b@x>"); // truncated at <b@x>
+});
+
+test("buildReplyHeaders appends an in_reply_to that isn't in the chain (#C)", () => {
+  const reply = { inReplyTo: "<c@x>", references: "<a@x> <b@x> <c@x>", subject: "T" };
+  const out = buildReplyHeaders(reply, "<z@x>");
+  assert.equal(out.inReplyTo, "<z@x>");
+  assert.equal(out.references, "<a@x> <b@x> <c@x> <z@x>"); // appended to terminate
 });
 
 test("buildReplyHeaders threads on an explicit in_reply_to with no thread", () => {
@@ -717,46 +725,47 @@ test("resolveAttachments rejects invalid base64 and normalizes base64url", () =>
 });
 
 // --------------------------------------------------------------------------
-// capMessageBodies  (review item #7)
+// capMessageBodies — lazy body rendering  (review items #7 + #E)
 // --------------------------------------------------------------------------
 test("capMessageBodies keeps bodies that fit within the budget", () => {
-  const r = capMessageBodies([{ body: "aaa" }, { body: "bbb" }], 100);
+  const r = capMessageBodies([{ id: 1 }, { id: 2 }], 100, () => "aaa");
   assert.equal(r.truncated, false);
   assert.equal(r.messages[0].body, "aaa");
-  assert.equal(r.messages[1].body, "bbb");
+  assert.equal(r.messages[1].body, "aaa");
 });
 
 test("capMessageBodies truncates the crossing body and omits later ones", () => {
-  const big = [{ body: "x".repeat(30) }, { body: "y".repeat(30) }, { body: "z".repeat(30) }];
-  const r = capMessageBodies(big, 20);
+  const items = [{ b: "x" }, { b: "y" }, { b: "z" }];
+  const r = capMessageBodies(items, 20, (m) => m.b.repeat(30));
   assert.equal(r.truncated, true);
   assert.ok(r.messages[0].body.startsWith("x".repeat(20)));
   assert.match(r.messages[0].body, /truncated/);
   assert.match(r.messages[1].body, /omitted/);
-  // First body is the 20-char budget plus a single marker line; later bodies
-  // are a single fixed marker. Bound the total against those known sizes.
-  const marker = "\n[Body truncated: thread exceeds size limit]";
-  const omitted = "[Body omitted: thread exceeds size limit]";
-  const total = r.messages.reduce((n, m) => n + m.body.length, 0);
-  assert.ok(total <= 20 + marker.length + 2 * omitted.length);
+  assert.match(r.messages[2].body, /omitted/);
+});
+
+test("capMessageBodies renders lazily — bodies past the budget are never decoded (#E)", () => {
+  const rendered = [];
+  const items = [{ id: "a" }, { id: "b" }, { id: "c" }];
+  capMessageBodies(items, 20, (m) => {
+    rendered.push(m.id);
+    return "z".repeat(30); // first body already exceeds the budget
+  });
+  // Only the first item is rendered; b and c are omitted without rendering.
+  assert.deepEqual(rendered, ["a"]);
 });
 
 test("capMessageBodies treats an exact-fit body as not truncated", () => {
-  const r = capMessageBodies([{ body: "a".repeat(20) }], 20);
+  const r = capMessageBodies([{ id: 1 }], 20, () => "a".repeat(20));
   assert.equal(r.truncated, false);
   assert.equal(r.messages[0].body, "a".repeat(20));
 });
 
-test("capMessageBodies does not flag a trailing empty body", () => {
-  const r = capMessageBodies([{ body: "a".repeat(20) }, { body: "" }], 20);
-  assert.equal(r.truncated, false);
-  assert.equal(r.messages[1].body, "");
-});
-
 test("capMessageBodies preserves non-body fields", () => {
-  const r = capMessageBodies([{ body: "x".repeat(50), message_id: "m1", from: "a@b" }], 10);
+  const r = capMessageBodies([{ message_id: "m1", from: "a@b" }], 10, () => "x".repeat(50));
   assert.equal(r.messages[0].message_id, "m1");
   assert.equal(r.messages[0].from, "a@b");
+  assert.match(r.messages[0].body, /truncated/);
 });
 
 // --------------------------------------------------------------------------
