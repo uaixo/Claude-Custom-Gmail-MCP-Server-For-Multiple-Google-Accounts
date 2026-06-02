@@ -695,7 +695,14 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
           requestBody,
         });
         id = requireField(res.data.id, "thread.id");
-        labelIds = res.data.messages?.[0]?.labelIds || [];
+        // A thread modify applies to every message, which may then carry
+        // differing labels; report the union across the thread rather than just
+        // the first message's, which would misrepresent the result.
+        const labelSet = new Set<string>();
+        for (const m of res.data.messages || []) {
+          for (const l of m.labelIds || []) labelSet.add(l);
+        }
+        labelIds = [...labelSet];
       } else {
         const res = await gmail.users.messages.modify({
           userId: "me",

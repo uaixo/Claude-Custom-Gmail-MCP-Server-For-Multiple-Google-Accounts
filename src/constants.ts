@@ -64,11 +64,16 @@ export const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
  */
 export const MAX_THREAD_MESSAGES = 100;
 
-/** Gmail OAuth scopes. Covers read, compose/send, and label management. */
+/**
+ * Gmail OAuth scopes (kept minimal). `gmail.modify` covers read, label
+ * management, and draft create/update; `gmail.send` covers sending. We
+ * intentionally do NOT request `gmail.compose` — it only adds draft/send
+ * abilities already granted by the other two, so omitting it follows least
+ * privilege. `userinfo.email` identifies which account just authorized.
+ */
 export const SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify", // read + labels + drafts
   "https://www.googleapis.com/auth/gmail.send", // send
-  "https://www.googleapis.com/auth/gmail.compose", // drafts
   "https://www.googleapis.com/auth/userinfo.email", // identify the account
 ];
 
@@ -99,6 +104,10 @@ export function credentialsPath(): string {
  *   returned (e.g. credentials.json, credentials2.json, credentials-work.json),
  *   sorted by name. Each may be a distinct OAuth client (different
  *   client_id/secret), which is why accounts record which one they used.
+ * - As a convenience, if no `credentials*.json` is present we fall back to
+ *   Google's default download name `client_secret*.json`, so the common "forgot
+ *   to rename the download" case still works. The fallback only kicks in when
+ *   no renamed file exists, so it never double-lists the same client.
  */
 export function credentialsFiles(): string[] {
   if (process.env.GMAIL_OAUTH_CREDENTIALS) {
@@ -106,11 +115,14 @@ export function credentialsFiles(): string[] {
   }
   const dir = dataDir();
   if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir)
-    .filter((f) => /^credentials.*\.json$/i.test(f))
-    .sort()
-    .map((f) => path.join(dir, f));
+  const names = fs.readdirSync(dir);
+  const pick = (re: RegExp): string[] =>
+    names
+      .filter((f) => re.test(f))
+      .sort()
+      .map((f) => path.join(dir, f));
+  const primary = pick(/^credentials.*\.json$/i);
+  return primary.length ? primary : pick(/^client_secret.*\.json$/i);
 }
 
 /**

@@ -186,7 +186,7 @@ Restart Claude Desktop. Ask it to "list my connected Gmail accounts" to confirm.
 
 ## Notes
 
-- **Scopes:** `gmail.modify` (read + labels + drafts), `gmail.send`, `gmail.compose`, `userinfo.email` (to identify the account). Drop `gmail.send` from `src/constants.ts` and re-consent if you want a send-disabled, draft-only setup.
+- **Scopes (minimal):** `gmail.modify` (read + labels + drafts), `gmail.send` (send), `userinfo.email` (to identify the account). `gmail.compose` is intentionally not requested — its abilities are already covered by the other two. Drop `gmail.send` from `src/constants.ts` and re-consent if you want a send-disabled, draft-only setup.
 - **Body format:** send/draft take a single `body` plus an `is_html` flag (plain text by default). When `is_html` is true the message is `text/html`; there is no simultaneous plain-text + HTML alternative part.
 - **Attachments:** supplied per call via local `path` or inline `content_base64`. Reading by `path` is disabled unless `GMAIL_MCP_ATTACHMENTS_DIR` allowlists the directory it lives in (a guardrail against emailing arbitrary local files); inline base64 is impractical for large binaries the model can't see, so set the allowlist and use `path` for those. Gmail's total message size limit (~25 MB) applies.
 - **Local-only:** this runs over stdio on your machine; tokens never leave it. To expose it as a *remote* custom connector instead, swap the stdio transport for the streamable-HTTP transport, host it on the public internet over HTTPS, and add it in Claude under Settings → Connectors → Add custom connector.

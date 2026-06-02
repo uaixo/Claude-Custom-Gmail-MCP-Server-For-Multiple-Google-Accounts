@@ -330,8 +330,11 @@ export function htmlToText(html: string): string {
       // doesn't leak into the body. A stray <title> outside <head> is handled too.
       .replace(/<head[\s\S]*?<\/head>/gi, "")
       .replace(/<title[\s\S]*?<\/title>/gi, "")
-      .replace(/<style[\s\S]*?<\/style>/gi, "")
-      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      // Match the closing tag, but fall back to end-of-input when it's missing
+      // (a truncated/malformed email), so an unclosed block can't leak its
+      // CSS/JS text into the body.
+      .replace(/<style\b[\s\S]*?(?:<\/style>|$)/gi, "")
+      .replace(/<script\b[\s\S]*?(?:<\/script>|$)/gi, "")
       .replace(/<br\s*\/?>/gi, "\n")
       .replace(/<\/(p|div|h[1-6]|li|tr|table|blockquote)>/gi, "\n")
       .replace(/<[^>]+>/g, "")
@@ -459,6 +462,12 @@ export function resolveAttachments(
             `directories (GMAIL_MCP_ATTACHMENTS_DIR). Refusing to read it.`
         );
       }
+      // Only read regular files: a directory, FIFO, socket, or device inside an
+      // allowed dir is not a valid attachment (and reading a FIFO could block
+      // the server indefinitely). statSync follows to the resolved real path.
+      if (!fs.statSync(resolved).isFile()) {
+        throw new Error(`Attachment ${i}: '${filePath}' is not a regular file.`);
+      }
       const filename = a.filename || path.basename(filePath);
       const mimeType = a.mime_type || inferMimeType(filename);
       const contentBase64 = fs.readFileSync(resolved).toString("base64");
@@ -546,13 +555,74 @@ function sanitizeHeaderValue(value: string): string {
 }
 
 /**
- * Sanitize a filename for use inside a quoted MIME parameter
- * (name="…" / filename="…"): strip CR/LF and neutralize the quote and backslash
- * characters that would otherwise terminate or escape the quoted string.
- * Non-ASCII still goes through RFC 2047 encoding via encodeHeaderWord.
+ * True when a filename is safe to place verbatim inside a quoted MIME parameter
+ * (`name="…"` / `filename="…"`): pure ASCII with no control characters, double
+ * quote, or backslash — i.e. nothing that could terminate or escape the quoted
+ * string (and so inject a header). Anything else is emitted as an RFC 2231
+ * extended parameter instead. Checked by code unit (no control-char regex) so
+ * the function carries no lint-suppression baggage.
  */
-function sanitizeFilename(name: string): string {
-  return name.replace(/[\r\n]+/g, " ").replace(/["\\]/g, "_");
+function isQuotableFilename(name: string): boolean {
+  if (!isAscii(name)) return false;
+  for (let i = 0; i < name.length; i++) {
+    const c = name.charCodeAt(i);
+    if (c < 0x20 || c === 0x22 /* " */ || c === 0x5c /* \ */) return false;
+  }
+  return true;
+}
+
+/**
+ * Percent-encode a string as an RFC 2231 / RFC 5987 extended-parameter value
+ * (the part after `UTF-8''`). Every byte outside the RFC 5987 `attr-char` set
+ * is encoded as %XX of its UTF-8 representation. This lets non-ASCII filenames
+ * survive without the RFC 2047 encoded-words that RFC 2047 §5 forbids inside a
+ * quoted parameter (and that some clients render literally).
+ */
+function encodeRfc2231(value: string): string {
+  let out = "";
+  for (const b of Buffer.from(value, "utf-8")) {
+    // RFC 5987 attr-char: ALPHA / DIGIT / "!#$&+-.^_`|~"
+    const isAttrChar =
+      (b >= 0x41 && b <= 0x5a) || // A-Z
+      (b >= 0x61 && b <= 0x7a) || // a-z
+      (b >= 0x30 && b <= 0x39) || // 0-9
+      b === 0x21 ||
+      b === 0x23 ||
+      b === 0x24 ||
+      b === 0x26 ||
+      b === 0x2b ||
+      b === 0x2d ||
+      b === 0x2e ||
+      b === 0x5e ||
+      b === 0x5f ||
+      b === 0x60 ||
+      b === 0x7c ||
+      b === 0x7e;
+    out += isAttrChar
+      ? String.fromCharCode(b)
+      : "%" + b.toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+
+/**
+ * Build a MIME header line carrying a filename parameter, choosing the encoding
+ * per RFC 2231: a quote-safe ASCII filename uses the simple quoted form
+ * (`filename="report.pdf"`); anything non-ASCII or containing quoting-breaking
+ * characters uses an RFC 2231 extended parameter (`filename*=UTF-8''…`), which
+ * is the standards-conformant way to carry such names (RFC 2047 encoded-words
+ * are illegal inside a quoted string). Either way CR/LF can't survive — the
+ * quoted form is gated by isQuotableFilename, and the extended form is
+ * percent-encoded — so neither can inject a header.
+ */
+function mimeHeaderWithFilename(
+  prefix: string,
+  paramName: string,
+  filename: string
+): string {
+  return isQuotableFilename(filename)
+    ? `${prefix}; ${paramName}="${filename}"`
+    : `${prefix}; ${paramName}*=UTF-8''${encodeRfc2231(filename)}`;
 }
 
 /**
@@ -695,17 +765,22 @@ export function buildRawMessage(opts: {
   );
 
   for (const att of attachments) {
-    const encodedName = encodeHeaderWord(sanitizeFilename(att.filename));
     const safeMime = sanitizeHeaderValue(att.mimeType);
+    // Fold each part header so a long (e.g. non-ASCII, percent-encoded) filename
+    // can't produce an over-length line, just like the top-level headers above.
+    const partHeaders = [
+      mimeHeaderWithFilename(`Content-Type: ${safeMime}`, "name", att.filename),
+      "Content-Transfer-Encoding: base64",
+      mimeHeaderWithFilename(
+        "Content-Disposition: attachment",
+        "filename",
+        att.filename
+      ),
+    ].map(foldHeaderLine);
     parts.push(
-      [
-        `--${boundary}`,
-        `Content-Type: ${safeMime}; name="${encodedName}"`,
-        "Content-Transfer-Encoding: base64",
-        `Content-Disposition: attachment; filename="${encodedName}"`,
-        "",
-        wrapBase64(att.contentBase64),
-      ].join("\r\n")
+      [`--${boundary}`, ...partHeaders, "", wrapBase64(att.contentBase64)].join(
+        "\r\n"
+      )
     );
   }
 
@@ -736,13 +811,36 @@ export function requireField<T>(value: T | null | undefined, what: string): T {
 /** Format a Gmail API error into an actionable message. */
 export function handleGmailError(error: unknown): string {
   const e = error as {
-    code?: number;
+    code?: number | string;
     status?: number;
     message?: string;
+    response?: {
+      status?: number;
+      data?: { error?: { message?: string; errors?: Array<{ message?: string }> } };
+    };
     errors?: Array<{ message?: string }>;
   };
-  const status = e?.code || e?.status;
-  const detail = e?.errors?.[0]?.message || e?.message || String(error);
+  // The HTTP status, wherever the client surfaced it. Modern gaxios sets a
+  // numeric `error.status` (or `error.response.status`) for HTTP errors and
+  // leaves `error.code` for transport-level failures (a string like
+  // "ENOTFOUND"); older shapes put the numeric status on `code`. Cover all
+  // three, but only treat a *number* as an HTTP status.
+  const status =
+    typeof e?.status === "number"
+      ? e.status
+      : typeof e?.response?.status === "number"
+        ? e.response.status
+        : typeof e?.code === "number"
+          ? e.code
+          : undefined;
+  // Prefer Gmail's structured error detail (it lives under response.data.error
+  // for a real API error); fall back to the error message.
+  const detail =
+    e?.response?.data?.error?.errors?.[0]?.message ||
+    e?.response?.data?.error?.message ||
+    e?.errors?.[0]?.message ||
+    e?.message ||
+    String(error);
   switch (status) {
     case 401:
       return "Error: Authentication failed or token expired. Re-run `npm run add-account` for this account.";
@@ -752,13 +850,15 @@ export function handleGmailError(error: unknown): string {
       return "Error: Resource not found. Check the message/thread/label ID.";
     case 429:
       return "Error: Rate limit exceeded. Wait before retrying.";
-    default:
-      // A status means it came from the Gmail API; without one it's a local
-      // error (e.g. attachment validation) and shouldn't claim an API failure.
-      return status
-        ? `Error: Gmail API request failed (status ${status}): ${detail}`
-        : `Error: ${detail}`;
   }
+  if (status) return `Error: Gmail API request failed (status ${status}): ${detail}`;
+  // No HTTP status. A string `code` is a transport/system error (DNS failure,
+  // connection reset, timeout) — report it as such rather than as an API
+  // rejection. Otherwise it's a local error (e.g. attachment validation).
+  if (typeof e?.code === "string") {
+    return `Error: Network error (${e.code}) reaching Gmail. Check connectivity and retry. (${detail})`;
+  }
+  return `Error: ${detail}`;
 }
 
 /**
