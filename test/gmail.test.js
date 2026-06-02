@@ -217,6 +217,14 @@ test("htmlToText removes HTML comments even when they contain '>'", () => {
   assert.doesNotMatch(htmlToText("x<!-- <script>evil()</script> -->y"), /evil/);
 });
 
+test("htmlToText strips an unclosed <style>/<script> block to end of input (#L4)", () => {
+  // A truncated/malformed email with no closing tag must not leak CSS/JS text.
+  assert.equal(htmlToText("<p>Hi</p><style>p{color:red}"), "Hi");
+  assert.doesNotMatch(htmlToText("<p>Hi</p><style>p{color:red}"), /color:red/);
+  assert.doesNotMatch(htmlToText("<p>Body</p><script>steal()"), /steal/);
+  assert.match(htmlToText("<p>Body</p><script>steal()"), /Body/);
+});
+
 // --------------------------------------------------------------------------
 // mapWithConcurrency  (review item #3)
 // --------------------------------------------------------------------------
@@ -565,23 +573,64 @@ test("buildRawMessage splits a long non-ASCII subject into RFC 2047 words within
   assert.equal(decoded, subject);
 });
 
-test("buildRawMessage keeps a short non-ASCII filename as a single encoded-word", () => {
+test("buildRawMessage keeps an ASCII filename in the simple quoted form (#M1)", () => {
   const mime = decodeBase64Url(
     buildRawMessage({
       to: ["a@b.com"],
       subject: "s",
       body: "b",
       attachments: [
+        { filename: "report.pdf", mimeType: "application/pdf", contentBase64: "QQ==" },
+      ],
+    })
+  );
+  assert.match(mime, /name="report\.pdf"/);
+  assert.match(mime, /filename="report\.pdf"/);
+});
+
+test("buildRawMessage encodes a non-ASCII filename as an RFC 2231 parameter, not RFC 2047 (#M1)", () => {
+  const mime = decodeBase64Url(
+    buildRawMessage({
+      to: ["a@b.com"],
+      subject: "s", // ASCII subject => no encoded-word should appear anywhere
+      body: "b",
+      attachments: [
         { filename: "résumé.pdf", mimeType: "application/pdf", contentBase64: "QQ==" },
       ],
     })
   );
-  const distinct = new Set(mime.match(/=\?UTF-8\?B\?[^?]*\?=/g));
-  assert.equal(distinct.size, 1, "filename should be exactly one encoded-word");
-  assert.ok(
-    !distinct.values().next().value.includes(" "),
-    "the filename encoded-word must not contain a space"
+  // RFC 2231 extended parameter (filename*=UTF-8''…), not an encoded-word inside
+  // a quoted string (which RFC 2047 §5 forbids).
+  assert.match(mime, /filename\*=UTF-8''r%C3%A9sum%C3%A9\.pdf/);
+  assert.match(mime, /name\*=UTF-8''r%C3%A9sum%C3%A9\.pdf/);
+  assert.doesNotMatch(mime, /=\?UTF-8\?B\?/);
+  assert.doesNotMatch(mime, /filename="r/);
+});
+
+test("buildRawMessage folds a long non-ASCII filename and round-trips it (#M1)", () => {
+  const filename = "報告書".repeat(30) + ".pdf"; // long + multi-byte
+  const mime = decodeBase64Url(
+    buildRawMessage({
+      to: ["a@b.com"],
+      subject: "s",
+      body: "b",
+      attachments: [
+        { filename, mimeType: "application/pdf", contentBase64: "QQ==" },
+      ],
+    })
   );
+  // No physical line may exceed RFC 5322's 998-octet hard limit.
+  for (const line of mime.split("\r\n")) {
+    assert.ok(
+      Buffer.byteLength(line, "utf-8") <= 998,
+      `line exceeds 998 octets (${Buffer.byteLength(line, "utf-8")})`
+    );
+  }
+  // The percent-encoded value (no spaces, so never folded internally) decodes
+  // back to the original filename.
+  const m = mime.match(/filename\*=UTF-8''([A-Za-z0-9%.\-_]+)/);
+  assert.ok(m, "filename* parameter present");
+  assert.equal(decodeURIComponent(m[1]), filename);
 });
 
 test("buildRawMessage rejects a message over the 25 MB limit with a clear error", () => {
@@ -609,6 +658,34 @@ test("handleGmailError distinguishes local errors from API errors", () => {
   assert.match(api, /Gmail API request failed \(status 500\)/);
 
   assert.match(handleGmailError({ code: 401 }), /Re-run `npm run add-account`/);
+});
+
+test("handleGmailError reads the HTTP status from gaxios shapes (#L2)", () => {
+  // gaxios surfaces a numeric status on error.status / error.response.status
+  // (not error.code) for HTTP errors; both must be recognized.
+  assert.match(handleGmailError({ status: 404 }), /Resource not found/);
+  assert.match(handleGmailError({ response: { status: 429 } }), /Rate limit exceeded/);
+});
+
+test("handleGmailError surfaces Gmail's structured error detail (#L2)", () => {
+  const err = {
+    response: {
+      status: 403,
+      data: { error: { errors: [{ message: "User-rate limit exceeded" }] } },
+    },
+  };
+  const msg = handleGmailError(err);
+  assert.match(msg, /Permission denied/);
+  assert.match(msg, /User-rate limit exceeded/); // detail is included, not dropped
+});
+
+test("handleGmailError reports a transport error distinctly, not as an API failure (#L2)", () => {
+  const net = handleGmailError({
+    code: "ENOTFOUND",
+    message: "getaddrinfo ENOTFOUND gmail.googleapis.com",
+  });
+  assert.match(net, /Network error \(ENOTFOUND\)/);
+  assert.doesNotMatch(net, /Gmail API request failed/);
 });
 
 test("requireField returns present values and throws on null/undefined", () => {
