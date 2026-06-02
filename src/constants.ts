@@ -22,6 +22,23 @@ export function isMainModule(importMetaUrl: string): boolean {
   }
 }
 
+/**
+ * The package version, read from package.json so it stays the single source of
+ * truth (rather than being duplicated as a literal in the server metadata).
+ * package.json sits one level above the compiled module in dist/, and at the
+ * package root when installed, so `../package.json` resolves in both layouts.
+ * Falls back to "0.0.0" if it can't be read.
+ */
+export function packageVersion(): string {
+  try {
+    const pkgUrl = new URL("../package.json", import.meta.url);
+    const pkg = JSON.parse(fs.readFileSync(pkgUrl, "utf-8"));
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
 /** Maximum response size in characters before truncation. */
 export const CHARACTER_LIMIT = 25000;
 

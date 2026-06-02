@@ -17,7 +17,6 @@ import { cleanupStaleTokenTemps, listAccounts } from "./auth.js";
 import {
   buildRawMessage,
   capMessageBodies,
-  capText,
   deriveReplySubject,
   extractPlainText,
   getThreadReplyHeaders,
@@ -25,6 +24,7 @@ import {
   handleGmailError,
   header,
   mapWithConcurrency,
+  renderJsonText,
   requireField,
   resolveAttachments,
 } from "./gmail.js";
@@ -32,6 +32,7 @@ import {
   CHARACTER_LIMIT,
   isMainModule,
   MAX_THREAD_MESSAGES,
+  packageVersion,
   THREAD_FETCH_CONCURRENCY,
 } from "./constants.js";
 
@@ -68,7 +69,7 @@ const attachmentSchema = z
 
 const server = new McpServer({
   name: "gmail-mcp-server",
-  version: "1.0.0",
+  version: packageVersion(),
 });
 
 /** Shared optional account selector for all tools. */
@@ -196,7 +197,7 @@ Returns: JSON {
       const text =
         detailed.length === 0
           ? `No threads found for query '${query}' in ${acct}.`
-          : capText(JSON.stringify(output, null, 2), "Refine your query.");
+          : renderJsonText(output, "Refine your query.");
       return { content: [{ type: "text", text }], structuredContent: output };
     } catch (error) {
       return {
@@ -271,8 +272,8 @@ For very large threads the result may be truncated: "truncated": true is set, an
         ...(truncated ? { truncated: true } : {}),
         ...(omittedMessages > 0 ? { omitted_message_count: omittedMessages } : {}),
       };
-      const text = capText(
-        JSON.stringify(output, null, 2),
+      const text = renderJsonText(
+        output,
         "Thread body was large; consider reading messages individually."
       );
       return { content: [{ type: "text", text }], structuredContent: output };

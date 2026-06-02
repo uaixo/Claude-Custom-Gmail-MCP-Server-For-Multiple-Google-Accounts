@@ -16,7 +16,9 @@ import {
   capMessageBodies,
   deriveReplySubject,
   requireField,
+  renderJsonText,
 } from "../dist/gmail.js";
+import { packageVersion } from "../dist/constants.js";
 
 const b64url = (s) => Buffer.from(s, "utf-8").toString("base64url");
 // base64url of raw bytes, for exercising non-UTF-8 charset decoding.
@@ -168,6 +170,22 @@ test("extractPlainText decodes a text/plain part using its declared charset", ()
 
 test("htmlToText converts <br> to a newline", () => {
   assert.equal(htmlToText("a<br>b"), "a\nb");
+});
+
+test("htmlToText drops <head>/<title> content and keeps the body (#7)", () => {
+  const html =
+    "<html><head><title>SECRET TITLE</title>" +
+    "<meta name='description' content='hidden meta'></head>" +
+    "<body><p>Visible body</p></body></html>";
+  const out = htmlToText(html);
+  assert.match(out, /Visible body/);
+  assert.doesNotMatch(out, /SECRET TITLE/);
+  assert.doesNotMatch(out, /hidden meta/);
+  assert.doesNotMatch(out, /[<>]/);
+});
+
+test("htmlToText drops a stray <title> outside <head>", () => {
+  assert.equal(htmlToText("<title>Just a title</title>Body text"), "Body text");
 });
 
 test("htmlToText removes HTML comments even when they contain '>'", () => {
@@ -441,6 +459,30 @@ test("requireField returns present values and throws on null/undefined", () => {
   assert.equal(requireField("", "s"), "");
   assert.throws(() => requireField(undefined, "label.id"), /missing expected field: label\.id/);
   assert.throws(() => requireField(null, "message.id"), /missing expected field: message\.id/);
+});
+
+test("renderJsonText returns valid JSON under budget, a safe notice over it (#4)", () => {
+  const small = { account: "a@b.com", count: 1, threads: [{ thread_id: "t1" }] };
+  assert.deepEqual(JSON.parse(renderJsonText(small, "note")), small);
+
+  // An object whose pretty-printed form exceeds CHARACTER_LIMIT (25000).
+  const big = {
+    items: Array.from({ length: 6000 }, (_, i) => ({ i, s: "xxxxxxxxxx" })),
+  };
+  assert.ok(JSON.stringify(big, null, 2).length > 25000, "fixture must exceed budget");
+  const capped = renderJsonText(big, "Refine your query.");
+  // The old slice-the-JSON behavior produced unparseable text; the notice must
+  // not masquerade as JSON, and must point the reader at structuredContent.
+  assert.throws(() => JSON.parse(capped));
+  assert.match(capped, /structuredContent/);
+  assert.match(capped, /Refine your query\./);
+});
+
+test("packageVersion matches package.json (#9)", () => {
+  const pkg = JSON.parse(
+    fs.readFileSync(new URL("../package.json", import.meta.url), "utf-8")
+  );
+  assert.equal(packageVersion(), pkg.version);
 });
 
 // --------------------------------------------------------------------------
