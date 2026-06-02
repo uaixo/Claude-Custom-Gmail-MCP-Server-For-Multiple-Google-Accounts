@@ -125,6 +125,37 @@ export async function getThreadReplyHeaders(
 }
 
 /**
+ * Combine an explicit In-Reply-To with a thread's derived reply headers into a
+ * consistent pair for buildRawMessage. RFC 5322 threading is only well-formed
+ * when the References chain ends with the In-Reply-To message id, so this
+ * guarantees that: an explicit `explicitInReplyTo` (e.g. the caller's
+ * `in_reply_to`) wins as In-Reply-To, and the References chain is made to
+ * terminate with it — de-duplicating then appending when the chain (taken from
+ * the thread's most recent message) ends with a different id. Without this, the
+ * two headers could disagree (In-Reply-To naming one message while References
+ * ended with another). Fields are undefined when there's nothing to thread on.
+ */
+export function buildReplyHeaders(
+  reply: ThreadReplyHeaders | undefined,
+  explicitInReplyTo?: string
+): { inReplyTo?: string; references?: string } {
+  const inReplyTo = explicitInReplyTo || reply?.inReplyTo || "";
+  let references = reply?.references || "";
+  if (inReplyTo) {
+    const ids = references ? references.split(/\s+/).filter(Boolean) : [];
+    if (ids[ids.length - 1] !== inReplyTo) {
+      const deduped = ids.filter((id) => id !== inReplyTo);
+      deduped.push(inReplyTo);
+      references = deduped.join(" ");
+    }
+  }
+  return {
+    inReplyTo: inReplyTo || undefined,
+    references: references || undefined,
+  };
+}
+
+/**
  * Choose the subject line for a (possibly reply) message. An explicit subject
  * always wins. When it's omitted and we're replying into a thread, fall back to
  * the thread's subject, prefixing "Re: " unless it already has one. Returns ""
@@ -442,37 +473,37 @@ function sanitizeFilename(name: string): string {
 
 /**
  * Fold a header line so no line exceeds 78 octets (RFC 5322 recommends ≤78; the
- * hard limit is 998). Folds only at existing spaces — inserting a CRLF before a
- * space, which then serves as the continuation line's indent — so unfolding
- * restores the value byte-for-byte. This keeps long recipient lists, References
- * chains, and multi-word encoded subjects within spec; a single token longer
- * than the limit (e.g. one very long address) is left intact rather than broken.
+ * hard limit is 998). Length is measured in UTF-8 octets, not characters, so a
+ * line of multi-byte content is still bounded correctly. Folds only at existing
+ * spaces — inserting a CRLF before a space, which then serves as the
+ * continuation line's indent — so unfolding restores the value byte-for-byte,
+ * and the break point (an ASCII space) is never inside a multi-byte sequence.
+ * This keeps long recipient lists, References chains, and multi-word encoded
+ * subjects within spec; a single token longer than the limit (e.g. one very
+ * long address) is left intact rather than broken.
  */
 function foldHeaderLine(line: string): string {
-  const LIMIT = 78;
-  if (line.length <= LIMIT) return line;
+  const LIMIT = 78; // octets
+  if (Buffer.byteLength(line, "utf-8") <= LIMIT) return line;
   const segments: string[] = [];
-  let start = 0;
-  while (line.length - start > LIMIT) {
-    // Prefer the last space within the limit; otherwise the first space past it
-    // (never break inside a token).
-    let foldAt = -1;
-    for (let i = Math.min(start + LIMIT, line.length - 1); i > start; i--) {
-      if (line[i] === " ") {
-        foldAt = i;
-        break;
-      }
+  let segStart = 0; // index where the current output segment begins
+  let lastSpace = -1; // index of the last space seen within the current segment
+  let bytes = 0; // octets accumulated in the current segment so far
+  for (let i = 0; i < line.length; i++) {
+    const charBytes = Buffer.byteLength(line[i], "utf-8");
+    if (bytes + charBytes > LIMIT && lastSpace > segStart) {
+      // Fold at the last space: it becomes the next line's leading indent.
+      segments.push(line.slice(segStart, lastSpace));
+      segStart = lastSpace;
+      lastSpace = -1;
+      // Recount octets for the new segment (leading space through char i).
+      bytes = Buffer.byteLength(line.slice(segStart, i + 1), "utf-8");
+    } else {
+      bytes += charBytes;
     }
-    if (foldAt === -1) {
-      let i = start + LIMIT;
-      while (i < line.length && line[i] !== " ") i++;
-      if (i >= line.length) break; // no more fold points; emit the rest as-is
-      foldAt = i;
-    }
-    segments.push(line.slice(start, foldAt));
-    start = foldAt; // the space at foldAt becomes the next line's leading indent
+    if (line[i] === " ") lastSpace = i;
   }
-  segments.push(line.slice(start));
+  segments.push(line.slice(segStart));
   return segments.join("\r\n");
 }
 

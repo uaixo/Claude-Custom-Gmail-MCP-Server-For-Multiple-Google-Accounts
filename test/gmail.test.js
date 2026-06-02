@@ -9,6 +9,7 @@ import {
   htmlToText,
   mapWithConcurrency,
   getThreadReplyHeaders,
+  buildReplyHeaders,
   buildRawMessage,
   handleGmailError,
   resolveAttachments,
@@ -305,6 +306,41 @@ test("getThreadReplyHeaders keeps In-Reply-To consistent with the References tai
 });
 
 // --------------------------------------------------------------------------
+// buildReplyHeaders consistency  (review item #3)
+// --------------------------------------------------------------------------
+test("buildReplyHeaders returns nothing to thread on without a thread or in_reply_to", () => {
+  assert.deepEqual(buildReplyHeaders(undefined), {
+    inReplyTo: undefined,
+    references: undefined,
+  });
+});
+
+test("buildReplyHeaders passes a consistent thread chain through unchanged", () => {
+  const reply = { inReplyTo: "<c@x>", references: "<a@x> <b@x> <c@x>", subject: "T" };
+  assert.deepEqual(buildReplyHeaders(reply), {
+    inReplyTo: "<c@x>",
+    references: "<a@x> <b@x> <c@x>",
+  });
+});
+
+test("buildReplyHeaders makes References end with an explicit in_reply_to (#3)", () => {
+  // Replying to an earlier message in the thread: In-Reply-To and the
+  // References tail must agree, not point at different messages.
+  const reply = { inReplyTo: "<c@x>", references: "<a@x> <b@x> <c@x>", subject: "T" };
+  const out = buildReplyHeaders(reply, "<b@x>");
+  assert.equal(out.inReplyTo, "<b@x>");
+  assert.ok(out.references.endsWith("<b@x>"), "References must end with In-Reply-To");
+  assert.equal(out.references, "<a@x> <c@x> <b@x>"); // de-duped, moved to the tail
+});
+
+test("buildReplyHeaders threads on an explicit in_reply_to with no thread", () => {
+  assert.deepEqual(buildReplyHeaders(undefined, "<only@x>"), {
+    inReplyTo: "<only@x>",
+    references: "<only@x>",
+  });
+});
+
+// --------------------------------------------------------------------------
 // buildRawMessage + handleGmailError  (review item #5)
 // --------------------------------------------------------------------------
 test("buildRawMessage emits headers and base64-encodes the body", () => {
@@ -389,6 +425,29 @@ test("buildRawMessage folds long header lines to <=78 octets, unfolding intact",
   assert.ok(
     unfolded.includes(`References: ${references}`),
     "References did not unfold to the original"
+  );
+});
+
+test("buildRawMessage folds multi-byte header content within 78 octets (#6)", () => {
+  // Message-ids with 2-byte UTF-8 characters: octet length exceeds character
+  // length, so character-based folding would overflow the 78-octet limit.
+  const references = Array.from(
+    { length: 40 },
+    (_, i) => `<αβγ${i}@example.com>`
+  ).join(" ");
+  const mime = decodeBase64Url(
+    buildRawMessage({ to: ["a@b.com"], subject: "s", body: "b", references })
+  );
+  const headerBlock = mime.split("\r\n\r\n")[0];
+  for (const line of headerBlock.split("\r\n")) {
+    const octets = Buffer.byteLength(line, "utf-8");
+    assert.ok(octets <= 78, `header line exceeds 78 octets (${octets}): ${line}`);
+  }
+  // Folding at ASCII spaces only, so unfolding restores the value byte-for-byte.
+  const unfolded = mime.replace(/\r\n /g, " ");
+  assert.ok(
+    unfolded.includes(`References: ${references}`),
+    "multi-byte References did not unfold intact"
   );
 });
 
