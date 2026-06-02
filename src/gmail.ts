@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { google, gmail_v1 } from "googleapis";
-import { getAuthedClient, resolveAccount } from "./auth.js";
+import { getAuthedClient, loadTokens, resolveAccount } from "./auth.js";
 import { attachmentDirs, CHARACTER_LIMIT, MAX_MESSAGE_BYTES } from "./constants.js";
 
 /**
@@ -33,8 +33,11 @@ export function gmailFor(account?: string): {
   gmail: gmail_v1.Gmail;
   account: string;
 } {
-  const resolved = resolveAccount(account);
-  const auth = getAuthedClient(resolved);
+  // Load the token store once and reuse it for both resolution and client
+  // lookup, rather than reading/parsing tokens.json twice per tool call.
+  const store = loadTokens();
+  const resolved = resolveAccount(account, store);
+  const auth = getAuthedClient(resolved, store);
   const gmail = google.gmail({ version: "v1", auth });
   return { gmail, account: resolved };
 }
@@ -181,10 +184,14 @@ export async function summarizeThread(
  * when the References chain ends with the In-Reply-To message id, so this
  * guarantees that: an explicit `explicitInReplyTo` (e.g. the caller's
  * `in_reply_to`) wins as In-Reply-To, and the References chain is made to
- * terminate with it — de-duplicating then appending when the chain (taken from
- * the thread's most recent message) ends with a different id. Without this, the
- * two headers could disagree (In-Reply-To naming one message while References
- * ended with another). Fields are undefined when there's nothing to thread on.
+ * terminate with it.
+ *
+ * When In-Reply-To is found within the thread chain, the chain is *truncated*
+ * at that message (keeping the ancestor path up to and including it) — a reply
+ * to message N shouldn't list messages that came after N as its ancestors. When
+ * it isn't in the chain (e.g. a caller-supplied id), it's appended so References
+ * still terminates with it. Fields are undefined when there's nothing to thread
+ * on.
  */
 export function buildReplyHeaders(
   reply: ThreadReplyHeaders | undefined,
@@ -194,11 +201,11 @@ export function buildReplyHeaders(
   let references = reply?.references || "";
   if (inReplyTo) {
     const ids = references ? references.split(/\s+/).filter(Boolean) : [];
-    if (ids[ids.length - 1] !== inReplyTo) {
-      const deduped = ids.filter((id) => id !== inReplyTo);
-      deduped.push(inReplyTo);
-      references = deduped.join(" ");
-    }
+    const at = ids.lastIndexOf(inReplyTo);
+    references =
+      at !== -1
+        ? ids.slice(0, at + 1).join(" ") // truncate at the answered message
+        : [...ids, inReplyTo].join(" "); // not present → append to terminate
   }
   return {
     inReplyTo: inReplyTo || undefined,
@@ -772,32 +779,37 @@ export function renderJsonText(value: unknown, note: string): string {
 
 /**
  * Bound the combined size of message bodies so structuredContent (and its text
- * rendering) can't balloon on a long thread. Bodies are kept in order until the
- * budget is spent; the body that crosses the budget is truncated and any later
- * bodies are omitted, each with a marker. Returns the trimmed messages and
- * whether any truncation occurred.
+ * rendering) can't balloon on a long thread. Bodies are produced in order by
+ * `renderBody` until the budget is spent; the body that crosses the budget is
+ * truncated and any later bodies are omitted with a marker.
+ *
+ * `renderBody` is invoked lazily — only while budget remains — so the (possibly
+ * expensive) decode/HTML-stripping of bodies that would be omitted is skipped
+ * entirely. Each result item is the input augmented with its final `body`.
  */
-export function capMessageBodies<T extends { body: string }>(
-  messages: T[],
-  budget: number
-): { messages: T[]; truncated: boolean } {
+export function capMessageBodies<T>(
+  items: T[],
+  budget: number,
+  renderBody: (item: T) => string
+): { messages: Array<T & { body: string }>; truncated: boolean } {
   let remaining = budget;
   let truncated = false;
-  const out = messages.map((m) => {
-    const body = m.body || "";
+  const messages = items.map((item) => {
     if (remaining <= 0) {
-      if (body) truncated = true;
-      return { ...m, body: body ? "[Body omitted: thread exceeds size limit]" : "" };
+      // Budget already spent — omit without rendering (the point of laziness).
+      truncated = true;
+      return { ...item, body: "[Body omitted: thread exceeds size limit]" };
     }
+    const body = renderBody(item);
     if (body.length > remaining) {
       truncated = true;
       const trimmed =
         body.slice(0, remaining) + "\n[Body truncated: thread exceeds size limit]";
       remaining = 0;
-      return { ...m, body: trimmed };
+      return { ...item, body: trimmed };
     }
     remaining -= body.length;
-    return m;
+    return { ...item, body };
   });
-  return { messages: out, truncated };
+  return { messages, truncated };
 }

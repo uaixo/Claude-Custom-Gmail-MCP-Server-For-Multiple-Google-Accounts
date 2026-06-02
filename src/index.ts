@@ -236,23 +236,26 @@ For very large threads the result may be truncated: "truncated": true is set, an
         id: thread_id,
         format: "full",
       });
-      // Bound the message count first (slice the raw list before decoding, so
-      // we don't waste work parsing bodies we'll drop), then bound the bodies.
+      // Bound the message count first (slice the raw list), then bound the
+      // bodies. Bodies are extracted lazily inside capMessageBodies, so bodies
+      // past the size budget aren't decoded/HTML-stripped at all.
       const rawMessages = res.data.messages || [];
       const omittedMessages = Math.max(0, rawMessages.length - MAX_THREAD_MESSAGES);
-      const allMessages = rawMessages.slice(0, MAX_THREAD_MESSAGES).map((m) => ({
+      const kept = rawMessages.slice(0, MAX_THREAD_MESSAGES);
+      const { messages: capped, truncated: bodyTruncated } = capMessageBodies(
+        kept,
+        CHARACTER_LIMIT,
+        (m) => extractPlainText(m.payload)
+      );
+      const messages = capped.map((m) => ({
         message_id: requireField(m.id, "message.id"),
         from: header(m.payload, "From"),
         to: header(m.payload, "To"),
         date: header(m.payload, "Date"),
         subject: header(m.payload, "Subject"),
-        body: extractPlainText(m.payload),
+        body: m.body,
         label_ids: m.labelIds || [],
       }));
-      const { messages, truncated: bodyTruncated } = capMessageBodies(
-        allMessages,
-        CHARACTER_LIMIT
-      );
       const truncated = bodyTruncated || omittedMessages > 0;
       const output = {
         account: acct,
@@ -648,7 +651,15 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
   },
   async ({ thread_id, message_id, add_label_ids, remove_label_ids, account }) => {
     try {
-      if ((thread_id && message_id) || (!thread_id && !message_id)) {
+      // Exactly one of thread_id / message_id must be set. Capture it as a
+      // discriminated target so its id is a definite string downstream — no
+      // non-null assertion needed.
+      const target = thread_id
+        ? ({ kind: "thread", id: thread_id } as const)
+        : message_id
+          ? ({ kind: "message", id: message_id } as const)
+          : null;
+      if (!target || (thread_id && message_id)) {
         return {
           content: [
             {
@@ -677,10 +688,10 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
       };
       let id: string;
       let labelIds: string[];
-      if (thread_id) {
+      if (target.kind === "thread") {
         const res = await gmail.users.threads.modify({
           userId: "me",
-          id: thread_id,
+          id: target.id,
           requestBody,
         });
         id = requireField(res.data.id, "thread.id");
@@ -688,7 +699,7 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
       } else {
         const res = await gmail.users.messages.modify({
           userId: "me",
-          id: message_id!,
+          id: target.id,
           requestBody,
         });
         id = requireField(res.data.id, "message.id");
@@ -696,7 +707,7 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
       }
       const output = {
         account: acct,
-        target: thread_id ? "thread" : "message",
+        target: target.kind,
         id,
         label_ids: labelIds,
       };

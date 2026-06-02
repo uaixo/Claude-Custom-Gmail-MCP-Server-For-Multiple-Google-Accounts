@@ -196,27 +196,36 @@ function sleep(ms: number): Promise<void> {
  * regresses below the previous unlocked baseline. Waiting is async so the event
  * loop is never blocked. `fn` itself is synchronous (load/mutate/save).
  */
+/** A token-store lock older than this is treated as stale (a crashed holder). */
+const LOCK_STALE_MS = 10_000;
+/** How long to try to acquire the lock before proceeding unlocked (advisory). */
+const LOCK_ACQUIRE_TIMEOUT_MS = 2_000;
+
 async function withTokenLock<T>(fn: () => T): Promise<T> {
   const dir = dataDir();
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const lockPath = `${tokensPath()}.lock`;
   let held = false;
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
   while (Date.now() < deadline) {
     try {
-      fs.closeSync(fs.openSync(lockPath, "wx")); // atomic exclusive create
+      // Atomic exclusive create; record the holder PID so a stuck lock is
+      // diagnosable (and a future holder can tell who left it behind).
+      fs.writeFileSync(lockPath, `${process.pid}`, { flag: "wx" });
       held = true;
       break;
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") break; // unexpected → proceed unlocked
       try {
-        // Steal an obviously-stale lock left behind by a crashed process.
-        if (Date.now() - fs.statSync(lockPath).mtimeMs > 10_000) {
-          fs.unlinkSync(lockPath);
+        // Steal a lock left behind by a crashed holder. Operations under the
+        // lock are sub-millisecond, so a lock older than LOCK_STALE_MS is
+        // almost certainly abandoned rather than a live, slow holder.
+        if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+          fs.rmSync(lockPath, { force: true });
           continue;
         }
       } catch {
-        continue; // lock vanished between stat and unlink → retry immediately
+        continue; // lock vanished between stat and remove → retry immediately
       }
       await sleep(25);
     }
@@ -225,8 +234,9 @@ async function withTokenLock<T>(fn: () => T): Promise<T> {
     return fn();
   } finally {
     if (held) {
+      // force:true → no throw if the lock was already removed (e.g. stolen).
       try {
-        fs.unlinkSync(lockPath);
+        fs.rmSync(lockPath, { force: true });
       } catch {
         /* ignore */
       }
@@ -311,8 +321,8 @@ export async function removeAccount(email: string): Promise<boolean> {
  * Otherwise, if exactly one account is connected, use it; if several are
  * connected, require the caller to disambiguate.
  */
-export function resolveAccount(requested?: string): string {
-  const accounts = listAccounts();
+export function resolveAccount(requested?: string, store?: TokenStore): string {
+  const accounts = Object.keys(store ?? loadTokens());
   if (accounts.length === 0) {
     throw new Error(
       "No Gmail accounts connected. Run `npm run add-account` to connect one."
@@ -342,10 +352,9 @@ export function resolveAccount(requested?: string): string {
  * built from the credential file that account was authorized with. Refreshed
  * access tokens are persisted automatically.
  */
-export function getAuthedClient(account: string): OAuth2Client {
+export function getAuthedClient(account: string, store?: TokenStore): OAuth2Client {
   const key = account.toLowerCase();
-  const store = loadTokens();
-  const entry = store[key];
+  const entry = (store ?? loadTokens())[key];
   if (!entry) {
     throw new Error(`No stored tokens for account '${account}'.`);
   }
