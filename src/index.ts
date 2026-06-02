@@ -28,6 +28,7 @@ import {
   renderJsonText,
   requireField,
   resolveAttachments,
+  summarizeThread,
 } from "./gmail.js";
 import {
   CHARACTER_LIMIT,
@@ -138,8 +139,9 @@ Args:
 Returns: JSON {
   "account": string,
   "count": number,
-  "threads": [ { "thread_id": string, "subject": string, "from": string, "date": string, "snippet": string } ]
-}`,
+  "threads": [ { "thread_id": string, "subject": string, "from": string, "date": string, "snippet": string, "error"?: string } ]
+}
+If an individual thread's details can't be fetched, that entry includes an "error" string (and empty subject/from/date) instead of the search failing.`,
     inputSchema: {
       query: z
         .string()
@@ -172,27 +174,13 @@ Returns: JSON {
       });
       const threads = list.data.threads || [];
       // Fetch lightweight metadata for each thread's first message, bounding the
-      // fan-out so large result sets don't trip Gmail's rate limit.
+      // fan-out so large result sets don't trip Gmail's rate limit. A single
+      // thread's fetch failing degrades to an entry with an `error` field rather
+      // than failing the whole search (see summarizeThread).
       const detailed = await mapWithConcurrency(
         threads,
         THREAD_FETCH_CONCURRENCY,
-        async (t) => {
-          const threadId = requireField(t.id, "thread.id");
-          const full = await gmail.users.threads.get({
-            userId: "me",
-            id: threadId,
-            format: "metadata",
-            metadataHeaders: ["Subject", "From", "Date"],
-          });
-          const first = full.data.messages?.[0];
-          return {
-            thread_id: threadId,
-            subject: header(first?.payload, "Subject"),
-            from: header(first?.payload, "From"),
-            date: header(first?.payload, "Date"),
-            snippet: first?.snippet || t.snippet || "",
-          };
-        }
+        (t) => summarizeThread(gmail, t)
       );
       const output = { account: acct, count: detailed.length, threads: detailed };
       const text =
