@@ -7,3 +7,8 @@
   anything, run `git fetch origin main` and `git pull` (or otherwise fast-forward
   local `main`), and confirm local `HEAD` matches `origin/main`. Never review
   off a possibly-stale local checkout. State the commit being reviewed.
+
+- **Don't assume — ask.** Do not make assumptions to fill gaps in a request.
+  When something is ambiguous or underspecified (scope, intent, environment,
+  expected behavior, edge cases), ask clarifying questions before acting rather
+  than guessing. Prefer a quick question over a confident guess.
