@@ -114,6 +114,28 @@ test("loadTokens returns empty without throwing on a corrupt store (#8)", () => 
   }
 });
 
+test("loadTokens treats valid-but-non-object JSON as corrupt instead of crashing (#1)", () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.readFileSync(file, "utf-8");
+  try {
+    // `null` is the dangerous case: Object.entries(null) throws, which would
+    // crash callers like startup's listAccounts(). An array or bare string used
+    // to slip through and produce bogus index-keyed "accounts" ("0", "1", ...).
+    // All must degrade to an empty store, exactly like unparseable JSON.
+    for (const bad of ["null", '["a@b.com"]', '"hello"', "42"]) {
+      fs.writeFileSync(file, bad);
+      let result;
+      assert.doesNotThrow(() => {
+        result = auth.loadTokens();
+      }, `loadTokens threw on ${bad}`);
+      assert.deepEqual(result, {}, `loadTokens(${bad}) should be empty`);
+      assert.deepEqual(auth.listAccounts(), [], `listAccounts(${bad}) should be empty`);
+    }
+  } finally {
+    fs.writeFileSync(file, saved); // restore for any later readers
+  }
+});
+
 test("getAuthedClient rebuilds when the on-disk refresh token changes (#1)", async () => {
   await auth.saveAccount(
     "rotate@x.com",
@@ -137,4 +159,62 @@ test("getAuthedClient rebuilds when the on-disk refresh token changes (#1)", asy
   assert.notEqual(rebuilt, first, "a changed refresh token must invalidate the cache");
   // The rebuilt client must still carry exactly one persistence listener.
   assert.equal(rebuilt.listenerCount("tokens"), 1);
+});
+
+test("getAuthedClient keeps the cached client across a refresh-token rotation (#2)", async () => {
+  await auth.saveAccount(
+    "rotate2@x.com",
+    { access_token: "a1", refresh_token: "r1" },
+    "credentials.json"
+  );
+  const first = auth.getAuthedClient("rotate2@x.com");
+
+  // Simulate google-auth-library rotating the refresh token during a refresh:
+  // it emits 'tokens' carrying a new refresh_token, which the cache listener
+  // persists to disk. The cached freshness signature must move with it, so the
+  // next lookup doesn't mistake our own rotation for an out-of-process
+  // re-consent and needlessly rebuild a still-valid client.
+  first.emit("tokens", { access_token: "a2", refresh_token: "r2" });
+  await new Promise((r) => setTimeout(r, 50)); // let the async persist settle
+
+  assert.equal(
+    auth.getAuthedClient("rotate2@x.com"),
+    first,
+    "an in-process rotation should not invalidate the cached client"
+  );
+  assert.equal(first.listenerCount("tokens"), 1, "no duplicate persistence listener");
+
+  // Control: a change made WITHOUT going through this client's listener (an
+  // out-of-process re-consent) must still force a rebuild — proving the
+  // signature check itself is intact, not simply disabled.
+  await auth.saveAccount(
+    "rotate2@x.com",
+    { access_token: "a3", refresh_token: "r3" },
+    "credentials.json"
+  );
+  assert.notEqual(
+    auth.getAuthedClient("rotate2@x.com"),
+    first,
+    "an out-of-process refresh-token change must still rebuild"
+  );
+});
+
+test("the data dir is created owner-only (0700) (#3)", async () => {
+  // Unix permission bits are meaningless on Windows; only assert on POSIX.
+  if (process.platform === "win32") return;
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-perms-"));
+  const nested = path.join(parent, "fresh", ".gmail-mcp"); // does not exist yet
+  const prev = process.env.GMAIL_MCP_DATA_DIR;
+  try {
+    process.env.GMAIL_MCP_DATA_DIR = nested;
+    // saveAccount -> updateTokens -> withTokenLock/saveTokens both go through
+    // ensureDataDir, which must create the dir 0700 (tokens.json is already 0600).
+    await auth.saveAccount("perms@x.com", { access_token: "t" }, "credentials.json");
+    const mode = fs.statSync(nested).mode & 0o777;
+    assert.equal(mode, 0o700, `expected 0700, got 0${mode.toString(8)}`);
+  } finally {
+    if (prev === undefined) delete process.env.GMAIL_MCP_DATA_DIR;
+    else process.env.GMAIL_MCP_DATA_DIR = prev;
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
 });
