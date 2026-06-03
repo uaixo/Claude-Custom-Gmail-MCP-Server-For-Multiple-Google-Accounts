@@ -84,23 +84,37 @@ export function listenWithFallback(
 }
 
 /**
- * Validate the OAuth redirect's query parameters. Rejects when Google returned
- * an error, when `state` doesn't match the value we generated (a CSRF /
- * code-injection guard, per RFC 8252 §8.9), or when no code is present; returns
- * the authorization code on success.
+ * Classify the OAuth redirect's query parameters against the state we issued.
+ *
+ *  - "ignore": `state` doesn't match what we generated, so this request isn't
+ *    part of our sign-in — a stray hit on the loopback port, or a CSRF /
+ *    code-injection attempt (RFC 8252 §8.9). The caller should answer it
+ *    neutrally and keep waiting, NOT abort: otherwise any local process could
+ *    grief the consent flow by racing a bogus callback to the loopback server.
+ *  - "error": it IS our flow (state matches) but Google reported an error, or
+ *    no code came back — a definitive failure to surface and stop on.
+ *  - "ok": our flow, with an authorization code to exchange.
+ *
+ * State is checked first so neither the `error` nor the `code` of a request
+ * that isn't ours is ever acted on.
  */
+export type CallbackResult =
+  | { status: "ok"; code: string }
+  | { status: "error"; error: string }
+  | { status: "ignore"; reason: string };
+
 export function validateCallback(
   params: URLSearchParams,
   expectedState: string
-): { code: string } | { error: string } {
-  const err = params.get("error");
-  if (err) return { error: err };
+): CallbackResult {
   if (params.get("state") !== expectedState) {
-    return { error: "State mismatch — possible CSRF; aborting sign-in." };
+    return { status: "ignore", reason: "state mismatch" };
   }
+  const err = params.get("error");
+  if (err) return { status: "error", error: err };
   const code = params.get("code");
-  if (!code) return { error: "No authorization code returned." };
-  return { code };
+  if (!code) return { status: "error", error: "No authorization code returned." };
+  return { status: "ok", code };
 }
 
 function printAccounts(): void {
@@ -174,8 +188,15 @@ async function addAccount(): Promise<void> {
         return;
       }
       const result = validateCallback(url.searchParams, state);
+      if (result.status === "ignore") {
+        // Not our sign-in (a stray or forged callback). Answer it without
+        // tearing down the server, so the genuine callback can still arrive.
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end("<h2>Unexpected request.</h2>");
+        return;
+      }
       res.writeHead(200, { "Content-Type": "text/html" });
-      if ("error" in result) {
+      if (result.status === "error") {
         res.end(
           `<h2>Authorization failed</h2><p>${escapeHtml(result.error)}</p>`
         );

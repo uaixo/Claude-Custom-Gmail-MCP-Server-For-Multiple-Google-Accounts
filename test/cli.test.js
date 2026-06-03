@@ -42,24 +42,37 @@ test("oauthRedirectUri formats per-port and defaults to the preferred port", () 
 // --------------------------------------------------------------------------
 test("validateCallback returns the code when state matches", () => {
   const params = new URLSearchParams({ state: "abc123", code: "auth-code" });
-  assert.deepEqual(validateCallback(params, "abc123"), { code: "auth-code" });
+  assert.deepEqual(validateCallback(params, "abc123"), {
+    status: "ok",
+    code: "auth-code",
+  });
 });
 
-test("validateCallback rejects a mismatched state (CSRF guard)", () => {
+test("validateCallback ignores a mismatched state instead of aborting (CSRF guard) (#2)", () => {
+  // A stray or forged loopback hit must be classified "ignore" so the consent
+  // server keeps waiting for the genuine callback rather than tearing down.
   const params = new URLSearchParams({ state: "attacker", code: "auth-code" });
-  const r = validateCallback(params, "abc123");
-  assert.ok("error" in r);
-  assert.match(r.error, /State mismatch/);
+  assert.equal(validateCallback(params, "abc123").status, "ignore");
 });
 
-test("validateCallback surfaces an OAuth error param before anything else", () => {
+test("validateCallback checks state before an error param, so a forged error can't abort it (#2)", () => {
+  // An attacker racing the loopback with ?error=...&state=wrong must not be able
+  // to fail the flow: state is verified first, so this is ignored, not surfaced.
+  const params = new URLSearchParams({ error: "access_denied", state: "wrong" });
+  assert.equal(validateCallback(params, "abc123").status, "ignore");
+});
+
+test("validateCallback surfaces an OAuth error once the state matches", () => {
   const params = new URLSearchParams({ error: "access_denied", state: "abc123" });
-  assert.deepEqual(validateCallback(params, "abc123"), { error: "access_denied" });
+  assert.deepEqual(validateCallback(params, "abc123"), {
+    status: "error",
+    error: "access_denied",
+  });
 });
 
-test("validateCallback rejects a missing code even when state matches", () => {
+test("validateCallback reports a missing code (with matching state) as an error", () => {
   const params = new URLSearchParams({ state: "abc123" });
-  assert.ok("error" in validateCallback(params, "abc123"));
+  assert.equal(validateCallback(params, "abc123").status, "error");
 });
 
 test("escapeHtml neutralizes HTML metacharacters in the OAuth callback page", () => {

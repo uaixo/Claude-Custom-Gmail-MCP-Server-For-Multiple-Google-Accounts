@@ -649,7 +649,11 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
     },
     annotations: {
       readOnlyHint: false,
-      destructiveHint: false,
+      // Removing labels is a non-additive change, and adding "TRASH"/"SPAM"
+      // moves mail out of the inbox (recoverable, but not additive). Flag the
+      // tool destructive so hosts can gate it behind a confirmation, rather
+      // than letting a label edit slip past the same prompt that guards sends.
+      destructiveHint: true,
       idempotentHint: true,
       openWorldHint: true,
     },

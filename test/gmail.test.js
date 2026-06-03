@@ -225,6 +225,21 @@ test("htmlToText strips an unclosed <style>/<script> block to end of input (#L4)
   assert.match(htmlToText("<p>Body</p><script>steal()"), /Body/);
 });
 
+test("htmlToText strips an unclosed <head>/<title> to end of input (#3)", () => {
+  // No closing </head>: head text (title, meta) must not leak into the body.
+  assert.doesNotMatch(htmlToText("<head><title>SECRET</title><meta x=1>"), /SECRET/);
+  // No closing </title> either.
+  assert.doesNotMatch(htmlToText("<title>SECRET TITLE"), /SECRET TITLE/);
+});
+
+test("htmlToText does not mistake <header> for <head> (#3)", () => {
+  // The \b guard matters most with the end-of-input fallback: without it, a
+  // <header> with no following </head> would be eaten all the way to EOF.
+  const out = htmlToText("<header>Visible nav</header><p>Body text</p>");
+  assert.match(out, /Visible nav/);
+  assert.match(out, /Body text/);
+});
+
 // --------------------------------------------------------------------------
 // mapWithConcurrency  (review item #3)
 // --------------------------------------------------------------------------
@@ -798,6 +813,27 @@ test("resolveAttachments rejects invalid base64 and normalizes base64url", () =>
   assert.equal(
     Buffer.from(out[0].contentBase64, "base64").toString("hex"),
     bytes.toString("hex")
+  );
+});
+
+test("resolveAttachments rejects base64 of an impossible length (#4)", () => {
+  // Stripped of padding, a base64 string's length is never ≡ 1 (mod 4): a lone
+  // trailing 6-bit group can't exist. Node's decoder would silently drop it
+  // rather than flag the corruption, so these must be rejected up front.
+  assert.throws(
+    () => resolveAttachments([{ filename: "a.bin", content_base64: "QQQQQ" }]), // 5
+    /not valid base64/
+  );
+  assert.throws(
+    () => resolveAttachments([{ filename: "a.bin", content_base64: "Q" }]), // 1
+    /not valid base64/
+  );
+  // Valid lengths (≡ 0/2/3 mod 4) still pass, padded or not.
+  assert.doesNotThrow(() =>
+    resolveAttachments([{ filename: "a.bin", content_base64: "QQ==" }])
+  );
+  assert.doesNotThrow(() =>
+    resolveAttachments([{ filename: "a.bin", content_base64: "QQQ" }]) // unpadded
   );
 });
 

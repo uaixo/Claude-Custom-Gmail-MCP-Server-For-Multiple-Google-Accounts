@@ -327,9 +327,14 @@ export function htmlToText(html: string): string {
       // which the generic tag pass below would only partially remove.
       .replace(/<!--[\s\S]*?-->/g, "")
       // Drop the document head (title, meta, etc.) so its non-visible text
-      // doesn't leak into the body. A stray <title> outside <head> is handled too.
-      .replace(/<head[\s\S]*?<\/head>/gi, "")
-      .replace(/<title[\s\S]*?<\/title>/gi, "")
+      // doesn't leak into the body. A stray <title> outside <head> is handled
+      // too. Like the style/script passes below, fall back to end-of-input when
+      // the closing tag is missing (truncated/malformed email) so an unclosed
+      // head can't leak. The \b stops <head>/<title> from matching <header>,
+      // <headline>, etc. — without it the "$" fallback would eat a visible
+      // <header> and everything after it to EOF.
+      .replace(/<head\b[\s\S]*?(?:<\/head>|$)/gi, "")
+      .replace(/<title\b[\s\S]*?(?:<\/title>|$)/gi, "")
       // Match the closing tag, but fall back to end-of-input when it's missing
       // (a truncated/malformed email), so an unclosed block can't leak its
       // CSS/JS text into the body.
@@ -488,7 +493,14 @@ export function resolveAttachments(
       .content_base64!.replace(/\s+/g, "")
       .replace(/-/g, "+")
       .replace(/_/g, "/");
-    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned)) {
+    // Two checks: every character must be in the base64 alphabet, and the
+    // length must be possible. Stripped of padding, a base64 string's length is
+    // never ≡ 1 (mod 4) — a lone trailing 6-bit group can't exist. Node's
+    // decoder is lenient and would silently drop that orphan group rather than
+    // flag it, so we reject it here. (Padding is optional because base64url
+    // inputs arrive unpadded; we re-pad canonically on re-encode below.)
+    const unpadded = cleaned.replace(/=+$/, "");
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned) || unpadded.length % 4 === 1) {
       throw new Error(`Attachment ${i}: 'content_base64' is not valid base64.`);
     }
     const contentBase64 = Buffer.from(cleaned, "base64").toString("base64");
