@@ -129,7 +129,16 @@ export function loadTokens(): TokenStore {
   if (!fs.existsSync(file)) return {};
   let raw: Record<string, unknown>;
   try {
-    raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+    const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf-8"));
+    // Guard the shape, not just the syntax. Valid JSON that isn't a plain object
+    // (null, an array, a string/number) would otherwise slip past the parse and
+    // break the Object.entries walk below: null throws — crashing callers like
+    // startup's listAccounts() — while an array or string silently yields bogus
+    // index-keyed "accounts". Treat any non-object as a corrupt store.
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("token store is not a JSON object");
+    }
+    raw = parsed as Record<string, unknown>;
     warnedCorruptTokenStore = false;
   } catch (e) {
     // A corrupt store shouldn't crash the server, but failing silently here
@@ -137,7 +146,7 @@ export function loadTokens(): TokenStore {
     if (!warnedCorruptTokenStore) {
       warnedCorruptTokenStore = true;
       console.error(
-        `Warning: could not parse token store at ${file} (${
+        `Warning: could not load token store at ${file} (${
           (e as Error).message
         }). Treating it as empty; connected accounts will be unavailable until it is repaired or re-created with \`npm run add-account\`.`
       );
@@ -160,9 +169,20 @@ export function loadTokens(): TokenStore {
   return store;
 }
 
-export function saveTokens(store: TokenStore): void {
+/**
+ * Ensure the data dir exists, creating it owner-only (0700) so the token store
+ * and any credential files beside it aren't traversable by other local users.
+ * tokens.json itself is written 0600; this hardens the containing directory to
+ * match. Only applied on creation — an existing dir's mode is left untouched.
+ */
+function ensureDataDir(): string {
   const dir = dataDir();
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+export function saveTokens(store: TokenStore): void {
+  const dir = ensureDataDir();
   const file = tokensPath();
   // Write to a temp file in the same directory, then atomically rename over the
   // target. This prevents a concurrent reader (or a crash mid-write) from ever
@@ -202,8 +222,7 @@ const LOCK_STALE_MS = 10_000;
 const LOCK_ACQUIRE_TIMEOUT_MS = 2_000;
 
 async function withTokenLock<T>(fn: () => T): Promise<T> {
-  const dir = dataDir();
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  ensureDataDir();
   const lockPath = `${tokensPath()}.lock`;
   let held = false;
   const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
@@ -379,6 +398,16 @@ export function getAuthedClient(account: string, store?: TokenStore): OAuth2Clie
   // so a concurrent writer's update isn't lost. Fire-and-forget: the library
   // doesn't await listeners, and persistence is best-effort.
   client.on("tokens", (fresh) => {
+    // If the library rotated the refresh token, keep this cache entry's
+    // freshness signature in step with what we're about to persist. Otherwise
+    // the next getAuthedClient() would read the new token off disk, see it
+    // differ from the cached signature, and mistake our own rotation for an
+    // out-of-process re-consent — rebuilding a perfectly good client. Guard on
+    // identity so a newer client that has since replaced us isn't clobbered.
+    if (fresh.refresh_token) {
+      const cached = authedClients.get(key);
+      if (cached?.client === client) cached.refreshToken = fresh.refresh_token;
+    }
     void updateTokens((store) => {
       const cur = store[key];
       if (cur) cur.tokens = { ...cur.tokens, ...fresh };
