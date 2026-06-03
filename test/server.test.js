@@ -40,3 +40,12 @@ test("read tools are not flagged destructive", async () => {
     assert.notEqual(t.annotations?.destructiveHint, true, `${name} should not be destructive`);
   }
 });
+
+test("gmail_modify_labels is annotated destructive so hosts can gate label edits", async () => {
+  // It can remove labels (non-additive) and add TRASH/SPAM, so a host that only
+  // confirms on destructive tools should still get the chance to prompt.
+  const tools = await listTools();
+  const mod = tools.find((t) => t.name === "gmail_modify_labels");
+  assert.ok(mod, "gmail_modify_labels should be registered");
+  assert.equal(mod.annotations?.destructiveHint, true);
+});
