@@ -69,7 +69,9 @@ const attachmentSchema = z
   })
   .strict();
 
-const server = new McpServer({
+// Exported so tests can connect an in-memory client and introspect the
+// registered tools (e.g. assert tool annotations).
+export const server = new McpServer({
   name: "gmail-mcp-server",
   version: packageVersion(),
 });
@@ -439,7 +441,10 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
     },
     annotations: {
       readOnlyHint: false,
-      destructiveHint: false,
+      // Sending delivers mail immediately and can't be undone. Flag it
+      // destructive so MCP hosts can gate it behind a confirmation, unlike the
+      // read tools and the reversible draft/label writes.
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: true,
     },

@@ -216,7 +216,10 @@ async function addAccount(): Promise<void> {
   }
   console.log("Opening browser for Google consent...");
   console.log(`If it doesn't open, visit:\n${authUrl}\n`);
-  void open(authUrl);
+  // Fire-and-forget: on a box with no browser/handler, open() rejects. The URL
+  // is already printed above, so swallow the rejection rather than letting it
+  // surface as an unhandledRejection and abort the consent flow.
+  open(authUrl).catch(() => {});
 
   // Wait for Google to redirect back to our loopback server with the code, but
   // don't hang forever if the user abandons consent.
