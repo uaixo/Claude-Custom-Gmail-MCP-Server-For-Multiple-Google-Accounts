@@ -1038,3 +1038,42 @@ test("withRetry gives up after the retry budget and rethrows (#C3)", async () =>
   );
   assert.equal(calls, 3); // initial attempt + 2 retries
 });
+
+test("withRetry idempotent:false does NOT retry a 5xx (no duplicate side effect) (#retry)", async () => {
+  // A non-idempotent call (send/draft): a 5xx after the server may already have
+  // processed the request must NOT be retried, or it could duplicate the effect.
+  let calls = 0;
+  await assert.rejects(
+    withRetry(
+      async () => {
+        calls++;
+        const e = new Error("unavailable");
+        e.code = 503;
+        throw e;
+      },
+      { retries: 5, baseDelayMs: 1, idempotent: false }
+    ),
+    /unavailable/
+  );
+  assert.equal(calls, 1); // 503 is not retried for a non-idempotent call
+});
+
+test("withRetry idempotent:false still retries a 429 (rejected before processing) (#retry)", async () => {
+  // A 429 means Gmail rejected the request before doing anything, so retrying is
+  // safe even for a non-idempotent call.
+  let calls = 0;
+  const out = await withRetry(
+    async () => {
+      calls++;
+      if (calls < 3) {
+        const e = new Error("rate");
+        e.status = 429;
+        throw e;
+      }
+      return "ok";
+    },
+    { retries: 5, baseDelayMs: 1, idempotent: false }
+  );
+  assert.equal(out, "ok");
+  assert.equal(calls, 3);
+});

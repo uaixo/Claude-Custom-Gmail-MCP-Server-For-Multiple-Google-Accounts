@@ -437,13 +437,17 @@ Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
         inReplyTo,
         references,
       });
-      const res = await withRetry(() =>
-        gmail.users.drafts.create({
-          userId: "me",
-          requestBody: {
-            message: { raw, ...(thread_id ? { threadId: thread_id } : {}) },
-          },
-        })
+      // idempotent:false → retry only on 429, so a transient 5xx after the
+      // draft was already created can't leave a duplicate draft behind.
+      const res = await withRetry(
+        () =>
+          gmail.users.drafts.create({
+            userId: "me",
+            requestBody: {
+              message: { raw, ...(thread_id ? { threadId: thread_id } : {}) },
+            },
+          }),
+        { idempotent: false }
       );
       const output = {
         account: acct,
@@ -567,11 +571,16 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
         inReplyTo,
         references,
       });
-      const res = await withRetry(() =>
-        gmail.users.messages.send({
-          userId: "me",
-          requestBody: { raw, ...(thread_id ? { threadId: thread_id } : {}) },
-        })
+      // idempotent:false → retry only on 429 (rejected before processing), so a
+      // transient 5xx after Gmail already sent the message can't deliver a
+      // duplicate copy.
+      const res = await withRetry(
+        () =>
+          gmail.users.messages.send({
+            userId: "me",
+            requestBody: { raw, ...(thread_id ? { threadId: thread_id } : {}) },
+          }),
+        { idempotent: false }
       );
       const output = {
         account: acct,

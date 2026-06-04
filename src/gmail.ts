@@ -884,23 +884,38 @@ function httpStatusOf(error: unknown): number | undefined {
   return undefined;
 }
 
-/** HTTP statuses worth retrying: rate limiting and transient server errors. */
+/**
+ * Statuses worth retrying for *idempotent* calls: rate limiting plus transient
+ * server errors, none of which leave a side effect behind when retried.
+ */
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 /**
+ * Statuses safe to retry for *non-idempotent* calls (send / draft-create): only
+ * a rate limit. A 429 means Gmail rejected the request before processing it, so
+ * a retry can't duplicate the side effect — whereas retrying a 5xx that the
+ * server had already processed could (e.g. deliver a second copy of an email).
+ */
+const RATE_LIMIT_ONLY = new Set([429]);
+
+/**
  * Run a Gmail API call with bounded, jittered exponential backoff on transient
- * failures (429 + 5xx). Non-retryable errors (other 4xx, local validation, and
- * transport errors with no HTTP status) and the final attempt throw immediately,
- * so callers' error handling is unchanged except that a transient blip is
- * retried instead of surfaced. Jitter avoids synchronized retries across
- * concurrent calls.
+ * failures. By default (idempotent calls) it retries on rate limiting + 5xx;
+ * pass `idempotent: false` for a call with a side effect that must not be
+ * duplicated (send, draft create), which restricts retries to 429 only.
+ * Non-retryable errors (other 4xx, local validation, transport errors with no
+ * HTTP status) and the final attempt throw immediately, so callers' error
+ * handling is unchanged except that a transient blip is retried instead of
+ * surfaced. Jitter avoids synchronized retries across concurrent calls.
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  opts: { retries?: number; baseDelayMs?: number } = {}
+  opts: { retries?: number; baseDelayMs?: number; idempotent?: boolean } = {}
 ): Promise<T> {
   const retries = opts.retries ?? 3;
   const baseDelayMs = opts.baseDelayMs ?? 300;
+  const retryable =
+    opts.idempotent === false ? RATE_LIMIT_ONLY : RETRYABLE_STATUSES;
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn();
@@ -909,7 +924,7 @@ export async function withRetry<T>(
       if (
         attempt >= retries ||
         status === undefined ||
-        !RETRYABLE_STATUSES.has(status)
+        !retryable.has(status)
       ) {
         throw error;
       }

@@ -312,6 +312,29 @@ test("gmail_create_draft creates a draft and returns its ids", async () => {
   assert.equal(result.structuredContent.message_id, "msg1");
 });
 
+test("gmail_send_message does not retry a 5xx — a transient error can't duplicate a send (#retry)", async () => {
+  // messages.send is non-idempotent: a 503 (which may arrive after Gmail already
+  // sent the message) must surface immediately, not trigger a retry that could
+  // deliver a second copy.
+  const { result, calls } = await callTool(
+    "gmail_send_message",
+    { to: ["x@y.com"], body: "b", account: "alice@example.com" },
+    {
+      "messages.send": () => {
+        const e = new Error("backend unavailable");
+        e.code = 503;
+        throw e;
+      },
+    }
+  );
+  assert.equal(result.isError, true);
+  assert.equal(
+    calls.filter((c) => c.name === "messages.send").length,
+    1,
+    "send must be attempted exactly once on a 5xx"
+  );
+});
+
 // --------------------------------------------------------------------------
 // gmail_list_labels / gmail_create_label
 // --------------------------------------------------------------------------
