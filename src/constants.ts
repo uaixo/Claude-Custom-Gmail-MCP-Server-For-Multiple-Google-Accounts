@@ -43,6 +43,19 @@ export function packageVersion(): string {
 export const CHARACTER_LIMIT = 25000;
 
 /**
+ * Character budget for the *combined* message bodies of a single thread, kept
+ * below CHARACTER_LIMIT on purpose. gmail_get_thread renders the whole result
+ * object — bodies plus per-message metadata (ids, headers, label arrays) and
+ * JSON punctuation — to the text channel via renderJsonText, which falls back
+ * to a notice once the serialized form exceeds CHARACTER_LIMIT. Reserving
+ * headroom for that structural overhead lets a typical thread with large bodies
+ * still render as JSON in the text channel instead of collapsing to the notice.
+ * Pathologically large or many-message threads still fall back, with
+ * structuredContent carrying the authoritative result either way.
+ */
+export const MAX_THREAD_BODY_CHARS = 20000;
+
+/**
  * Maximum number of per-thread metadata fetches to run concurrently when
  * expanding search results. Bounds the fan-out so large result sets don't
  * trip Gmail's per-user rate limit.

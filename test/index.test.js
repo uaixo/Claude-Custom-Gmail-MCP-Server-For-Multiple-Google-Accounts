@@ -441,3 +441,119 @@ test("a Gmail API error is surfaced as an isError result, not thrown", async () 
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /not found/i);
 });
+
+// --------------------------------------------------------------------------
+// gmail_list_labels caps oversized text like the other read tools (#1)
+// --------------------------------------------------------------------------
+test("gmail_list_labels routes oversized output through the text budget (#1)", async () => {
+  // Enough labels that the pretty-printed JSON exceeds CHARACTER_LIMIT (25000):
+  // the text channel must fall back to the structuredContent notice rather than
+  // dumping oversized JSON, while structuredContent still carries every label.
+  const labels = Array.from({ length: 1200 }, (_, i) => ({
+    id: `Label_${i}`,
+    name: `A reasonably descriptive label name number ${i}`,
+    type: "user",
+  }));
+  const { result } = await callTool(
+    "gmail_list_labels",
+    { account: "alice@example.com" },
+    { "labels.list": { data: { labels } } }
+  );
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.labels.length, 1200);
+  // The text is the safe notice (not parseable JSON), pointing at structuredContent.
+  assert.throws(() => JSON.parse(result.content[0].text));
+  assert.match(result.content[0].text, /structuredContent/);
+});
+
+// --------------------------------------------------------------------------
+// gmail_get_thread body budget is decoupled from the render budget (#2)
+// --------------------------------------------------------------------------
+test("gmail_get_thread keeps a large single body within the text channel (#2)", async () => {
+  // A body larger than the thread body budget but, once truncated, small enough
+  // that the rendered JSON still fits CHARACTER_LIMIT — so the text channel
+  // returns real JSON, not the "too large" notice. This only holds because the
+  // body budget (MAX_THREAD_BODY_CHARS) is below the render budget.
+  const bigBody = "x".repeat(30000);
+  const { result } = await callTool(
+    "gmail_get_thread",
+    { thread_id: "t1", account: "alice@example.com" },
+    {
+      "threads.get": {
+        data: {
+          messages: [
+            {
+              id: "m1",
+              labelIds: ["INBOX"],
+              payload: {
+                mimeType: "text/plain",
+                headers: [{ name: "Subject", value: "Big" }],
+                body: { data: utf8(bigBody).toString("base64url") },
+              },
+            },
+          ],
+        },
+      },
+    }
+  );
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.truncated, true);
+  const body = result.structuredContent.messages[0].body;
+  assert.ok(body.length < bigBody.length, "body should be truncated");
+  assert.match(body, /truncated/);
+  // The text channel rendered real JSON rather than the oversized notice...
+  assert.doesNotMatch(result.content[0].text, /Result too large/);
+  // ...and it round-trips to the same structuredContent body.
+  assert.equal(JSON.parse(result.content[0].text).messages[0].body, body);
+});
+
+// --------------------------------------------------------------------------
+// attachment schema enforces "exactly one of path / content_base64" (#4)
+// --------------------------------------------------------------------------
+test("gmail_create_draft rejects an attachment with both path and content_base64 (#4)", async () => {
+  // The union schema fails validation at the boundary (Zod 'unrecognized_keys'),
+  // so the input is rejected as a schema-level validation error before the
+  // handler runs — not via resolveAttachments' runtime check. An empty call list
+  // proves the handler never reached the Gmail API.
+  const { result, calls } = await callTool("gmail_create_draft", {
+    to: ["x@y.com"],
+    body: "b",
+    account: "alice@example.com",
+    attachments: [{ path: "/x", content_base64: "QQ==", filename: "a.bin" }],
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Input validation error/);
+  assert.equal(calls.length, 0, "no Gmail call should happen on invalid input");
+});
+
+test("gmail_create_draft rejects inline content_base64 without a filename (#4)", async () => {
+  // The inline branch requires filename, so this fails union validation at the
+  // schema boundary.
+  const { result, calls } = await callTool("gmail_create_draft", {
+    to: ["x@y.com"],
+    body: "b",
+    account: "alice@example.com",
+    attachments: [{ content_base64: "QQ==" }],
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Input validation error/);
+  assert.equal(calls.length, 0, "no Gmail call should happen on invalid input");
+});
+
+test("gmail_create_draft accepts a valid inline attachment (#4)", async () => {
+  // The happy path still works through the union schema.
+  const { result, calls } = await callTool(
+    "gmail_create_draft",
+    {
+      to: ["x@y.com"],
+      body: "b",
+      account: "alice@example.com",
+      attachments: [{ content_base64: "QQ==", filename: "a.bin" }],
+    },
+    { "drafts.create": { data: { id: "d1", message: { id: "msg1" } } } }
+  );
+  assert.equal(result.isError, undefined);
+  const dc = calls.find((c) => c.name === "drafts.create");
+  assert.ok(dc.params.requestBody.message.raw, "draft carries a raw message");
+  assert.equal(result.structuredContent.draft_id, "d1");
+});

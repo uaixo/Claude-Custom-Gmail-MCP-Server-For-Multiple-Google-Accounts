@@ -240,6 +240,24 @@ test("htmlToText does not mistake <header> for <head> (#3)", () => {
   assert.match(out, /Body text/);
 });
 
+test("htmlToText preserves literal < and > that aren't real markup", () => {
+  // "3 < 5 and 5 > 3": the '<'/'>' are body text, not tags. The narrowed tag
+  // matcher only strips a '<' that opens a real tag, so this survives — the old
+  // catch-all /<[^>]+>/ ate "< 5 and 5 >" as a bogus tag.
+  assert.equal(htmlToText("<p>3 < 5 and 5 > 3</p>"), "3 < 5 and 5 > 3");
+  // A lone '<' with a space after it is not a tag opener either.
+  assert.equal(htmlToText("<div>a < b</div>"), "a < b");
+});
+
+test("htmlToText still strips real tags, declarations, and end tags", () => {
+  // The narrowed matcher must keep removing genuine markup: start tags, a
+  // <!DOCTYPE> declaration, namespaced Outlook tags, and end tags.
+  const out = htmlToText('<!DOCTYPE html><o:p>Outlook</o:p><a href="x">link</a>');
+  assert.equal(out, "Outlooklink");
+  assert.doesNotMatch(out, /[<>]/);
+  assert.doesNotMatch(out, /DOCTYPE|href/);
+});
+
 // --------------------------------------------------------------------------
 // mapWithConcurrency  (review item #3)
 // --------------------------------------------------------------------------
