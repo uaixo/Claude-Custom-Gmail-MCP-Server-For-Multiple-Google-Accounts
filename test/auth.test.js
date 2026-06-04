@@ -218,3 +218,46 @@ test("the data dir is created owner-only (0700) (#3)", async () => {
     fs.rmSync(parent, { recursive: true, force: true });
   }
 });
+
+test("a removed account isn't resurrected by a late token refresh from its old client (#C4)", async () => {
+  await auth.saveAccount(
+    "ghost@x.com",
+    { access_token: "a1", refresh_token: "r1" },
+    "credentials.json"
+  );
+  const client = auth.getAuthedClient("ghost@x.com");
+  assert.equal(await auth.removeAccount("ghost@x.com"), true);
+  assert.ok(!auth.listAccounts().includes("ghost@x.com"));
+
+  // The evicted client emits a token refresh AFTER removal. Its listener must
+  // not write the account back into the store.
+  client.emit("tokens", { access_token: "a2", refresh_token: "r2" });
+  await new Promise((r) => setTimeout(r, 50)); // let the async persist settle
+
+  assert.ok(
+    !auth.listAccounts().includes("ghost@x.com"),
+    "a removed account must stay removed"
+  );
+});
+
+test("withTokenLock fails instead of writing unlocked when the lock is held (#B3)", async () => {
+  const lock = path.join(dataDir, "tokens.json.lock");
+  // A fresh (non-stale) lock that won't be stolen within the short window.
+  fs.writeFileSync(lock, "424242");
+  const prev = process.env.GMAIL_MCP_LOCK_TIMEOUT_MS;
+  process.env.GMAIL_MCP_LOCK_TIMEOUT_MS = "150";
+  try {
+    await assert.rejects(
+      auth.saveAccount("contend@x.com", { access_token: "t" }, "credentials.json"),
+      /Could not acquire the token-store lock/
+    );
+    assert.ok(
+      !auth.listAccounts().includes("contend@x.com"),
+      "must not write the account when the lock couldn't be acquired"
+    );
+  } finally {
+    if (prev === undefined) delete process.env.GMAIL_MCP_LOCK_TIMEOUT_MS;
+    else process.env.GMAIL_MCP_LOCK_TIMEOUT_MS = prev;
+    fs.rmSync(lock, { force: true });
+  }
+});

@@ -29,8 +29,10 @@ import {
   requireField,
   resolveAttachments,
   summarizeThread,
+  withRetry,
 } from "./gmail.js";
 import {
+  CHARACTER_LIMIT,
   isMainModule,
   MAX_THREAD_BODY_CHARS,
   MAX_THREAD_MESSAGES,
@@ -104,6 +106,26 @@ const accountField = z
   .describe(
     "Email address of the connected Gmail account to use. Optional when only one account is connected; required to disambiguate when several are."
   );
+
+/**
+ * A recipient: either a bare email address ("alice@x.com") or an RFC 5322
+ * name-addr with a display name ("Alice Example <alice@x.com>"). The email part
+ * (inside the angle brackets when present) must look like an address; CR/LF in
+ * the value is stripped downstream in buildRawMessage, so a display name can't
+ * inject headers.
+ */
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function isRecipient(value: string): boolean {
+  const trimmed = value.trim();
+  const named = /<([^<>]+)>\s*$/.exec(trimmed);
+  const email = (named ? named[1] : trimmed).trim();
+  return EMAIL_RE.test(email);
+}
+const recipientSchema = z
+  .string()
+  .refine(isRecipient, {
+    message: 'Must be an email address or \'Display Name <email@host>\'.',
+  });
 
 // ---------------------------------------------------------------------------
 // gmail_list_accounts
@@ -189,11 +211,13 @@ If an individual thread's details can't be fetched, that entry includes an "erro
   async ({ query, account, max_results }) => {
     try {
       const { gmail, account: acct } = gmailFor(account);
-      const list = await gmail.users.threads.list({
-        userId: "me",
-        q: query,
-        maxResults: max_results,
-      });
+      const list = await withRetry(() =>
+        gmail.users.threads.list({
+          userId: "me",
+          q: query,
+          maxResults: max_results,
+        })
+      );
       const threads = list.data.threads || [];
       // Fetch lightweight metadata for each thread's first message, bounding the
       // fan-out so large result sets don't trip Gmail's rate limit. A single
@@ -253,11 +277,13 @@ For very large threads the result may be truncated: "truncated": true is set, an
   async ({ thread_id, account }) => {
     try {
       const { gmail, account: acct } = gmailFor(account);
-      const res = await gmail.users.threads.get({
-        userId: "me",
-        id: thread_id,
-        format: "full",
-      });
+      const res = await withRetry(() =>
+        gmail.users.threads.get({
+          userId: "me",
+          id: thread_id,
+          format: "full",
+        })
+      );
       // Bound the message count first (slice the raw list), then bound the
       // bodies. Bodies are extracted lazily inside capMessageBodies, so bodies
       // past the size budget aren't decoded/HTML-stripped at all.
@@ -286,10 +312,40 @@ For very large threads the result may be truncated: "truncated": true is set, an
         ...(truncated ? { truncated: true } : {}),
         ...(omittedMessages > 0 ? { omitted_message_count: omittedMessages } : {}),
       };
-      const text = renderJsonText(
-        output,
-        "Thread body was large; consider reading messages individually."
-      );
+      // Prefer the full JSON. If it's over the character budget, fall back to a
+      // compact per-message summary (ids, headers, body sizes) that points at
+      // structuredContent for the authoritative content — far more useful than a
+      // bare "too large" notice. If even that summary is over budget (a thread
+      // with very many messages), fall back to the notice.
+      const fullJson = JSON.stringify(output, null, 2);
+      let text: string;
+      if (fullJson.length <= CHARACTER_LIMIT) {
+        text = fullJson;
+      } else {
+        const summary = [
+          `Thread ${thread_id} in ${acct}: ${messages.length} message(s)` +
+            `${truncated ? " (truncated)" : ""}.`,
+          omittedMessages > 0
+            ? `${omittedMessages} trailing message(s) omitted.`
+            : "",
+          "Full headers and bodies are in structuredContent. Per-message summary:",
+          ...messages.map(
+            (m) =>
+              `- [${m.message_id}] ${m.from || "(unknown sender)"} — ` +
+              `${m.subject || "(no subject)"}` +
+              `${m.date ? ` (${m.date})` : ""}; body ${m.body.length} chars`
+          ),
+        ]
+          .filter(Boolean)
+          .join("\n");
+        text =
+          summary.length <= CHARACTER_LIMIT
+            ? summary
+            : renderJsonText(
+                output,
+                "Thread is very large; read messages individually."
+              );
+      }
       return { content: [{ type: "text", text }], structuredContent: output };
     } catch (error) {
       return {
@@ -323,7 +379,10 @@ Args:
 
 Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
     inputSchema: {
-      to: z.array(z.string().email()).min(1).describe("Recipient email addresses"),
+      to: z
+        .array(recipientSchema)
+        .min(1)
+        .describe('Recipients, each "email@host" or \'Name <email@host>\''),
       subject: z
         .string()
         .optional()
@@ -341,8 +400,8 @@ Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
         .array(attachmentSchema)
         .optional()
         .describe("Files to attach (each via local 'path' or inline 'content_base64')"),
-      cc: z.array(z.string().email()).optional().describe("CC recipients"),
-      bcc: z.array(z.string().email()).optional().describe("BCC recipients"),
+      cc: z.array(recipientSchema).optional().describe("CC recipients"),
+      bcc: z.array(recipientSchema).optional().describe("BCC recipients"),
       account: accountField,
       thread_id: z
         .string()
@@ -363,7 +422,7 @@ Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
       // When drafting into a thread, derive threading headers from it so Gmail
       // associates the draft as a reply.
       const reply = thread_id
-        ? await getThreadReplyHeaders(gmail, thread_id)
+        ? await withRetry(() => getThreadReplyHeaders(gmail, thread_id))
         : undefined;
       const { inReplyTo, references } = buildReplyHeaders(reply);
       const raw = buildRawMessage({
@@ -378,12 +437,14 @@ Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
         inReplyTo,
         references,
       });
-      const res = await gmail.users.drafts.create({
-        userId: "me",
-        requestBody: {
-          message: { raw, ...(thread_id ? { threadId: thread_id } : {}) },
-        },
-      });
+      const res = await withRetry(() =>
+        gmail.users.drafts.create({
+          userId: "me",
+          requestBody: {
+            message: { raw, ...(thread_id ? { threadId: thread_id } : {}) },
+          },
+        })
+      );
       const output = {
         account: acct,
         draft_id: requireField(res.data.id, "draft.id"),
@@ -429,7 +490,10 @@ Args:
 
 Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
     inputSchema: {
-      to: z.array(z.string().email()).min(1).describe("Recipient email addresses"),
+      to: z
+        .array(recipientSchema)
+        .min(1)
+        .describe('Recipients, each "email@host" or \'Name <email@host>\''),
       subject: z
         .string()
         .optional()
@@ -447,8 +511,8 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
         .array(attachmentSchema)
         .optional()
         .describe("Files to attach (each via local 'path' or inline 'content_base64')"),
-      cc: z.array(z.string().email()).optional().describe("CC recipients"),
-      bcc: z.array(z.string().email()).optional().describe("BCC recipients"),
+      cc: z.array(recipientSchema).optional().describe("CC recipients"),
+      bcc: z.array(recipientSchema).optional().describe("BCC recipients"),
       account: accountField,
       thread_id: z
         .string()
@@ -488,7 +552,7 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
       // explicit in_reply_to still wins for In-Reply-To; buildReplyHeaders then
       // makes the References chain terminate with it, so the two headers agree.
       const reply = thread_id
-        ? await getThreadReplyHeaders(gmail, thread_id)
+        ? await withRetry(() => getThreadReplyHeaders(gmail, thread_id))
         : undefined;
       const { inReplyTo, references } = buildReplyHeaders(reply, in_reply_to);
       const raw = buildRawMessage({
@@ -503,10 +567,12 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
         inReplyTo,
         references,
       });
-      const res = await gmail.users.messages.send({
-        userId: "me",
-        requestBody: { raw, ...(thread_id ? { threadId: thread_id } : {}) },
-      });
+      const res = await withRetry(() =>
+        gmail.users.messages.send({
+          userId: "me",
+          requestBody: { raw, ...(thread_id ? { threadId: thread_id } : {}) },
+        })
+      );
       const output = {
         account: acct,
         message_id: requireField(res.data.id, "message.id"),
@@ -556,7 +622,7 @@ Returns: JSON { "account": string, "labels": [ { "id": string, "name": string, "
   async ({ account }) => {
     try {
       const { gmail, account: acct } = gmailFor(account);
-      const res = await gmail.users.labels.list({ userId: "me" });
+      const res = await withRetry(() => gmail.users.labels.list({ userId: "me" }));
       const labels = (res.data.labels || []).map((l) => ({
         id: requireField(l.id, "label.id"),
         name: requireField(l.name, "label.name"),
@@ -611,14 +677,16 @@ Returns: JSON { "account": string, "id": string, "name": string }`,
   async ({ name, account }) => {
     try {
       const { gmail, account: acct } = gmailFor(account);
-      const res = await gmail.users.labels.create({
-        userId: "me",
-        requestBody: {
-          name,
-          labelListVisibility: "labelShow",
-          messageListVisibility: "show",
-        },
-      });
+      const res = await withRetry(() =>
+        gmail.users.labels.create({
+          userId: "me",
+          requestBody: {
+            name,
+            labelListVisibility: "labelShow",
+            messageListVisibility: "show",
+          },
+        })
+      );
       const output = {
         account: acct,
         id: requireField(res.data.id, "label.id"),
@@ -725,11 +793,13 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
       let id: string;
       let labelIds: string[];
       if (target.kind === "thread") {
-        const res = await gmail.users.threads.modify({
-          userId: "me",
-          id: target.id,
-          requestBody,
-        });
+        const res = await withRetry(() =>
+          gmail.users.threads.modify({
+            userId: "me",
+            id: target.id,
+            requestBody,
+          })
+        );
         id = requireField(res.data.id, "thread.id");
         // A thread modify applies to every message, which may then carry
         // differing labels; report the union across the thread rather than just
@@ -740,11 +810,13 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
         }
         labelIds = [...labelSet];
       } else {
-        const res = await gmail.users.messages.modify({
-          userId: "me",
-          id: target.id,
-          requestBody,
-        });
+        const res = await withRetry(() =>
+          gmail.users.messages.modify({
+            userId: "me",
+            id: target.id,
+            requestBody,
+          })
+        );
         id = requireField(res.data.id, "message.id");
         labelIds = res.data.labelIds || [];
       }

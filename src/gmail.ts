@@ -1,6 +1,8 @@
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { google, gmail_v1 } from "googleapis";
+import { convert as htmlToTextConvert } from "html-to-text";
 import { getAuthedClient, loadTokens, resolveAccount } from "./auth.js";
 import { attachmentDirs, CHARACTER_LIMIT, MAX_MESSAGE_BYTES } from "./constants.js";
 
@@ -272,86 +274,31 @@ function findPartBody(
   return "";
 }
 
-/** The handful of named HTML entities that commonly appear in email bodies. */
-const NAMED_ENTITIES: Record<string, string> = {
-  nbsp: " ",
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-  apos: "'",
-};
-
-/** String.fromCodePoint, but yields "" instead of throwing on an invalid code point. */
-function safeFromCodePoint(code: number): string {
-  try {
-    return String.fromCodePoint(code);
-  } catch {
-    return ""; // out of range (> 0x10FFFF) or otherwise invalid — drop it
-  }
-}
-
 /**
- * Decode the handful of HTML entities that commonly appear in email bodies. A
- * single left-to-right pass (rather than chained .replace() calls) avoids
- * double-decoding: e.g. "&amp;lt;" decodes to the literal "&lt;", not "<",
- * because scanning resumes after each match instead of re-reading the "&".
- * Numeric references are bounds-checked so a malformed value can't throw.
- */
-function decodeHtmlEntities(text: string): string {
-  return text.replace(
-    /&(#x[0-9a-f]+|#\d+|nbsp|amp|lt|gt|quot|apos);/gi,
-    (match, body: string) => {
-      const b = body.toLowerCase();
-      if (b[0] === "#") {
-        const code =
-          b[1] === "x" ? parseInt(b.slice(2), 16) : parseInt(b.slice(1), 10);
-        return Number.isNaN(code) ? match : safeFromCodePoint(code);
-      }
-      return NAMED_ENTITIES[b] ?? match;
-    }
-  );
-}
-
-/**
- * Strip an HTML email body down to readable plain text. Drops style/script
- * blocks, turns block-level closes and <br> into newlines, removes remaining
- * tags, decodes common entities, and collapses excess blank lines. This is a
- * best-effort fallback for messages with no text/plain part — not a full
- * HTML-to-text renderer.
+ * Strip an HTML email body down to readable plain text using the html-to-text
+ * library, which parses the markup (handling quoted attributes, comments,
+ * malformed nesting, character references, and block structure) rather than
+ * scrubbing tags with regexes. head/title/style/script are dropped, links
+ * render as their visible text (no URL clutter), and images are skipped.
+ * Non-breaking spaces are normalized to ordinary spaces so callers see plain
+ * ASCII whitespace. Returns "" for empty/blank input.
  */
 export function htmlToText(html: string): string {
-  return decodeHtmlEntities(
-    html
-      // Strip comments first: a comment can contain '>' (e.g. "<!-- a > b -->"),
-      // which the generic tag pass below would only partially remove.
-      .replace(/<!--[\s\S]*?-->/g, "")
-      // Drop the document head (title, meta, etc.) so its non-visible text
-      // doesn't leak into the body. A stray <title> outside <head> is handled
-      // too. Like the style/script passes below, fall back to end-of-input when
-      // the closing tag is missing (truncated/malformed email) so an unclosed
-      // head can't leak. The \b stops <head>/<title> from matching <header>,
-      // <headline>, etc. — without it the "$" fallback would eat a visible
-      // <header> and everything after it to EOF.
-      .replace(/<head\b[\s\S]*?(?:<\/head>|$)/gi, "")
-      .replace(/<title\b[\s\S]*?(?:<\/title>|$)/gi, "")
-      // Match the closing tag, but fall back to end-of-input when it's missing
-      // (a truncated/malformed email), so an unclosed block can't leak its
-      // CSS/JS text into the body.
-      .replace(/<style\b[\s\S]*?(?:<\/style>|$)/gi, "")
-      .replace(/<script\b[\s\S]*?(?:<\/script>|$)/gi, "")
-      .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<\/(p|div|h[1-6]|li|tr|table|blockquote)>/gi, "\n")
-      // Strip only genuine markup: a '<' that opens a start tag (letter), end
-      // tag ('/'), declaration ('!', e.g. <!DOCTYPE>), or processing
-      // instruction ('?'). A '<' followed by anything else — a space or digit,
-      // as in "3 < 5 and 5 > 3" — is literal body text and is left intact,
-      // where the old catch-all /<[^>]+>/ would have eaten "< 5 and 5 >" as a
-      // bogus tag. A lone '>' has no matching opener and likewise survives.
-      .replace(/<[/!?a-zA-Z][^>]*>/g, "")
-  )
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
+  return htmlToTextConvert(html, {
+    // Preserve the content as-is; the model, not a fixed column width, decides
+    // wrapping. Skip non-visible/non-text elements so they can't leak into the
+    // body, and drop hrefs/images so only readable text remains.
+    wordwrap: false,
+    selectors: [
+      { selector: "a", options: { ignoreHref: true } },
+      { selector: "img", format: "skip" },
+      { selector: "head", format: "skip" },
+      { selector: "title", format: "skip" },
+      { selector: "style", format: "skip" },
+      { selector: "script", format: "skip" },
+    ],
+  })
+    .replace(/\u00A0/g, " ")
     .trim();
 }
 
@@ -495,21 +442,30 @@ export function resolveAttachments(
     // silently-corrupt attachment. Buffer.from is lenient (it drops invalid
     // chars), so the regex is what actually rejects garbage; re-encoding the
     // decoded bytes yields canonical padding for the wire.
-    const cleaned = a
-      .content_base64!.replace(/\s+/g, "")
-      .replace(/-/g, "+")
-      .replace(/_/g, "/");
-    // Two checks: every character must be in the base64 alphabet, and the
-    // length must be possible. Stripped of padding, a base64 string's length is
-    // never ≡ 1 (mod 4) — a lone trailing 6-bit group can't exist. Node's
-    // decoder is lenient and would silently drop that orphan group rather than
-    // flag it, so we reject it here. (Padding is optional because base64url
-    // inputs arrive unpadded; we re-pad canonically on re-encode below.)
-    const unpadded = cleaned.replace(/=+$/, "");
-    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned) || unpadded.length % 4 === 1) {
+    //
+    // One whitespace-stripping pass, then validate against both the standard
+    // (+/) and URL-safe (-_) alphabets in a single regex — no separate
+    // alphabet-conversion passes just to validate.
+    const cleaned = a.content_base64!.replace(/\s+/g, "");
+    if (!/^[A-Za-z0-9+/_-]*={0,2}$/.test(cleaned)) {
       throw new Error(`Attachment ${i}: 'content_base64' is not valid base64.`);
     }
-    const contentBase64 = Buffer.from(cleaned, "base64").toString("base64");
+    // Length must be possible: stripped of padding, a base64 string's length is
+    // never ≡ 1 (mod 4) — a lone trailing 6-bit group can't exist, and Node's
+    // lenient decoder would silently drop it rather than flag it. Measure the
+    // unpadded length in place rather than allocating a trimmed copy. (Padding
+    // is optional because base64url inputs arrive unpadded.)
+    let unpaddedLen = cleaned.length;
+    while (unpaddedLen > 0 && cleaned.charCodeAt(unpaddedLen - 1) === 0x3d /* = */) {
+      unpaddedLen--;
+    }
+    if (unpaddedLen % 4 === 1) {
+      throw new Error(`Attachment ${i}: 'content_base64' is not valid base64.`);
+    }
+    // Normalize the URL-safe alphabet to standard in one pass, then re-encode to
+    // canonical standard base64 (canonical padding for the wire).
+    const standard = cleaned.replace(/[-_]/g, (c) => (c === "-" ? "+" : "/"));
+    const contentBase64 = Buffer.from(standard, "base64").toString("base64");
     return { filename: a.filename, mimeType, contentBase64 };
   });
 }
@@ -643,6 +599,41 @@ function mimeHeaderWithFilename(
     : `${prefix}; ${paramName}*=UTF-8''${encodeRfc2231(filename)}`;
 }
 
+/** RFC 5322's hard per-line limit (998 octets, excluding the CRLF). */
+const HARD_LINE_LIMIT = 998;
+
+/**
+ * Last-resort hard break for a segment that has no foldable space yet still
+ * exceeds the hard line limit (e.g. one pathologically long token). Splits on a
+ * UTF-8 code-point boundary — `for...of` iterates by code point, so a multi-byte
+ * character is never cut — and gives each continuation a leading space so the
+ * result re-folds as valid FWS. Unlike space-folding this alters the value on
+ * unfolding (a space is inserted), but it only triggers for values far longer
+ * than any real address, message-id, or filename; everything shorter is
+ * untouched. The alternative — emitting a >998-octet line — risks the whole
+ * message being rejected.
+ */
+function hardBreakSegment(segment: string): string[] {
+  if (Buffer.byteLength(segment, "utf-8") <= HARD_LINE_LIMIT) return [segment];
+  const max = HARD_LINE_LIMIT - 1; // reserve an octet for the continuation space
+  const pieces: string[] = [];
+  let cur = "";
+  let bytes = 0;
+  for (const ch of segment) {
+    const charBytes = Buffer.byteLength(ch, "utf-8");
+    if (bytes + charBytes > max && cur !== "") {
+      pieces.push(cur);
+      cur = ch;
+      bytes = charBytes;
+    } else {
+      cur += ch;
+      bytes += charBytes;
+    }
+  }
+  if (cur !== "") pieces.push(cur);
+  return pieces.map((piece, idx) => (idx === 0 ? piece : ` ${piece}`));
+}
+
 /**
  * Fold a header line so no line exceeds 78 octets (RFC 5322 recommends ≤78; the
  * hard limit is 998). Length is measured in UTF-8 octets, not characters, so a
@@ -651,8 +642,10 @@ function mimeHeaderWithFilename(
  * continuation line's indent — so unfolding restores the value byte-for-byte,
  * and the break point (an ASCII space) is never inside a multi-byte sequence.
  * This keeps long recipient lists, References chains, and multi-word encoded
- * subjects within spec; a single token longer than the limit (e.g. one very
- * long address) is left intact rather than broken.
+ * subjects within spec. A single token longer than 78 octets (e.g. one long
+ * address) is left intact rather than broken — except that a token still over
+ * the 998-octet hard limit is hard-broken as a last resort (see
+ * hardBreakSegment) so no emitted line can violate that limit.
  */
 function foldHeaderLine(line: string): string {
   const LIMIT = 78; // octets
@@ -676,7 +669,9 @@ function foldHeaderLine(line: string): string {
     if (line[i] === " ") lastSpace = i;
   }
   segments.push(line.slice(segStart));
-  return segments.join("\r\n");
+  // Hard-break any segment that has no foldable space but still exceeds the
+  // 998-octet hard limit; normal segments pass through unchanged.
+  return segments.flatMap(hardBreakSegment).join("\r\n");
 }
 
 /** Wrap a long base64 string into 76-char lines per RFC 2045. */
@@ -684,11 +679,21 @@ function wrapBase64(data: string): string {
   return data.replace(/.{1,76}/g, "$&\r\n").trimEnd();
 }
 
-/** Generate a unique MIME boundary token. */
+/** Generate an unguessable MIME boundary token (144 bits of CSPRNG entropy). */
 function makeBoundary(tag: string): string {
-  return `=_${tag}_${Date.now().toString(36)}_${Math.random()
-    .toString(36)
-    .slice(2)}`;
+  return `=_${tag}_${crypto.randomBytes(18).toString("hex")}`;
+}
+
+/**
+ * A boundary guaranteed not to occur within the content it will delimit. With a
+ * 144-bit random token a collision is already infinitesimal; this check makes
+ * it impossible (and is cheap), so a delimiter can never appear inside a part
+ * body and prematurely terminate it.
+ */
+function uniqueBoundary(tag: string, contents: string[]): string {
+  let boundary = makeBoundary(tag);
+  while (contents.some((c) => c.includes(boundary))) boundary = makeBoundary(tag);
+  return boundary;
 }
 
 /**
@@ -712,12 +717,77 @@ function finalizeMessage(lines: string[]): string {
 }
 
 /**
+ * Render the message body as the lines of a MIME entity. When `isHtml` is set,
+ * the body is sent as `multipart/alternative` with a text/plain part (derived
+ * from the HTML via htmlToText, listed first per RFC 2046 "least rich first")
+ * and the original HTML second, so non-HTML clients still get readable text.
+ * Otherwise it's a single text/plain part. Each raw base64 blob is pushed onto
+ * `contents` so the caller can choose enclosing boundaries that never collide
+ * with the content.
+ */
+function renderBodyEntity(
+  body: string,
+  isHtml: boolean | undefined,
+  contents: string[]
+): string[] {
+  if (!isHtml) {
+    const b64 = wrapBase64(Buffer.from(body, "utf-8").toString("base64"));
+    contents.push(b64);
+    return [
+      'Content-Type: text/plain; charset="UTF-8"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      b64,
+    ];
+  }
+  const plainB64 = wrapBase64(
+    Buffer.from(htmlToText(body), "utf-8").toString("base64")
+  );
+  const htmlB64 = wrapBase64(Buffer.from(body, "utf-8").toString("base64"));
+  contents.push(plainB64, htmlB64);
+  const altBoundary = uniqueBoundary("alt", [plainB64, htmlB64]);
+  return [
+    `Content-Type: multipart/alternative; boundary="${altBoundary}"`,
+    "",
+    `--${altBoundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+    "",
+    plainB64,
+    `--${altBoundary}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+    "",
+    htmlB64,
+    `--${altBoundary}--`,
+  ];
+}
+
+/** Render one attachment as the lines of a multipart/mixed part. */
+function renderAttachmentPart(att: ResolvedAttachment): string[] {
+  const safeMime = sanitizeHeaderValue(att.mimeType);
+  // Fold each part header so a long (e.g. non-ASCII, percent-encoded) filename
+  // can't produce an over-length line, just like the top-level headers.
+  const partHeaders = [
+    mimeHeaderWithFilename(`Content-Type: ${safeMime}`, "name", att.filename),
+    "Content-Transfer-Encoding: base64",
+    mimeHeaderWithFilename(
+      "Content-Disposition: attachment",
+      "filename",
+      att.filename
+    ),
+  ].map(foldHeaderLine);
+  return [...partHeaders, "", wrapBase64(att.contentBase64)];
+}
+
+/**
  * Build a raw RFC 2822 message suitable for Gmail's `raw` field.
  *
- * Body can be plain text or HTML (`isHtml`). When attachments are present the
- * message is `multipart/mixed` (body part first, then each attachment);
- * otherwise it's a single text/plain or text/html part. Handles To/Cc/Bcc,
- * RFC 2047 subject encoding, and optional reply threading headers.
+ * Body can be plain text or HTML (`isHtml`); an HTML body is sent as
+ * `multipart/alternative` (auto-derived plain text + HTML). When attachments
+ * are present the whole thing is wrapped in `multipart/mixed` (body entity
+ * first, then each attachment). Handles To/Cc/Bcc, RFC 2047 subject encoding,
+ * and optional reply threading headers.
  */
 export function buildRawMessage(opts: {
   from?: string;
@@ -750,66 +820,35 @@ export function buildRawMessage(opts: {
   // encoded subjects) to stay within RFC 5322's line-length limit.
   const foldedHeaders = headers.map(foldHeaderLine);
 
-  const bodyContentType = opts.isHtml
-    ? 'text/html; charset="UTF-8"'
-    : 'text/plain; charset="UTF-8"';
+  // Raw content blobs, collected so multipart boundaries can be chosen to never
+  // occur within the content they delimit.
+  const contents: string[] = [];
+  const bodyEntity = renderBodyEntity(opts.body, opts.isHtml, contents);
 
   const attachments = opts.attachments || [];
 
-  // Simple case: no attachments → single body part.
+  // No attachments → the body entity is the whole message body.
   if (attachments.length === 0) {
-    const lines = [
-      ...foldedHeaders,
-      `Content-Type: ${bodyContentType}`,
-      "Content-Transfer-Encoding: base64",
-      "",
-      wrapBase64(Buffer.from(opts.body, "utf-8").toString("base64")),
-    ];
-    return finalizeMessage(lines);
+    return finalizeMessage([...foldedHeaders, ...bodyEntity]);
   }
 
-  // Multipart/mixed: body part, then one part per attachment.
-  const boundary = makeBoundary("mix");
-  const parts: string[] = [];
-
-  parts.push(
-    [
-      `--${boundary}`,
-      `Content-Type: ${bodyContentType}`,
-      "Content-Transfer-Encoding: base64",
-      "",
-      wrapBase64(Buffer.from(opts.body, "utf-8").toString("base64")),
-    ].join("\r\n")
-  );
-
+  // Attachments present → wrap the body entity and each attachment in
+  // multipart/mixed.
   for (const att of attachments) {
-    const safeMime = sanitizeHeaderValue(att.mimeType);
-    // Fold each part header so a long (e.g. non-ASCII, percent-encoded) filename
-    // can't produce an over-length line, just like the top-level headers above.
-    const partHeaders = [
-      mimeHeaderWithFilename(`Content-Type: ${safeMime}`, "name", att.filename),
-      "Content-Transfer-Encoding: base64",
-      mimeHeaderWithFilename(
-        "Content-Disposition: attachment",
-        "filename",
-        att.filename
-      ),
-    ].map(foldHeaderLine);
-    parts.push(
-      [`--${boundary}`, ...partHeaders, "", wrapBase64(att.contentBase64)].join(
-        "\r\n"
-      )
-    );
+    contents.push(att.contentBase64, att.filename, att.mimeType);
   }
-
-  const lines = [
+  const boundary = uniqueBoundary("mix", contents);
+  const lines: string[] = [
     ...foldedHeaders,
     `Content-Type: multipart/mixed; boundary="${boundary}"`,
     "",
-    parts.join("\r\n"),
-    `--${boundary}--`,
-    "",
+    `--${boundary}`,
+    ...bodyEntity,
   ];
+  for (const att of attachments) {
+    lines.push(`--${boundary}`, ...renderAttachmentPart(att));
+  }
+  lines.push(`--${boundary}--`, "");
   return finalizeMessage(lines);
 }
 
@@ -826,6 +865,61 @@ export function requireField<T>(value: T | null | undefined, what: string): T {
   return value;
 }
 
+/**
+ * Extract a numeric HTTP status from the various shapes clients surface. Modern
+ * gaxios sets a numeric `error.status` (or `error.response.status`); older
+ * shapes put it on `code`. A *string* `code` (e.g. "ENOTFOUND") is a
+ * transport-level failure, not an HTTP status, so it's ignored. Returns
+ * undefined when there's no numeric HTTP status (transport or local error).
+ */
+function httpStatusOf(error: unknown): number | undefined {
+  const e = error as {
+    code?: number | string;
+    status?: number;
+    response?: { status?: number };
+  };
+  if (typeof e?.status === "number") return e.status;
+  if (typeof e?.response?.status === "number") return e.response.status;
+  if (typeof e?.code === "number") return e.code;
+  return undefined;
+}
+
+/** HTTP statuses worth retrying: rate limiting and transient server errors. */
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/**
+ * Run a Gmail API call with bounded, jittered exponential backoff on transient
+ * failures (429 + 5xx). Non-retryable errors (other 4xx, local validation, and
+ * transport errors with no HTTP status) and the final attempt throw immediately,
+ * so callers' error handling is unchanged except that a transient blip is
+ * retried instead of surfaced. Jitter avoids synchronized retries across
+ * concurrent calls.
+ */
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  opts: { retries?: number; baseDelayMs?: number } = {}
+): Promise<T> {
+  const retries = opts.retries ?? 3;
+  const baseDelayMs = opts.baseDelayMs ?? 300;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const status = httpStatusOf(error);
+      if (
+        attempt >= retries ||
+        status === undefined ||
+        !RETRYABLE_STATUSES.has(status)
+      ) {
+        throw error;
+      }
+      const delay =
+        baseDelayMs * 2 ** attempt + Math.floor(Math.random() * baseDelayMs);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
 /** Format a Gmail API error into an actionable message. */
 export function handleGmailError(error: unknown): string {
   const e = error as {
@@ -838,19 +932,8 @@ export function handleGmailError(error: unknown): string {
     };
     errors?: Array<{ message?: string }>;
   };
-  // The HTTP status, wherever the client surfaced it. Modern gaxios sets a
-  // numeric `error.status` (or `error.response.status`) for HTTP errors and
-  // leaves `error.code` for transport-level failures (a string like
-  // "ENOTFOUND"); older shapes put the numeric status on `code`. Cover all
-  // three, but only treat a *number* as an HTTP status.
-  const status =
-    typeof e?.status === "number"
-      ? e.status
-      : typeof e?.response?.status === "number"
-        ? e.response.status
-        : typeof e?.code === "number"
-          ? e.code
-          : undefined;
+  // The HTTP status, wherever the client surfaced it (see httpStatusOf).
+  const status = httpStatusOf(error);
   // Prefer Gmail's structured error detail (it lives under response.data.error
   // for a real API error); fall back to the error message.
   const detail =
