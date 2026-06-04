@@ -650,3 +650,15 @@ test("gmail_create_draft rejects a malformed recipient at the schema boundary (#
   assert.match(result.content[0].text, /Input validation error/);
   assert.equal(calls.length, 0, "no Gmail call should happen on invalid input");
 });
+
+test("gmail_create_draft accepts a dot-less (intranet) recipient domain (#note4)", async () => {
+  // "ops@localhost" has no dotted domain; it must be accepted now (Gmail makes
+  // the final delivery-time judgment).
+  const { result } = await callTool(
+    "gmail_create_draft",
+    { to: ["ops@localhost"], body: "hi", account: "alice@example.com" },
+    { "drafts.create": { data: { id: "d1", message: { id: "m1" } } } }
+  );
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.draft_id, "d1");
+});

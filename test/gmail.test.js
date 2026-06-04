@@ -984,6 +984,77 @@ test("buildRawMessage nests alternative inside mixed when an HTML body has attac
   assert.match(mime, /Content-Disposition: attachment/);
 });
 
+test("buildRawMessage uses distinct mixed and alternative boundaries (#note5)", () => {
+  const mime = decodeBase64Url(
+    buildRawMessage({
+      to: ["a@b.com"],
+      subject: "s",
+      isHtml: true,
+      body: "<p>Hi</p>",
+      attachments: [
+        { filename: "a.txt", mimeType: "text/plain", contentBase64: "QQ==" },
+      ],
+    })
+  );
+  const mix = /boundary="(=_mix_[0-9a-f]+)"/.exec(mime);
+  const alt = /boundary="(=_alt_[0-9a-f]+)"/.exec(mime);
+  assert.ok(mix && alt, "both a mixed and an alternative boundary are present");
+  assert.notEqual(mix[1], alt[1], "the two boundaries must differ");
+  // The collision guard picks the mixed boundary to avoid the alternative one,
+  // so neither is a substring of the other (a substring would let a delimiter
+  // match inside the wrong level).
+  assert.ok(
+    !alt[1].includes(mix[1]) && !mix[1].includes(alt[1]),
+    "neither boundary may contain the other"
+  );
+});
+
+// --------------------------------------------------------------------------
+// formatRecipient — display-name encoding/quoting (#note2, #note3)
+// --------------------------------------------------------------------------
+test("buildRawMessage quotes a display name containing a comma (#note3)", () => {
+  // The comma-bearing name must be quoted so it isn't read as two recipients
+  // once the list is comma-joined.
+  const mime = decodeBase64Url(
+    buildRawMessage({
+      to: ["Doe, John <john@x.com>", "a@b.com"],
+      subject: "s",
+      body: "b",
+    })
+  );
+  assert.match(mime, /^To: "Doe, John" <john@x\.com>, a@b\.com$/m);
+});
+
+test("buildRawMessage RFC 2047-encodes a non-ASCII recipient display name (#note2)", () => {
+  const mime = decodeBase64Url(
+    buildRawMessage({ to: ["Müller <m@x.com>"], subject: "s", body: "b" })
+  );
+  // Display name encoded as an encoded-word; address left intact; no raw bytes.
+  assert.match(mime, /^To: =\?UTF-8\?B\?[^?]+\?= <m@x\.com>$/m);
+  const m = /=\?UTF-8\?B\?([^?]+)\?=/.exec(mime);
+  assert.equal(Buffer.from(m[1], "base64").toString("utf-8"), "Müller");
+});
+
+test("buildRawMessage leaves a clean ASCII display name unquoted (#note3)", () => {
+  const mime = decodeBase64Url(
+    buildRawMessage({ to: ["Alice Example <alice@x.com>"], subject: "s", body: "b" })
+  );
+  assert.match(mime, /^To: Alice Example <alice@x\.com>$/m);
+});
+
+// --------------------------------------------------------------------------
+// htmlToText input bound (#note1)
+// --------------------------------------------------------------------------
+test("htmlToText bounds very large input before parsing (#note1)", () => {
+  // Content past the input cap is dropped (the cap guards against multi-MB
+  // bodies building an unbounded DOM); content before it survives. One giant
+  // text node keeps the test fast.
+  const html = "<p>VISIBLE_HEAD " + "y".repeat(2_000_000) + " HIDDEN_TAIL</p>";
+  const out = htmlToText(html);
+  assert.match(out, /VISIBLE_HEAD/);
+  assert.doesNotMatch(out, /HIDDEN_TAIL/);
+});
+
 // --------------------------------------------------------------------------
 // withRetry — transient-failure backoff (#C3)
 // --------------------------------------------------------------------------

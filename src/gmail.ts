@@ -275,6 +275,15 @@ function findPartBody(
 }
 
 /**
+ * Cap on the HTML handed to the parser. The plain text we keep is small \u2014 thread
+ * reads truncate the output to a character budget, and the send path only
+ * derives a fallback alternative part \u2014 so parsing an unbounded multi-MB body
+ * would build a huge DOM for no benefit. 1 MB is far above any realistic email's
+ * text content; a larger body is sliced (best-effort) before parsing.
+ */
+const MAX_HTML_INPUT_CHARS = 1_000_000;
+
+/**
  * Strip an HTML email body down to readable plain text using the html-to-text
  * library, which parses the markup (handling quoted attributes, comments,
  * malformed nesting, character references, and block structure) rather than
@@ -284,7 +293,13 @@ function findPartBody(
  * ASCII whitespace. Returns "" for empty/blank input.
  */
 export function htmlToText(html: string): string {
-  return htmlToTextConvert(html, {
+  // Bound the input so a pathologically large body can't build an unbounded DOM
+  // (the kept text is small either way; see MAX_HTML_INPUT_CHARS).
+  const bounded =
+    html.length > MAX_HTML_INPUT_CHARS
+      ? html.slice(0, MAX_HTML_INPUT_CHARS)
+      : html;
+  return htmlToTextConvert(bounded, {
     // Preserve the content as-is; the model, not a fixed column width, decides
     // wrapping. Skip non-visible/non-text elements so they can't leak into the
     // body, and drop hrefs/images so only readable text remains.
@@ -528,6 +543,41 @@ function sanitizeHeaderValue(value: string): string {
   return value.replace(/[\r\n]+/g, " ");
 }
 
+/** RFC 5322 "specials" (plus ".") that force a display name to be quoted. */
+const DISPLAY_NAME_SPECIALS = /[()<>[\]:;@\\,".]/;
+
+/**
+ * Render a recipient as an RFC 5322 mailbox. A bare address ("a@b.com") passes
+ * through unchanged. For a "Display Name <addr>" form the display name is:
+ *   - RFC 2047 encoded when it contains non-ASCII (so "Müller" survives the
+ *     wire instead of going out as raw bytes), or
+ *   - wrapped in a quoted-string when it contains specials such as a comma (so
+ *     "Doe, John <j@x>" isn't read as two recipients once the list is
+ *     comma-joined), escaping any " or \ inside, or
+ *   - left as-is when it's a clean ASCII phrase.
+ * CR/LF is still stripped at the header level by sanitizeHeaderValue, so a
+ * display name can't inject a header regardless of this formatting.
+ */
+function formatRecipient(recipient: string): string {
+  const trimmed = recipient.trim();
+  const m = /^(.*)<([^<>]+)>\s*$/.exec(trimmed);
+  if (!m) return trimmed; // bare address (or nothing parseable as a name-addr)
+  const name = m[1].trim();
+  const address = m[2].trim();
+  if (!name) return `<${address}>`;
+  let displayName: string;
+  if (!isAscii(name)) {
+    // RFC 2047 encoded-word — legal in a display-name phrase, and (unlike a
+    // quoted-string) the right way to carry non-ASCII here.
+    displayName = encodeHeaderWord(name);
+  } else if (DISPLAY_NAME_SPECIALS.test(name)) {
+    displayName = `"${name.replace(/(["\\])/g, "\\$1")}"`;
+  } else {
+    displayName = name;
+  }
+  return `${displayName} <${address}>`;
+}
+
 /**
  * True when a filename is safe to place verbatim inside a quoted MIME parameter
  * (`name="…"` / `filename="…"`): pure ASCII with no control characters, double
@@ -744,8 +794,11 @@ function renderBodyEntity(
     Buffer.from(htmlToText(body), "utf-8").toString("base64")
   );
   const htmlB64 = wrapBase64(Buffer.from(body, "utf-8").toString("base64"));
-  contents.push(plainB64, htmlB64);
   const altBoundary = uniqueBoundary("alt", [plainB64, htmlB64]);
+  // Record the parts AND this boundary so an enclosing multipart/mixed boundary
+  // (chosen later) is guaranteed distinct from the alternative boundary too, not
+  // just from the content.
+  contents.push(plainB64, htmlB64, altBoundary);
   return [
     `Content-Type: multipart/alternative; boundary="${altBoundary}"`,
     "",
@@ -801,14 +854,17 @@ export function buildRawMessage(opts: {
   inReplyTo?: string;
   references?: string;
 }): string {
+  // Render each recipient to an RFC 5322 mailbox (encoding/quoting display
+  // names) before comma-joining, so a name with a comma or non-ASCII survives.
+  const formatList = (xs: string[]): string => xs.map(formatRecipient).join(", ");
   const headers: string[] = [];
   if (opts.from) headers.push(`From: ${sanitizeHeaderValue(opts.from)}`);
-  headers.push(`To: ${sanitizeHeaderValue(opts.to.join(", "))}`);
-  if (opts.cc?.length) headers.push(`Cc: ${sanitizeHeaderValue(opts.cc.join(", "))}`);
+  headers.push(`To: ${sanitizeHeaderValue(formatList(opts.to))}`);
+  if (opts.cc?.length) headers.push(`Cc: ${sanitizeHeaderValue(formatList(opts.cc))}`);
   // The Bcc header is how Gmail learns the blind recipients for a raw send; it
   // strips the header before delivery, so it is not leaked to To/Cc. Keep it.
   if (opts.bcc?.length)
-    headers.push(`Bcc: ${sanitizeHeaderValue(opts.bcc.join(", "))}`);
+    headers.push(`Bcc: ${sanitizeHeaderValue(formatList(opts.bcc))}`);
   headers.push(`Subject: ${encodeHeaderWord(sanitizeHeaderValue(opts.subject))}`);
   if (opts.inReplyTo)
     headers.push(`In-Reply-To: ${sanitizeHeaderValue(opts.inReplyTo)}`);

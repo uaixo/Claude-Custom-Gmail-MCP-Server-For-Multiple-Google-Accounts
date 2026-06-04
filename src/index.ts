@@ -110,11 +110,13 @@ const accountField = z
 /**
  * A recipient: either a bare email address ("alice@x.com") or an RFC 5322
  * name-addr with a display name ("Alice Example <alice@x.com>"). The email part
- * (inside the angle brackets when present) must look like an address; CR/LF in
- * the value is stripped downstream in buildRawMessage, so a display name can't
- * inject headers.
+ * (inside the angle brackets when present) must look like an address — a
+ * non-empty local part and a non-empty, whitespace-free domain. The domain need
+ * not be dotted, so intranet addresses like "ops@localhost" are accepted; Gmail
+ * makes the final delivery-time judgment. CR/LF in the value is stripped
+ * downstream in buildRawMessage, so a display name can't inject headers.
  */
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
 function isRecipient(value: string): boolean {
   const trimmed = value.trim();
   const named = /<([^<>]+)>\s*$/.exec(trimmed);
