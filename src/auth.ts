@@ -120,6 +120,13 @@ export function credentialsRefFor(file: string): string {
 let warnedCorruptTokenStore = false;
 
 /**
+ * Whether we've already warned this process about proceeding without the
+ * token-store lock. Re-armed on a successful acquisition, so a fresh contention
+ * episode is reported again rather than staying silent after the first time.
+ */
+let warnedLockContention = false;
+
+/**
  * Load the token store, migrating any legacy entries (raw Credentials written
  * before per-account credential files) to the current shape, defaulting their
  * credential file to the basename of the default credentials path.
@@ -212,14 +219,21 @@ function sleep(ms: number): Promise<void> {
  * a load-modify-write here isn't clobbered by a concurrent writer (e.g. the
  * server refreshing a token while add-account connects another account, which
  * would otherwise lose one account's update). The lock is advisory: if it can't
- * be acquired within a short window we proceed anyway, so behavior never
- * regresses below the previous unlocked baseline. Waiting is async so the event
- * loop is never blocked. `fn` itself is synchronous (load/mutate/save).
+ * be acquired within the window we proceed anyway, so behavior never regresses
+ * below the previous unlocked baseline — but that case is now surfaced once on
+ * stderr instead of silently risking a lost update. Waiting is async so the
+ * event loop is never blocked. `fn` itself is synchronous (load/mutate/save).
  */
 /** A token-store lock older than this is treated as stale (a crashed holder). */
 const LOCK_STALE_MS = 10_000;
-/** How long to try to acquire the lock before proceeding unlocked (advisory). */
-const LOCK_ACQUIRE_TIMEOUT_MS = 2_000;
+/**
+ * How long to try to acquire the lock before proceeding unlocked (advisory).
+ * Deliberately longer than LOCK_STALE_MS: a crashed holder's lock is always
+ * waited out and stolen at the stale threshold rather than tripping the unlocked
+ * fallback, so that fallback is only reached under sustained *live* contention
+ * (realistically never, given at most the server plus one add-account process).
+ */
+const LOCK_ACQUIRE_TIMEOUT_MS = 12_000;
 
 async function withTokenLock<T>(fn: () => T): Promise<T> {
   ensureDataDir();
@@ -246,8 +260,25 @@ async function withTokenLock<T>(fn: () => T): Promise<T> {
       } catch {
         continue; // lock vanished between stat and remove → retry immediately
       }
-      await sleep(25);
+      // Jittered backoff so the server and a concurrent add-account don't retry
+      // in lock-step and keep colliding on the same slot.
+      await sleep(25 + Math.floor(Math.random() * 25));
     }
+  }
+  if (held) {
+    warnedLockContention = false; // re-arm for a future contention episode
+  } else if (!warnedLockContention) {
+    // We're about to load-modify-write without the lock. This is the advisory
+    // fallback (never worse than the old unlocked baseline), but a concurrent
+    // writer could still clobber this update — surface it once instead of
+    // losing it silently.
+    warnedLockContention = true;
+    console.error(
+      `Warning: could not acquire the token-store lock at ${lockPath} within ` +
+        `${LOCK_ACQUIRE_TIMEOUT_MS} ms; proceeding without it. A simultaneous ` +
+        `account change could be lost; re-run \`npm run add-account\` if an ` +
+        `account goes missing.`
+    );
   }
   try {
     return fn();

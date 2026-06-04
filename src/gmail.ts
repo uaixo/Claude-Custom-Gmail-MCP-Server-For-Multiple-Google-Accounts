@@ -342,7 +342,13 @@ export function htmlToText(html: string): string {
       .replace(/<script\b[\s\S]*?(?:<\/script>|$)/gi, "")
       .replace(/<br\s*\/?>/gi, "\n")
       .replace(/<\/(p|div|h[1-6]|li|tr|table|blockquote)>/gi, "\n")
-      .replace(/<[^>]+>/g, "")
+      // Strip only genuine markup: a '<' that opens a start tag (letter), end
+      // tag ('/'), declaration ('!', e.g. <!DOCTYPE>), or processing
+      // instruction ('?'). A '<' followed by anything else — a space or digit,
+      // as in "3 < 5 and 5 > 3" — is literal body text and is left intact,
+      // where the old catch-all /<[^>]+>/ would have eaten "< 5 and 5 >" as a
+      // bogus tag. A lone '>' has no matching opener and likewise survives.
+      .replace(/<[/!?a-zA-Z][^>]*>/g, "")
   )
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")

@@ -218,67 +218,77 @@ async function addAccount(): Promise<void> {
   // Bind to loopback first so we know the actual port, then build the redirect
   // URI and auth URL to match it.
   const port = await listenWithFallback(serverHttp, OAUTH_REDIRECT_PORT);
-  const oAuth2Client = newOAuthClient(credFile, oauthRedirectUri(port));
-  // PKCE (RFC 7636): bind the auth code to this process, so an intercepted code
-  // can't be exchanged for tokens without the matching verifier.
-  const { codeVerifier, codeChallenge } =
-    await oAuth2Client.generateCodeVerifierAsync();
-  const authUrl = oAuth2Client.generateAuthUrl({
-    access_type: "offline", // request a refresh token
-    prompt: "consent", // force refresh-token issuance on re-consent
-    scope: SCOPES,
-    state,
-    code_challenge_method: CodeChallengeMethod.S256,
-    code_challenge: codeChallenge,
-  });
-
-  if (port !== OAUTH_REDIRECT_PORT) {
-    console.log(`Port ${OAUTH_REDIRECT_PORT} was busy; listening on ${port}.`);
-  }
-  console.log("Opening browser for Google consent...");
-  console.log(`If it doesn't open, visit:\n${authUrl}\n`);
-  // Fire-and-forget: on a box with no browser/handler, open() rejects. The URL
-  // is already printed above, so swallow the rejection rather than letting it
-  // surface as an unhandledRejection and abort the consent flow.
-  open(authUrl).catch(() => {});
-
-  // Wait for Google to redirect back to our loopback server with the code, but
-  // don't hang forever if the user abandons consent.
-  const timeout = setTimeout(() => {
-    serverHttp.close();
-    rejectCode(
-      new Error(
-        `Timed out after ${
-          CONSENT_TIMEOUT_MS / 60000
-        } minutes waiting for Google consent. Re-run and complete sign-in in the browser.`
-      )
-    );
-  }, CONSENT_TIMEOUT_MS);
-  let code: string;
+  // The server is now listening. The callback handler and the consent timeout
+  // close it on their own paths, but wrap the rest so an exception thrown after
+  // binding (building the client, generating the auth URL, the token exchange)
+  // can't leave the loopback listener open.
   try {
-    code = await codePromise;
+    const oAuth2Client = newOAuthClient(credFile, oauthRedirectUri(port));
+    // PKCE (RFC 7636): bind the auth code to this process, so an intercepted code
+    // can't be exchanged for tokens without the matching verifier.
+    const { codeVerifier, codeChallenge } =
+      await oAuth2Client.generateCodeVerifierAsync();
+    const authUrl = oAuth2Client.generateAuthUrl({
+      access_type: "offline", // request a refresh token
+      prompt: "consent", // force refresh-token issuance on re-consent
+      scope: SCOPES,
+      state,
+      code_challenge_method: CodeChallengeMethod.S256,
+      code_challenge: codeChallenge,
+    });
+
+    if (port !== OAUTH_REDIRECT_PORT) {
+      console.log(`Port ${OAUTH_REDIRECT_PORT} was busy; listening on ${port}.`);
+    }
+    console.log("Opening browser for Google consent...");
+    console.log(`If it doesn't open, visit:\n${authUrl}\n`);
+    // Fire-and-forget: on a box with no browser/handler, open() rejects. The URL
+    // is already printed above, so swallow the rejection rather than letting it
+    // surface as an unhandledRejection and abort the consent flow.
+    open(authUrl).catch(() => {});
+
+    // Wait for Google to redirect back to our loopback server with the code, but
+    // don't hang forever if the user abandons consent.
+    const timeout = setTimeout(() => {
+      serverHttp.close();
+      rejectCode(
+        new Error(
+          `Timed out after ${
+            CONSENT_TIMEOUT_MS / 60000
+          } minutes waiting for Google consent. Re-run and complete sign-in in the browser.`
+        )
+      );
+    }, CONSENT_TIMEOUT_MS);
+    let code: string;
+    try {
+      code = await codePromise;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const { tokens } = await oAuth2Client.getToken({ code, codeVerifier });
+    oAuth2Client.setCredentials(tokens);
+
+    // Identify which account just authorized.
+    const oauth2 = google.oauth2({ version: "v2", auth: oAuth2Client });
+    const me = await oauth2.userinfo.get();
+    const email = (me.data.email || "").toLowerCase();
+    if (!email) throw new Error("Could not determine the account email.");
+
+    // Preserve an existing refresh token if Google didn't return a new one.
+    const existing = loadTokens()[email];
+    if (existing?.tokens.refresh_token && !tokens.refresh_token) {
+      tokens.refresh_token = existing.tokens.refresh_token;
+    }
+
+    await saveAccount(email, tokens, credentialsRefFor(credFile));
+    console.log(`\nConnected: ${email}  [${credentialsRefFor(credFile)}]`);
+    printAccounts();
   } finally {
-    clearTimeout(timeout);
+    // Safety net for the early-throw paths; on the normal paths the handler or
+    // timeout already closed it, so guard on `listening` to avoid a double close.
+    if (serverHttp.listening) serverHttp.close();
   }
-
-  const { tokens } = await oAuth2Client.getToken({ code, codeVerifier });
-  oAuth2Client.setCredentials(tokens);
-
-  // Identify which account just authorized.
-  const oauth2 = google.oauth2({ version: "v2", auth: oAuth2Client });
-  const me = await oauth2.userinfo.get();
-  const email = (me.data.email || "").toLowerCase();
-  if (!email) throw new Error("Could not determine the account email.");
-
-  // Preserve an existing refresh token if Google didn't return a new one.
-  const existing = loadTokens()[email];
-  if (existing?.tokens.refresh_token && !tokens.refresh_token) {
-    tokens.refresh_token = existing.tokens.refresh_token;
-  }
-
-  await saveAccount(email, tokens, credentialsRefFor(credFile));
-  console.log(`\nConnected: ${email}  [${credentialsRefFor(credFile)}]`);
-  printAccounts();
 }
 
 async function main(): Promise<void> {

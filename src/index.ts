@@ -31,43 +31,63 @@ import {
   summarizeThread,
 } from "./gmail.js";
 import {
-  CHARACTER_LIMIT,
   isMainModule,
+  MAX_THREAD_BODY_CHARS,
   MAX_THREAD_MESSAGES,
   packageVersion,
   THREAD_FETCH_CONCURRENCY,
 } from "./constants.js";
 
 /**
- * Shared attachment schema. Each attachment provides exactly one of `path`
- * (read from local disk by the server) or `content_base64` (inline). For
- * `path`, filename and mime_type are inferred if omitted; for `content_base64`,
- * filename is required.
+ * Shared attachment schema, modeled as a union of two mutually exclusive forms
+ * so the "exactly one of `path` / `content_base64`" rule is expressed in the
+ * advertised JSON schema (an `anyOf`) and enforced at the validation boundary,
+ * not only at runtime in resolveAttachments. The `path` form infers filename
+ * and mime_type when omitted; the `content_base64` form requires filename. Each
+ * member is `.strict()`, so supplying both fields (or neither) fails to match
+ * either branch and is rejected.
  */
 const attachmentSchema = z
-  .object({
-    filename: z
-      .string()
-      .optional()
-      .describe(
-        "Display filename. Defaults to the basename for 'path'; required for 'content_base64'."
-      ),
-    path: z
-      .string()
-      .optional()
-      .describe(
-        "Path to a local file on the machine running the server. Disabled unless the server sets GMAIL_MCP_ATTACHMENTS_DIR; the file must resolve to within an allowed directory. Otherwise use content_base64."
-      ),
-    content_base64: z
-      .string()
-      .optional()
-      .describe("Inline file content, standard base64-encoded."),
-    mime_type: z
-      .string()
-      .optional()
-      .describe("MIME type. Inferred from the filename extension if omitted."),
-  })
-  .strict();
+  .union([
+    z
+      .object({
+        path: z
+          .string()
+          .describe(
+            "Path to a local file on the machine running the server. Disabled unless the server sets GMAIL_MCP_ATTACHMENTS_DIR; the file must resolve to within an allowed directory. Otherwise use content_base64."
+          ),
+        filename: z
+          .string()
+          .optional()
+          .describe("Display filename. Defaults to the file's basename."),
+        mime_type: z
+          .string()
+          .optional()
+          .describe(
+            "MIME type. Inferred from the filename extension if omitted."
+          ),
+      })
+      .strict(),
+    z
+      .object({
+        content_base64: z
+          .string()
+          .describe("Inline file content, standard base64-encoded."),
+        filename: z
+          .string()
+          .describe("Display filename. Required for inline content_base64."),
+        mime_type: z
+          .string()
+          .optional()
+          .describe(
+            "MIME type. Inferred from the filename extension if omitted."
+          ),
+      })
+      .strict(),
+  ])
+  .describe(
+    "A file to attach. Supply exactly one of 'path' (the server reads a local file) or 'content_base64' (inline base64)."
+  );
 
 // Exported so tests can connect an in-memory client and introspect the
 // registered tools (e.g. assert tool annotations).
@@ -246,7 +266,7 @@ For very large threads the result may be truncated: "truncated": true is set, an
       const kept = rawMessages.slice(0, MAX_THREAD_MESSAGES);
       const { messages: capped, truncated: bodyTruncated } = capMessageBodies(
         kept,
-        CHARACTER_LIMIT,
+        MAX_THREAD_BODY_CHARS,
         (m) => extractPlainText(m.payload)
       );
       const messages = capped.map((m) => ({
@@ -543,8 +563,15 @@ Returns: JSON { "account": string, "labels": [ { "id": string, "name": string, "
         type: l.type || "user",
       }));
       const output = { account: acct, labels };
+      // Route through renderJsonText (like the other read tools) so an account
+      // with very many labels can't emit text past the character budget; the
+      // full list is always available in structuredContent.
+      const text = renderJsonText(
+        output,
+        "Read the full label list from structuredContent."
+      );
       return {
-        content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
+        content: [{ type: "text", text }],
         structuredContent: output,
       };
     } catch (error) {
