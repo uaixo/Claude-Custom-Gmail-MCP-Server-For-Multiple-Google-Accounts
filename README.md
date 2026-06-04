@@ -187,7 +187,9 @@ Restart Claude Desktop. Ask it to "list my connected Gmail accounts" to confirm.
 ## Notes
 
 - **Scopes (minimal):** `gmail.modify` (read + labels + drafts), `gmail.send` (send), `userinfo.email` (to identify the account). `gmail.compose` is intentionally not requested — its abilities are already covered by the other two. Drop `gmail.send` from `src/constants.ts` and re-consent if you want a send-disabled, draft-only setup.
-- **Body format:** send/draft take a single `body` plus an `is_html` flag (plain text by default). When `is_html` is true the message is `text/html`; there is no simultaneous plain-text + HTML alternative part.
+- **Body format:** send/draft take a single `body` plus an `is_html` flag (plain text by default). When `is_html` is true the message is sent as `multipart/alternative` — the HTML plus an auto-derived plain-text part (via `html-to-text`) so clients that don't render HTML still get readable text.
+- **Recipients:** `to`/`cc`/`bcc` accept either a bare address (`alice@x.com`) or a display-name form (`Alice Example <alice@x.com>`).
+- **Transient errors:** Gmail calls are retried automatically with bounded, jittered backoff on rate limits (429) and transient server errors (5xx); other failures surface immediately.
 - **Attachments:** supplied per call via local `path` or inline `content_base64`. Reading by `path` is disabled unless `GMAIL_MCP_ATTACHMENTS_DIR` allowlists the directory it lives in (a guardrail against emailing arbitrary local files); inline base64 is impractical for large binaries the model can't see, so set the allowlist and use `path` for those. Gmail's total message size limit (~25 MB) applies.
 - **Local-only:** this runs over stdio on your machine; tokens never leave it. To expose it as a *remote* custom connector instead, swap the stdio transport for the streamable-HTTP transport, host it on the public internet over HTTPS, and add it in Claude under Settings → Connectors → Add custom connector.
 - **Token expiry:** access tokens refresh automatically. If a refresh token is revoked (password change, manual revocation, or long inactivity on an unverified app), re-run `npm run add-account` for that account. A running server detects the rewritten credentials and picks them up on its next call — no restart needed.
@@ -200,6 +202,7 @@ Restart Claude Desktop. Ask it to "list my connected Gmail accounts" to confirm.
 | `GMAIL_MCP_DATA_DIR` | `~/.gmail-mcp` | Where tokens and `credentials*.json` files live |
 | `GMAIL_OAUTH_CREDENTIALS` | (unset) | Force a single OAuth client JSON path; disables `credentials*.json` auto-discovery |
 | `GMAIL_MCP_ATTACHMENTS_DIR` | (unset) | Allowlist of directories (separated by the platform path delimiter) that `path` attachments may be read from. Unset means `path` is disabled and only `content_base64` works |
+| `GMAIL_MCP_LOCK_TIMEOUT_MS` | `12000` | How long to wait for the token-store lock before failing a write rather than risking a lost update |
 
 ## Architecture
 

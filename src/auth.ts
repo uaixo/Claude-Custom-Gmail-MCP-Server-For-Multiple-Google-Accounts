@@ -120,13 +120,6 @@ export function credentialsRefFor(file: string): string {
 let warnedCorruptTokenStore = false;
 
 /**
- * Whether we've already warned this process about proceeding without the
- * token-store lock. Re-armed on a successful acquisition, so a fresh contention
- * episode is reported again rather than staying silent after the first time.
- */
-let warnedLockContention = false;
-
-/**
  * Load the token store, migrating any legacy entries (raw Credentials written
  * before per-account credential files) to the current shape, defaulting their
  * credential file to the basename of the default credentials path.
@@ -218,28 +211,38 @@ function sleep(ms: number): Promise<void> {
  * Run `fn` while holding a best-effort cross-process lock on the token store, so
  * a load-modify-write here isn't clobbered by a concurrent writer (e.g. the
  * server refreshing a token while add-account connects another account, which
- * would otherwise lose one account's update). The lock is advisory: if it can't
- * be acquired within the window we proceed anyway, so behavior never regresses
- * below the previous unlocked baseline — but that case is now surfaced once on
- * stderr instead of silently risking a lost update. Waiting is async so the
+ * would otherwise lose one account's update). If the lock can't be acquired
+ * within the window we throw rather than write unlocked, so a contended update
+ * fails loudly instead of silently risking a lost update. (The server's
+ * best-effort token-refresh persistence swallows that rejection; account
+ * mutations surface it to the user, who can retry.) Waiting is async so the
  * event loop is never blocked. `fn` itself is synchronous (load/mutate/save).
  */
 /** A token-store lock older than this is treated as stale (a crashed holder). */
 const LOCK_STALE_MS = 10_000;
 /**
- * How long to try to acquire the lock before proceeding unlocked (advisory).
- * Deliberately longer than LOCK_STALE_MS: a crashed holder's lock is always
- * waited out and stolen at the stale threshold rather than tripping the unlocked
- * fallback, so that fallback is only reached under sustained *live* contention
- * (realistically never, given at most the server plus one add-account process).
+ * How long to try to acquire the lock before giving up and throwing. Override
+ * with GMAIL_MCP_LOCK_TIMEOUT_MS (milliseconds). Deliberately longer than
+ * LOCK_STALE_MS by default: a crashed holder's lock is always waited out and
+ * stolen at the stale threshold rather than causing a spurious failure, so we
+ * only throw under sustained *live* contention (realistically never, given at
+ * most the server plus one add-account process).
  */
 const LOCK_ACQUIRE_TIMEOUT_MS = 12_000;
+
+function lockAcquireTimeoutMs(): number {
+  const override = Number(process.env.GMAIL_MCP_LOCK_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0
+    ? override
+    : LOCK_ACQUIRE_TIMEOUT_MS;
+}
 
 async function withTokenLock<T>(fn: () => T): Promise<T> {
   ensureDataDir();
   const lockPath = `${tokensPath()}.lock`;
+  const timeoutMs = lockAcquireTimeoutMs();
   let held = false;
-  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       // Atomic exclusive create; record the holder PID so a stuck lock is
@@ -248,7 +251,9 @@ async function withTokenLock<T>(fn: () => T): Promise<T> {
       held = true;
       break;
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") break; // unexpected → proceed unlocked
+      // A non-EEXIST error is a real filesystem failure (permissions, etc.);
+      // surface it rather than masking it as lock contention.
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
       try {
         // Steal a lock left behind by a crashed holder. Operations under the
         // lock are sub-millisecond, so a lock older than LOCK_STALE_MS is
@@ -265,31 +270,22 @@ async function withTokenLock<T>(fn: () => T): Promise<T> {
       await sleep(25 + Math.floor(Math.random() * 25));
     }
   }
-  if (held) {
-    warnedLockContention = false; // re-arm for a future contention episode
-  } else if (!warnedLockContention) {
-    // We're about to load-modify-write without the lock. This is the advisory
-    // fallback (never worse than the old unlocked baseline), but a concurrent
-    // writer could still clobber this update — surface it once instead of
-    // losing it silently.
-    warnedLockContention = true;
-    console.error(
-      `Warning: could not acquire the token-store lock at ${lockPath} within ` +
-        `${LOCK_ACQUIRE_TIMEOUT_MS} ms; proceeding without it. A simultaneous ` +
-        `account change could be lost; re-run \`npm run add-account\` if an ` +
-        `account goes missing.`
+  if (!held) {
+    // Couldn't acquire within the window. Fail rather than write unlocked, so a
+    // concurrent update is never silently clobbered.
+    throw new Error(
+      `Could not acquire the token-store lock at ${lockPath} within ${timeoutMs} ms. ` +
+        `Another process may be updating it; please retry.`
     );
   }
   try {
     return fn();
   } finally {
-    if (held) {
-      // force:true → no throw if the lock was already removed (e.g. stolen).
-      try {
-        fs.rmSync(lockPath, { force: true });
-      } catch {
-        /* ignore */
-      }
+    // force:true → no throw if the lock was already removed (e.g. stolen).
+    try {
+      fs.rmSync(lockPath, { force: true });
+    } catch {
+      /* ignore */
     }
   }
 }
@@ -429,16 +425,18 @@ export function getAuthedClient(account: string, store?: TokenStore): OAuth2Clie
   // so a concurrent writer's update isn't lost. Fire-and-forget: the library
   // doesn't await listeners, and persistence is best-effort.
   client.on("tokens", (fresh) => {
-    // If the library rotated the refresh token, keep this cache entry's
-    // freshness signature in step with what we're about to persist. Otherwise
-    // the next getAuthedClient() would read the new token off disk, see it
-    // differ from the cached signature, and mistake our own rotation for an
-    // out-of-process re-consent — rebuilding a perfectly good client. Guard on
-    // identity so a newer client that has since replaced us isn't clobbered.
-    if (fresh.refresh_token) {
-      const cached = authedClients.get(key);
-      if (cached?.client === client) cached.refreshToken = fresh.refresh_token;
-    }
+    // Only the client that is still the cached one for this account may persist.
+    // If this client has been superseded (an out-of-process re-consent rebuilt
+    // it) or evicted (removeAccount), a late token refresh from it must not
+    // resurrect a removed account or clobber the replacement — so bail out.
+    const cached = authedClients.get(key);
+    if (cached?.client !== client) return;
+    // Keep this cache entry's freshness signature in step with a rotated refresh
+    // token we're about to persist; otherwise the next getAuthedClient() would
+    // read the new token off disk, see it differ from the cached signature, and
+    // mistake our own rotation for an out-of-process re-consent — needlessly
+    // rebuilding a perfectly good client.
+    if (fresh.refresh_token) cached.refreshToken = fresh.refresh_token;
     void updateTokens((store) => {
       const cur = store[key];
       if (cur) cur.tokens = { ...cur.tokens, ...fresh };

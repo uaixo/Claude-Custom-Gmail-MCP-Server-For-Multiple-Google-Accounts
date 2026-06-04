@@ -19,6 +19,7 @@ import {
   deriveReplySubject,
   requireField,
   renderJsonText,
+  withRetry,
 } from "../dist/gmail.js";
 import { packageVersion } from "../dist/constants.js";
 
@@ -910,4 +911,130 @@ test("deriveReplySubject prefers an explicit subject, else derives from the thre
   assert.equal(deriveReplySubject(undefined, "RE: shouting"), "RE: shouting");
   assert.equal(deriveReplySubject(undefined, "   "), "");
   assert.equal(deriveReplySubject(undefined, undefined), "");
+});
+
+// --------------------------------------------------------------------------
+// buildRawMessage: crypto boundary (#A1), hard-break (#A3), alternative (#C2)
+// --------------------------------------------------------------------------
+test("buildRawMessage uses an unguessable, per-message multipart boundary (#A1)", () => {
+  const attachments = [
+    { filename: "a.bin", mimeType: "application/octet-stream", contentBase64: "QQ==" },
+  ];
+  const grab = () => {
+    const mime = decodeBase64Url(
+      buildRawMessage({ to: ["a@b.com"], subject: "s", body: "b", attachments })
+    );
+    const m = /boundary="(=_mix_[0-9a-f]{36})"/.exec(mime);
+    assert.ok(m, "boundary is a random hex token, not time/Math.random based");
+    return m[1];
+  };
+  // Two builds must not reuse a boundary (proves it's CSPRNG, not Date.now()).
+  assert.notEqual(grab(), grab());
+});
+
+test("buildRawMessage hard-breaks a single >998-octet header token to satisfy the hard limit (#A3)", () => {
+  // One enormous message-id with no internal space: space-folding can't break
+  // it, so it must be hard-broken so no physical line exceeds 998 octets.
+  const giant = "<" + "a".repeat(3000) + "@example.com>";
+  const mime = decodeBase64Url(
+    buildRawMessage({ to: ["a@b.com"], subject: "s", body: "b", references: giant })
+  );
+  for (const line of mime.split("\r\n")) {
+    assert.ok(
+      Buffer.byteLength(line, "utf-8") <= 998,
+      `line exceeds 998 octets (${Buffer.byteLength(line, "utf-8")})`
+    );
+  }
+});
+
+test("buildRawMessage sends HTML as multipart/alternative with a derived plain part (#C2)", () => {
+  const html = "<p>Hello <b>world</b></p>";
+  const mime = decodeBase64Url(
+    buildRawMessage({ to: ["a@b.com"], subject: "s", isHtml: true, body: html })
+  );
+  assert.match(mime, /Content-Type: multipart\/alternative/);
+  assert.match(mime, /Content-Type: text\/plain; charset="UTF-8"/);
+  assert.match(mime, /Content-Type: text\/html; charset="UTF-8"/);
+  // The plain alternative is derived from the HTML (htmlToText => "Hello world").
+  assert.ok(
+    mime.includes(Buffer.from("Hello world", "utf-8").toString("base64")),
+    "derived text/plain alternative present"
+  );
+  // The original HTML is retained as the text/html part.
+  assert.ok(
+    mime.includes(Buffer.from(html, "utf-8").toString("base64")),
+    "text/html part present"
+  );
+});
+
+test("buildRawMessage nests alternative inside mixed when an HTML body has attachments (#C2)", () => {
+  const mime = decodeBase64Url(
+    buildRawMessage({
+      to: ["a@b.com"],
+      subject: "s",
+      isHtml: true,
+      body: "<p>Hi</p>",
+      attachments: [
+        { filename: "a.txt", mimeType: "text/plain", contentBase64: "QQ==" },
+      ],
+    })
+  );
+  assert.match(mime, /Content-Type: multipart\/mixed/);
+  assert.match(mime, /Content-Type: multipart\/alternative/);
+  assert.match(mime, /Content-Disposition: attachment/);
+});
+
+// --------------------------------------------------------------------------
+// withRetry — transient-failure backoff (#C3)
+// --------------------------------------------------------------------------
+test("withRetry retries a transient 5xx then succeeds (#C3)", async () => {
+  let calls = 0;
+  const out = await withRetry(
+    async () => {
+      calls++;
+      if (calls < 3) {
+        const e = new Error("transient");
+        e.code = 503;
+        throw e;
+      }
+      return "ok";
+    },
+    { retries: 5, baseDelayMs: 1 }
+  );
+  assert.equal(out, "ok");
+  assert.equal(calls, 3);
+});
+
+test("withRetry does not retry a non-retryable status (#C3)", async () => {
+  let calls = 0;
+  await assert.rejects(
+    withRetry(
+      async () => {
+        calls++;
+        const e = new Error("nope");
+        e.code = 404;
+        throw e;
+      },
+      { retries: 5, baseDelayMs: 1 }
+    ),
+    /nope/
+  );
+  assert.equal(calls, 1); // tried once, no retries
+});
+
+test("withRetry gives up after the retry budget and rethrows (#C3)", async () => {
+  let calls = 0;
+  await assert.rejects(
+    withRetry(
+      async () => {
+        calls++;
+        const e = new Error("rate");
+        e.status = 429;
+        throw e;
+      },
+      { retries: 2, baseDelayMs: 1 }
+    ),
+    /rate/
+  );
+  assert.equal(calls, 3); // initial attempt + 2 retries
 });

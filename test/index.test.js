@@ -557,3 +557,73 @@ test("gmail_create_draft accepts a valid inline attachment (#4)", async () => {
   assert.ok(dc.params.requestBody.message.raw, "draft carries a raw message");
   assert.equal(result.structuredContent.draft_id, "d1");
 });
+
+// --------------------------------------------------------------------------
+// gmail_get_thread compact summary fallback (#B2)
+// --------------------------------------------------------------------------
+test("gmail_get_thread falls back to a compact summary when the full JSON is over budget (#B2)", async () => {
+  // Many messages with large bodies: the full JSON exceeds CHARACTER_LIMIT, so
+  // the text channel returns a useful per-message summary (not the bare notice),
+  // while structuredContent still carries every message.
+  const messages = Array.from({ length: 60 }, (_, i) => ({
+    id: `m${i}`,
+    labelIds: ["INBOX"],
+    payload: {
+      mimeType: "text/plain",
+      headers: [
+        { name: "Subject", value: `Subject number ${i}` },
+        { name: "From", value: `sender${i}@example.com` },
+      ],
+      body: { data: utf8("x".repeat(800)).toString("base64url") },
+    },
+  }));
+  const { result } = await callTool(
+    "gmail_get_thread",
+    { thread_id: "t1", account: "alice@example.com" },
+    { "threads.get": { data: { messages } } }
+  );
+  assert.equal(result.isError, undefined);
+  const text = result.content[0].text;
+  assert.ok(text.length <= 25000, "summary stays within the character budget");
+  assert.match(text, /Per-message summary/);
+  assert.match(text, /structuredContent/);
+  assert.match(text, /\[m0\] sender0@example\.com — Subject number 0/);
+  assert.throws(() => JSON.parse(text), "the summary is not raw JSON");
+  assert.equal(result.structuredContent.messages.length, 60);
+});
+
+// --------------------------------------------------------------------------
+// Display-name recipients (#C1)
+// --------------------------------------------------------------------------
+test("gmail_create_draft accepts a display-name recipient and emits it verbatim (#C1)", async () => {
+  let raw = null;
+  const { result } = await callTool(
+    "gmail_create_draft",
+    {
+      to: ["Alice Example <alice@x.com>"],
+      cc: ["bob@x.com"],
+      body: "hi",
+      account: "alice@example.com",
+    },
+    {
+      "drafts.create": (p) => {
+        raw = p.requestBody.message.raw;
+        return { data: { id: "d1", message: { id: "m1" } } };
+      },
+    }
+  );
+  assert.equal(result.isError, undefined);
+  const mime = Buffer.from(raw, "base64url").toString("utf-8");
+  assert.match(mime, /^To: Alice Example <alice@x\.com>$/m);
+});
+
+test("gmail_create_draft rejects a malformed recipient at the schema boundary (#C1)", async () => {
+  const { result, calls } = await callTool("gmail_create_draft", {
+    to: ["not-an-email"],
+    body: "hi",
+    account: "alice@example.com",
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Input validation error/);
+  assert.equal(calls.length, 0, "no Gmail call should happen on invalid input");
+});
