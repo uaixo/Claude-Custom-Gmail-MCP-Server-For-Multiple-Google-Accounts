@@ -86,6 +86,23 @@ test("cleanupStaleTokenTemps removes only stale temp files (#6)", () => {
   fs.rmSync(fresh, { force: true });
 });
 
+test("cleanupStaleTokenTemps removes an abandoned lock but keeps a fresh one (#3)", () => {
+  const lock = path.join(dataDir, "tokens.json.lock");
+
+  // A lock left by a crashed holder long ago must be swept.
+  fs.writeFileSync(lock, "999999");
+  const old = Date.now() / 1000 - 3600;
+  fs.utimesSync(lock, old, old);
+  auth.cleanupStaleTokenTemps();
+  assert.ok(!fs.existsSync(lock), "abandoned lock should be removed");
+
+  // A fresh lock (a live holder mid-write) must be left untouched.
+  fs.writeFileSync(lock, `${process.pid}`);
+  auth.cleanupStaleTokenTemps();
+  assert.ok(fs.existsSync(lock), "a fresh lock must not be swept");
+  fs.rmSync(lock, { force: true });
+});
+
 test("token store mutations steal a stale lock and release it (#7)", async () => {
   const lock = path.join(dataDir, "tokens.json.lock");
   fs.writeFileSync(lock, "999999");

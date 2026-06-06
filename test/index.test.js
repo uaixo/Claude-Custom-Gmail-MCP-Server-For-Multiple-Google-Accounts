@@ -219,7 +219,7 @@ test("gmail_get_thread maps headers/body/labels for each message", async () => {
   assert.equal(result.structuredContent.truncated, undefined);
 });
 
-test("gmail_get_thread caps the message count and reports how many were omitted", async () => {
+test("gmail_get_thread caps the message count, keeping the newest and reporting how many older were omitted", async () => {
   const messages = Array.from({ length: 105 }, (_, i) => ({
     id: `m${i}`,
     labelIds: ["INBOX"],
@@ -239,8 +239,11 @@ test("gmail_get_thread caps the message count and reports how many were omitted"
   assert.equal(sc.messages.length, 100); // MAX_THREAD_MESSAGES
   assert.equal(sc.omitted_message_count, 5);
   assert.equal(sc.truncated, true);
-  assert.equal(sc.messages[0].message_id, "m0");
-  assert.equal(sc.messages[0].body, "body 0");
+  // The 5 OLDEST (m0–m4) are dropped; the newest 100 (m5–m104) are kept, in
+  // order, so the most recent messages survive the cap.
+  assert.equal(sc.messages[0].message_id, "m5");
+  assert.equal(sc.messages[0].body, "body 5");
+  assert.equal(sc.messages[99].message_id, "m104");
 });
 
 // --------------------------------------------------------------------------

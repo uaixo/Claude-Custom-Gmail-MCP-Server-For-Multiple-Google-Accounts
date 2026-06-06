@@ -204,6 +204,16 @@ Restart Claude Desktop. Ask it to "list my connected Gmail accounts" to confirm.
 | `GMAIL_MCP_ATTACHMENTS_DIR` | (unset) | Allowlist of directories (separated by the platform path delimiter) that `path` attachments may be read from. Unset means `path` is disabled and only `content_base64` works |
 | `GMAIL_MCP_LOCK_TIMEOUT_MS` | `12000` | How long to wait for the token-store lock before failing a write rather than risking a lost update |
 
+## Development
+
+```bash
+npm run build   # compile src/ -> dist/
+npm run lint    # eslint
+npm test        # build, then run the test suite
+```
+
+The tests import the compiled output from `dist/`, so run them with **`npm test`** — its `pretest` hook builds first. Running bare `node --test` skips that build and will execute stale (or missing) compiled code; only use it when `dist/` is already up to date.
+
 ## Architecture
 
 How the pieces fit together, for anyone reading or extending the code. The server is five TypeScript modules:

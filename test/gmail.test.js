@@ -19,6 +19,7 @@ import {
   deriveReplySubject,
   requireField,
   renderJsonText,
+  jsonTooLargeNotice,
   withRetry,
 } from "../dist/gmail.js";
 import { packageVersion } from "../dist/constants.js";
@@ -745,6 +746,20 @@ test("renderJsonText returns valid JSON under budget, a safe notice over it (#4)
   assert.throws(() => JSON.parse(capped));
   assert.match(capped, /structuredContent/);
   assert.match(capped, /Refine your query\./);
+
+  // renderJsonText's over-budget branch must produce exactly the standalone
+  // notice for the same length, so callers that precomputed the JSON length can
+  // reuse jsonTooLargeNotice instead of re-serializing (#4).
+  const len = JSON.stringify(big, null, 2).length;
+  assert.equal(capped, jsonTooLargeNotice(len, "Refine your query."));
+});
+
+test("jsonTooLargeNotice reports the length and note and is not valid JSON (#4)", () => {
+  const notice = jsonTooLargeNotice(12345, "Read structuredContent.");
+  assert.match(notice, /12345 characters/);
+  assert.match(notice, /structuredContent/);
+  assert.match(notice, /Read structuredContent\./);
+  assert.throws(() => JSON.parse(notice));
 });
 
 test("packageVersion matches package.json (#9)", () => {
