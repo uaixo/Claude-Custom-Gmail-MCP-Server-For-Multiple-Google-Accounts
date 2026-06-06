@@ -1043,8 +1043,18 @@ export function handleGmailError(error: unknown): string {
 export function renderJsonText(value: unknown, note: string): string {
   const json = JSON.stringify(value, null, 2);
   if (json.length <= CHARACTER_LIMIT) return json;
+  return jsonTooLargeNotice(json.length, note);
+}
+
+/**
+ * The plain-text notice renderJsonText falls back to when a result is too large
+ * to render as JSON. Split out so a caller that has already serialized the value
+ * (e.g. gmail_get_thread, which stringifies once to size it and to build a
+ * summary) can reuse that length instead of paying for a second JSON.stringify.
+ */
+export function jsonTooLargeNotice(length: number, note: string): string {
   return (
-    `[Result too large to render as text (${json.length} characters); the ` +
+    `[Result too large to render as text (${length} characters); the ` +
     `complete result is available in structuredContent. ${note}]`
   );
 }

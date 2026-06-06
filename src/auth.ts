@@ -322,6 +322,19 @@ export function cleanupStaleTokenTemps(maxAgeMs = 60_000): void {
       /* ignore */
     }
   }
+  // Also remove a lock file abandoned by a crashed holder, so a stale
+  // `tokens.json.lock` doesn't linger in the data dir until the next writer
+  // happens to contend on it. A lock older than LOCK_STALE_MS can't belong to a
+  // live holder — operations under it are sub-millisecond — which is exactly the
+  // threshold withTokenLock uses to steal one, so applying it here is safe.
+  const lockPath = `${tokensPath()}.lock`;
+  try {
+    if (now - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+      fs.rmSync(lockPath, { force: true });
+    }
+  } catch {
+    /* no lock present, or it vanished under us — nothing to clean up */
+  }
 }
 
 /** Persist (or update) one account's tokens and credential-file reference. */

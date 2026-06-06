@@ -24,6 +24,7 @@ import {
   gmailFor,
   handleGmailError,
   header,
+  jsonTooLargeNotice,
   mapWithConcurrency,
   renderJsonText,
   requireField,
@@ -264,7 +265,7 @@ Returns: JSON {
   "messages": [ { "message_id": string, "from": string, "to": string, "date": string, "subject": string, "body": string, "label_ids": string[] } ]
 }
 
-For very large threads the result may be truncated: "truncated": true is set, and "omitted_message_count" reports how many trailing messages were dropped.`,
+For very large threads the result may be truncated: "truncated": true is set, and "omitted_message_count" reports how many of the oldest messages were dropped (the newest are kept).`,
     inputSchema: {
       thread_id: z.string().min(1).describe("Thread ID to fetch"),
       account: accountField,
@@ -291,7 +292,11 @@ For very large threads the result may be truncated: "truncated": true is set, an
       // past the size budget aren't decoded/HTML-stripped at all.
       const rawMessages = res.data.messages || [];
       const omittedMessages = Math.max(0, rawMessages.length - MAX_THREAD_MESSAGES);
-      const kept = rawMessages.slice(0, MAX_THREAD_MESSAGES);
+      // Keep the NEWEST messages when a thread exceeds the cap. Gmail returns a
+      // thread oldest-first, and the most recent messages are the ones a reader
+      // usually wants, so drop from the front (oldest) rather than the tail.
+      // slice(-N) returns the whole array when there are fewer than N messages.
+      const kept = rawMessages.slice(-MAX_THREAD_MESSAGES);
       const { messages: capped, truncated: bodyTruncated } = capMessageBodies(
         kept,
         MAX_THREAD_BODY_CHARS,
@@ -328,7 +333,7 @@ For very large threads the result may be truncated: "truncated": true is set, an
           `Thread ${thread_id} in ${acct}: ${messages.length} message(s)` +
             `${truncated ? " (truncated)" : ""}.`,
           omittedMessages > 0
-            ? `${omittedMessages} trailing message(s) omitted.`
+            ? `${omittedMessages} older message(s) omitted.`
             : "",
           "Full headers and bodies are in structuredContent. Per-message summary:",
           ...messages.map(
@@ -343,8 +348,10 @@ For very large threads the result may be truncated: "truncated": true is set, an
         text =
           summary.length <= CHARACTER_LIMIT
             ? summary
-            : renderJsonText(
-                output,
+            : // Reuse the length we already computed for fullJson rather than
+              // re-serializing inside renderJsonText (#4).
+              jsonTooLargeNotice(
+                fullJson.length,
                 "Thread is very large; read messages individually."
               );
       }
