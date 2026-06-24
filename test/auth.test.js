@@ -20,7 +20,7 @@ after(() => {
   delete process.env.GMAIL_MCP_DATA_DIR;
 });
 
-const auth = await import("../dist/auth.js");
+const auth = await import("../src/auth.js");
 
 test("saveAccount/loadTokens roundtrip, atomic write, 0600 perms, no temp leftover", async () => {
   await auth.saveAccount("a@b.com", { access_token: "x", refresh_token: "y" }, "credentials.json");

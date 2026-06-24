@@ -33,7 +33,6 @@ jobs:
         run: npm run lint
 
       - name: Test
-        # `npm test` (not bare `node --test`) so the `pretest` build hook runs:
-        # the tests import the compiled output from dist/, and this keeps CI
-        # using the exact command contributors run locally.
+        # Tests run directly against src/ via tsx (see package.json), so no build
+        # is needed here; the Build step above is the separate type-check gate.
         run: npm test

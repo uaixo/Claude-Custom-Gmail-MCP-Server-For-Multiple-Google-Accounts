@@ -8,7 +8,7 @@ import { google } from "googleapis";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
-import { server } from "../dist/index.js";
+import { server } from "../src/index.js";
 
 // --------------------------------------------------------------------------
 // Handler integration tests (review item #4).
@@ -173,6 +173,31 @@ test("gmail_search_threads forwards the query/max_results and maps summaries", a
   assert.deepEqual(result.structuredContent.threads, [
     { thread_id: "t1", subject: "Hello", from: "x@y.com", date: "today", snippet: "snip" },
   ]);
+  // No nextPageToken in the response → none surfaced to the caller.
+  assert.equal(result.structuredContent.next_page_token, undefined);
+});
+
+test("gmail_search_threads forwards page_token and surfaces next_page_token (#7)", async () => {
+  const { result, calls } = await callTool(
+    "gmail_search_threads",
+    { query: "is:unread", account: "alice@example.com", page_token: "PAGE2" },
+    {
+      "threads.list": {
+        data: { threads: [{ id: "t9" }], nextPageToken: "PAGE3" },
+      },
+      "threads.get": {
+        data: {
+          messages: [{ payload: { headers: [{ name: "Subject", value: "Hi" }] } }],
+        },
+      },
+    }
+  );
+  assert.equal(result.isError, undefined);
+  const list = calls.find((c) => c.name === "threads.list");
+  // The caller's page_token is forwarded to Gmail as pageToken.
+  assert.equal(list.params.pageToken, "PAGE2");
+  // Gmail's nextPageToken is surfaced as next_page_token for the next call.
+  assert.equal(result.structuredContent.next_page_token, "PAGE3");
 });
 
 // --------------------------------------------------------------------------
