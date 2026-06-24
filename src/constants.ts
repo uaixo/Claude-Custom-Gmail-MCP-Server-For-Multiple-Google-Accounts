@@ -32,8 +32,12 @@ export function isMainModule(importMetaUrl: string): boolean {
 export function packageVersion(): string {
   try {
     const pkgUrl = new URL("../package.json", import.meta.url);
-    const pkg = JSON.parse(fs.readFileSync(pkgUrl, "utf-8"));
-    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+    const pkg: unknown = JSON.parse(fs.readFileSync(pkgUrl, "utf-8"));
+    const version =
+      pkg && typeof pkg === "object" && "version" in pkg
+        ? (pkg as { version?: unknown }).version
+        : undefined;
+    return typeof version === "string" ? version : "0.0.0";
   } catch {
     return "0.0.0";
   }

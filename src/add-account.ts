@@ -130,7 +130,8 @@ function printAccounts(): void {
 
 /** Prompt the user to choose one credential file from a list. */
 async function chooseCredentialFile(files: string[]): Promise<string> {
-  if (files.length === 1) return files[0];
+  const [only] = files;
+  if (files.length === 1 && only !== undefined) return only;
   console.log("\nMultiple OAuth credential files found. Choose one to use:");
   files.forEach((f, i) => console.log(`  ${i + 1}) ${f}`));
   const rl = readline.createInterface({
@@ -144,7 +145,8 @@ async function chooseCredentialFile(files: string[]): Promise<string> {
       );
       const n = parseInt(answer.trim(), 10);
       if (Number.isInteger(n) && n >= 1 && n <= files.length) {
-        return files[n - 1];
+        const chosen = files[n - 1];
+        if (chosen !== undefined) return chosen;
       }
       console.log("Invalid selection, try again.");
     }

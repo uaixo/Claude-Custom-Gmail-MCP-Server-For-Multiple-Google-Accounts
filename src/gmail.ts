@@ -21,14 +21,19 @@ export async function mapWithConcurrency<T, R>(
   limit: number,
   fn: (item: T, index: number) => Promise<R>
 ): Promise<R[]> {
-  const results: R[] = new Array(items.length);
+  const results: R[] = new Array<R>(items.length);
   let next = 0;
   const workerCount = Math.max(1, Math.min(limit, items.length));
   const workers = Array.from({ length: workerCount }, async () => {
     while (true) {
       const i = next++;
       if (i >= items.length) break;
-      results[i] = await fn(items[i], i);
+      // i is in-bounds, so items[i] is present; the explicit guard satisfies
+      // noUncheckedIndexedAccess without changing behavior for the dense arrays
+      // this is called with.
+      const item = items[i];
+      if (item === undefined) continue;
+      results[i] = await fn(item, i);
     }
   });
   await Promise.all(workers);
@@ -604,8 +609,10 @@ function formatRecipient(recipient: string): string {
   const trimmed = recipient.trim();
   const m = /^(.*)<([^<>]+)>\s*$/.exec(trimmed);
   if (!m) return trimmed; // bare address (or nothing parseable as a name-addr)
-  const name = m[1].trim();
-  const address = m[2].trim();
+  // Both capture groups are present whenever the regex matches; `?? ""` only
+  // satisfies the type checker (the address group can never actually be empty).
+  const name = (m[1] ?? "").trim();
+  const address = (m[2] ?? "").trim();
   if (!name) return `<${address}>`;
   let displayName: string;
   if (!isAscii(name)) {
@@ -747,7 +754,10 @@ function foldHeaderLine(line: string): string {
   let lastSpace = -1; // index of the last space seen within the current segment
   let bytes = 0; // octets accumulated in the current segment so far
   for (let i = 0; i < line.length; i++) {
-    const charBytes = Buffer.byteLength(line[i], "utf-8");
+    // charAt returns "" past the end (never here, since i < length) and is typed
+    // string, unlike line[i] which noUncheckedIndexedAccess widens to undefined.
+    const ch = line.charAt(i);
+    const charBytes = Buffer.byteLength(ch, "utf-8");
     if (bytes + charBytes > LIMIT && lastSpace > segStart) {
       // Fold at the last space: it becomes the next line's leading indent.
       segments.push(line.slice(segStart, lastSpace));
@@ -758,7 +768,7 @@ function foldHeaderLine(line: string): string {
     } else {
       bytes += charBytes;
     }
-    if (line[i] === " ") lastSpace = i;
+    if (ch === " ") lastSpace = i;
   }
   segments.push(line.slice(segStart));
   // Hard-break any segment that has no foldable space but still exceeds the

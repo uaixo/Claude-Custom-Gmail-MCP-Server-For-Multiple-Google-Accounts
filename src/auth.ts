@@ -75,16 +75,22 @@ export function loadClientConfig(file?: string): OAuthClientConfig {
         `or set GMAIL_OAUTH_CREDENTIALS to a specific file.`
     );
   }
-  const raw = JSON.parse(fs.readFileSync(target, "utf-8"));
+  const parsed: unknown = JSON.parse(fs.readFileSync(target, "utf-8"));
+  const root: Record<string, unknown> =
+    parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
   // Google's downloaded file nests config under "installed" or "web".
-  const cfg = raw.installed || raw.web || raw;
+  const cfg = (root.installed ?? root.web ?? root) as Partial<OAuthClientConfig>;
   if (!cfg.client_id || !cfg.client_secret) {
     throw new Error(
       `Credentials file ${target} is missing client_id/client_secret. ` +
         `Make sure it is an OAuth "Desktop app" client JSON.`
     );
   }
-  return cfg;
+  return {
+    client_id: cfg.client_id,
+    client_secret: cfg.client_secret,
+    redirect_uris: cfg.redirect_uris,
+  };
 }
 
 /** Build a fresh OAuth2 client from a specific credential file. */
@@ -398,7 +404,8 @@ export function resolveAccount(requested?: string, store?: TokenStore): string {
     }
     return key;
   }
-  if (accounts.length === 1) return accounts[0];
+  const [only] = accounts;
+  if (accounts.length === 1 && only !== undefined) return only;
   throw new Error(
     `Multiple accounts connected (${accounts.join(
       ", "

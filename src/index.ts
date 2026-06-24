@@ -121,7 +121,9 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
 function isRecipient(value: string): boolean {
   const trimmed = value.trim();
   const named = /<([^<>]+)>\s*$/.exec(trimmed);
-  const email = (named ? named[1] : trimmed).trim();
+  // When the name-addr form matched, capture group 1 is always present; `?? ""`
+  // only satisfies noUncheckedIndexedAccess.
+  const email = (named ? (named[1] ?? "") : trimmed).trim();
   return EMAIL_RE.test(email);
 }
 const recipientSchema = z
@@ -152,7 +154,9 @@ Returns: JSON { "count": number, "accounts": string[] } where each entry is a co
       openWorldHint: false,
     },
   },
-  async () => {
+  // Synchronous: listing accounts is a local read with nothing to await. The
+  // SDK accepts a sync handler, and keeping it sync avoids a no-op async wrapper.
+  () => {
     const accounts = listAccounts();
     const output = { count: accounts.length, accounts };
     const text =
