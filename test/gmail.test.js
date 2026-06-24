@@ -446,11 +446,40 @@ test("summarizeThread degrades to an error entry when the fetch fails (#A)", asy
     e.code = 429;
     throw e;
   });
-  const out = await summarizeThread(gmail, { id: "t2", snippet: "fallback" });
+  // retries:0 → degrade immediately (the retry path is covered separately below).
+  const out = await summarizeThread(
+    gmail,
+    { id: "t2", snippet: "fallback" },
+    { retries: 0 }
+  );
   assert.equal(out.thread_id, "t2"); // still identified from the list result
   assert.equal(out.snippet, "fallback"); // falls back to the list snippet
   assert.equal(out.subject, "");
   assert.match(out.error, /Rate limit/);
+});
+
+test("summarizeThread retries a transient per-thread 429 before degrading (#4)", async () => {
+  let calls = 0;
+  const gmail = mockGmailGet(async () => {
+    calls++;
+    if (calls === 1) {
+      const e = new Error("rate limited");
+      e.code = 429;
+      throw e;
+    }
+    return {
+      data: { messages: [{ payload: { headers: [{ name: "Subject", value: "Recovered" }] } }] },
+    };
+  });
+  // baseDelayMs:0 keeps the backoff instant; the first 429 is retried, not degraded.
+  const out = await summarizeThread(
+    gmail,
+    { id: "t3", snippet: "fallback" },
+    { baseDelayMs: 0 }
+  );
+  assert.equal(calls, 2, "the fetch was retried once after the transient 429");
+  assert.equal(out.subject, "Recovered");
+  assert.equal(out.error, undefined, "a retried-then-succeeded fetch is not an error entry");
 });
 
 test("summarizeThread captures a missing thread id instead of throwing (#A)", async () => {
@@ -474,7 +503,10 @@ test("one failing thread does not sink the whole search batch (#A)", async () =>
     };
   });
   const threads = [{ id: "a" }, { id: "bad" }, { id: "c" }];
-  const out = await mapWithConcurrency(threads, 5, (t) => summarizeThread(gmail, t));
+  // retries:0 → the "bad" thread degrades without waiting out the retry budget.
+  const out = await mapWithConcurrency(threads, 5, (t) =>
+    summarizeThread(gmail, t, { retries: 0 })
+  );
   assert.equal(out.length, 3);
   assert.equal(out[0].subject, "S-a");
   assert.ok(out[1].error, "the failing thread carries an error");
@@ -723,6 +755,16 @@ test("handleGmailError reports a transport error distinctly, not as an API failu
   assert.doesNotMatch(net, /Gmail API request failed/);
 });
 
+test("handleGmailError reports a request timeout as a timeout, not a generic error (#3)", () => {
+  // A node-fetch timeout has no HTTP status and no string `code`, only `type`.
+  const msg = handleGmailError({
+    type: "request-timeout",
+    message: "network timeout at: https://gmail.googleapis.com/...",
+  });
+  assert.match(msg, /timed out/i);
+  assert.doesNotMatch(msg, /Gmail API request failed/);
+});
+
 test("requireField returns present values and throws on null/undefined", () => {
   assert.equal(requireField("abc", "thread.id"), "abc");
   assert.equal(requireField(0, "n"), 0); // falsy-but-present must pass through
@@ -816,6 +858,28 @@ test("resolveAttachments enforces the path allowlist and blocks escapes", () => 
     assert.throws(
       () => resolveAttachments([{ path: path.join(allowed, "..", "secret", "id_rsa") }]),
       /outside the allowed/
+    );
+  } finally {
+    if (prev === undefined) delete process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+    else process.env.GMAIL_MCP_ATTACHMENTS_DIR = prev;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveAttachments rejects a non-regular file (directory) inside the allowlist (#5)", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-att-"));
+  const subdir = path.join(root, "a-directory");
+  fs.mkdirSync(subdir);
+  const prev = process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+  try {
+    process.env.GMAIL_MCP_ATTACHMENTS_DIR = root;
+    // A directory passes the existence + containment checks but is not a regular
+    // file, so it must be refused rather than read. On POSIX the open succeeds
+    // and the fstat-on-fd guard rejects it ("not a regular file"); on Windows the
+    // open itself fails ("could not be opened safely"). Either way it's refused.
+    assert.throws(
+      () => resolveAttachments([{ path: subdir }]),
+      /not a regular file|could not be opened safely/
     );
   } finally {
     if (prev === undefined) delete process.env.GMAIL_MCP_ATTACHMENTS_DIR;
@@ -1162,4 +1226,61 @@ test("withRetry idempotent:false still retries a 429 (rejected before processing
   );
   assert.equal(out, "ok");
   assert.equal(calls, 3);
+});
+
+test("withRetry retries a transient transport error (ETIMEDOUT) for idempotent calls (#3)", async () => {
+  // A timeout/reset has no HTTP status; for an idempotent call it's safe to retry.
+  let calls = 0;
+  const out = await withRetry(
+    async () => {
+      calls++;
+      if (calls < 2) {
+        const e = new Error("connect ETIMEDOUT");
+        e.code = "ETIMEDOUT"; // string code (system error), not an HTTP status
+        throw e;
+      }
+      return "ok";
+    },
+    { retries: 5, baseDelayMs: 1 }
+  );
+  assert.equal(out, "ok");
+  assert.equal(calls, 2);
+});
+
+test("withRetry treats a node-fetch request-timeout as retryable for idempotent calls (#3)", async () => {
+  // A node-fetch timeout carries no `code`, only `type: "request-timeout"`.
+  let calls = 0;
+  const out = await withRetry(
+    async () => {
+      calls++;
+      if (calls < 2) {
+        const e = new Error("network timeout at: https://gmail.googleapis.com/...");
+        e.type = "request-timeout";
+        throw e;
+      }
+      return "ok";
+    },
+    { retries: 5, baseDelayMs: 1 }
+  );
+  assert.equal(out, "ok");
+  assert.equal(calls, 2);
+});
+
+test("withRetry idempotent:false does NOT retry a transport timeout (#3)", async () => {
+  // For a send/draft a timeout could mean the request was already processed, so
+  // retrying might duplicate the side effect — it must surface immediately.
+  let calls = 0;
+  await assert.rejects(
+    withRetry(
+      async () => {
+        calls++;
+        const e = new Error("connect ETIMEDOUT");
+        e.code = "ETIMEDOUT";
+        throw e;
+      },
+      { retries: 5, baseDelayMs: 1, idempotent: false }
+    ),
+    /ETIMEDOUT/
+  );
+  assert.equal(calls, 1); // transport errors are never retried for non-idempotent calls
 });
