@@ -7,12 +7,12 @@ import {
   listenWithFallback,
   escapeHtml,
   validateCallback,
-} from "../dist/add-account.js";
+} from "../src/add-account.js";
 import {
   oauthRedirectUri,
   OAUTH_REDIRECT_PORT,
   attachmentDirs,
-} from "../dist/constants.js";
+} from "../src/constants.js";
 
 const close = (s) => new Promise((r) => s.close(r));
 // Bind on the loopback interface, matching listenWithFallback. A wildcard

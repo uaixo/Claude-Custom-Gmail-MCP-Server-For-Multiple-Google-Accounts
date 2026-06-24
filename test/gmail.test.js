@@ -21,8 +21,8 @@ import {
   renderJsonText,
   jsonTooLargeNotice,
   withRetry,
-} from "../dist/gmail.js";
-import { packageVersion } from "../dist/constants.js";
+} from "../src/gmail.js";
+import { packageVersion } from "../src/constants.js";
 
 const b64url = (s) => Buffer.from(s, "utf-8").toString("base64url");
 // base64url of raw bytes, for exercising non-UTF-8 charset decoding.

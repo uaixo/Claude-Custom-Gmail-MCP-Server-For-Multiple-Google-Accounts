@@ -19,6 +19,8 @@ This is the multi-account capability the built-in Google connector doesn't offer
 
 Every tool except `gmail_list_accounts` accepts `account: "you@gmail.com"`. If only one account is connected, you can omit it; with several connected, it's required.
 
+`gmail_search_threads` is paginated: each call returns up to `max_results` threads (≤100) plus a `next_page_token` when more match. Pass that token back as `page_token` (with the same query) to fetch the next page.
+
 ### HTML and attachments (send / draft)
 
 `gmail_send_message` and `gmail_create_draft` accept:
@@ -208,12 +210,12 @@ Restart Claude Desktop. Ask it to "list my connected Gmail accounts" to confirm.
 ## Development
 
 ```bash
-npm run build   # compile src/ -> dist/
+npm run build   # compile src/ -> dist/ (also type-checks)
 npm run lint    # eslint
-npm test        # build, then run the test suite
+npm test        # run the test suite directly against src/ (via tsx)
 ```
 
-The tests import the compiled output from `dist/`, so run them with **`npm test`** — its `pretest` hook builds first. Running bare `node --test` skips that build and will execute stale (or missing) compiled code; only use it when `dist/` is already up to date.
+The tests run against the TypeScript sources in `src/` through `tsx` (Node's built-in test runner with `--import tsx`), so no build step is needed to test — just edit and re-run. `npm run build` (`tsc`) still type-checks the whole project and is run separately in CI.
 
 ## Architecture
 

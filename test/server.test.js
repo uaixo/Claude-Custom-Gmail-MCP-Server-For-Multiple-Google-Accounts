@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
-import { server } from "../dist/index.js";
+import { server } from "../src/index.js";
 
 /**
  * Connect an in-memory MCP client to the real server and return the tool list

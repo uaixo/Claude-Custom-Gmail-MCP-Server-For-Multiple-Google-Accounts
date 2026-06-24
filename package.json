@@ -22,8 +22,7 @@
     "clean": "rm -rf dist",
     "lint": "eslint .",
     "prepare": "npm run build",
-    "pretest": "npm run build",
-    "test": "node --test"
+    "test": "node --import tsx --test"
   },
   "engines": {
     "node": ">=18"

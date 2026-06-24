@@ -186,13 +186,15 @@ Args:
   - query (string): Gmail search query. Required.
   - account (string, optional): Which connected account to search.
   - max_results (number): 1-100, default 20.
+  - page_token (string, optional): Opaque token from a previous call's "next_page_token", to fetch the next page of results for the same query.
 
 Returns: JSON {
   "account": string,
   "count": number,
-  "threads": [ { "thread_id": string, "subject": string, "from": string, "date": string, "snippet": string, "error"?: string } ]
+  "threads": [ { "thread_id": string, "subject": string, "from": string, "date": string, "snippet": string, "error"?: string } ],
+  "next_page_token"?: string
 }
-If an individual thread's details can't be fetched, that entry includes an "error" string (and empty subject/from/date) instead of the search failing.`,
+"next_page_token" is present only when more results are available; pass it back as "page_token" (with the same query) to fetch the next page. If an individual thread's details can't be fetched, that entry includes an "error" string (and empty subject/from/date) instead of the search failing.`,
     inputSchema: {
       query: z
         .string()
@@ -206,7 +208,13 @@ If an individual thread's details can't be fetched, that entry includes an "erro
         .min(1)
         .max(100)
         .default(20)
-        .describe("Maximum number of threads to return (1-100)"),
+        .describe("Maximum number of threads to return per page (1-100)"),
+      page_token: z
+        .string()
+        .optional()
+        .describe(
+          "Opaque pagination token from a previous response's next_page_token; fetches the next page for the same query."
+        ),
     },
     annotations: {
       readOnlyHint: true,
@@ -215,7 +223,7 @@ If an individual thread's details can't be fetched, that entry includes an "erro
       openWorldHint: true,
     },
   },
-  async ({ query, account, max_results }) => {
+  async ({ query, account, max_results, page_token }) => {
     try {
       const { gmail, account: acct } = gmailFor(account);
       const list = await withRetry(() =>
@@ -223,6 +231,7 @@ If an individual thread's details can't be fetched, that entry includes an "erro
           userId: "me",
           q: query,
           maxResults: max_results,
+          ...(page_token ? { pageToken: page_token } : {}),
         })
       );
       const threads = list.data.threads || [];
@@ -235,7 +244,15 @@ If an individual thread's details can't be fetched, that entry includes an "erro
         THREAD_FETCH_CONCURRENCY,
         (t) => summarizeThread(gmail, t)
       );
-      const output = { account: acct, count: detailed.length, threads: detailed };
+      // Surface Gmail's pagination cursor so callers can fetch the next page;
+      // present only when more results exist for this query.
+      const nextPageToken = list.data.nextPageToken || undefined;
+      const output = {
+        account: acct,
+        count: detailed.length,
+        threads: detailed,
+        ...(nextPageToken ? { next_page_token: nextPageToken } : {}),
+      };
       const text =
         detailed.length === 0
           ? `No threads found for query '${query}' in ${acct}.`
