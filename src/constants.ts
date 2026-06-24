@@ -32,8 +32,12 @@ export function isMainModule(importMetaUrl: string): boolean {
 export function packageVersion(): string {
   try {
     const pkgUrl = new URL("../package.json", import.meta.url);
-    const pkg = JSON.parse(fs.readFileSync(pkgUrl, "utf-8"));
-    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+    const pkg: unknown = JSON.parse(fs.readFileSync(pkgUrl, "utf-8"));
+    const version =
+      pkg && typeof pkg === "object" && "version" in pkg
+        ? (pkg as { version?: unknown }).version
+        : undefined;
+    return typeof version === "string" ? version : "0.0.0";
   } catch {
     return "0.0.0";
   }
@@ -76,6 +80,24 @@ export const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
  * threads, independent of the body-character budget.
  */
 export const MAX_THREAD_MESSAGES = 100;
+
+/**
+ * Per-request timeout (milliseconds) applied to every Gmail API call. Bounds a
+ * single request's duration so a hung socket fails fast — and, for idempotent
+ * calls, is retried by withRetry — instead of blocking a tool call until the OS
+ * TCP timeout (which can be minutes). withRetry bounds the number of attempts;
+ * this bounds each attempt. Defaults to 30s; override with
+ * GMAIL_MCP_REQUEST_TIMEOUT_MS (a positive number of milliseconds).
+ */
+export const GMAIL_REQUEST_TIMEOUT_MS = 30_000;
+
+/** Resolve the per-request timeout, honoring the env override when valid. */
+export function gmailRequestTimeoutMs(): number {
+  const override = Number(process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0
+    ? override
+    : GMAIL_REQUEST_TIMEOUT_MS;
+}
 
 /**
  * Gmail OAuth scopes (kept minimal). `gmail.modify` covers read, label

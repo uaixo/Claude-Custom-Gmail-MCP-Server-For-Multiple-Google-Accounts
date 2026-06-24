@@ -4,7 +4,12 @@ import crypto from "crypto";
 import { google, gmail_v1 } from "googleapis";
 import { convert as htmlToTextConvert } from "html-to-text";
 import { getAuthedClient, loadTokens, resolveAccount } from "./auth.js";
-import { attachmentDirs, CHARACTER_LIMIT, MAX_MESSAGE_BYTES } from "./constants.js";
+import {
+  attachmentDirs,
+  CHARACTER_LIMIT,
+  gmailRequestTimeoutMs,
+  MAX_MESSAGE_BYTES,
+} from "./constants.js";
 
 /**
  * Map over items running at most `limit` operations concurrently, preserving
@@ -16,14 +21,19 @@ export async function mapWithConcurrency<T, R>(
   limit: number,
   fn: (item: T, index: number) => Promise<R>
 ): Promise<R[]> {
-  const results: R[] = new Array(items.length);
+  const results: R[] = new Array<R>(items.length);
   let next = 0;
   const workerCount = Math.max(1, Math.min(limit, items.length));
   const workers = Array.from({ length: workerCount }, async () => {
     while (true) {
       const i = next++;
       if (i >= items.length) break;
-      results[i] = await fn(items[i], i);
+      // i is in-bounds, so items[i] is present; the explicit guard satisfies
+      // noUncheckedIndexedAccess without changing behavior for the dense arrays
+      // this is called with.
+      const item = items[i];
+      if (item === undefined) continue;
+      results[i] = await fn(item, i);
     }
   });
   await Promise.all(workers);
@@ -40,7 +50,14 @@ export function gmailFor(account?: string): {
   const store = loadTokens();
   const resolved = resolveAccount(account, store);
   const auth = getAuthedClient(resolved, store);
-  const gmail = google.gmail({ version: "v1", auth });
+  // Set a per-request timeout at the client level so it applies to every call
+  // (it propagates through googleapis to gaxios/node-fetch). Without it a hung
+  // socket would block the tool call until the OS TCP timeout.
+  const gmail = google.gmail({
+    version: "v1",
+    auth,
+    timeout: gmailRequestTimeoutMs(),
+  });
   return { gmail, account: resolved };
 }
 
@@ -142,24 +159,33 @@ export interface ThreadSummary {
 
 /**
  * Fetch lightweight metadata (first message's Subject/From/Date) for one thread
- * in a search result. A per-thread failure — a transient 429/5xx, or a thread
- * deleted between the list and this get — is captured as an `error` field on a
- * degraded entry rather than thrown, so one bad thread doesn't sink the whole
- * search. Falls back to the list snippet when the full fetch is unavailable.
+ * in a search result. The per-thread fetch is retried (idempotent backoff via
+ * withRetry) so a transient 429 — most likely *during* a concurrent fan-out — is
+ * ridden out rather than degrading the entry. Only after retries are exhausted
+ * (or for a non-retryable failure, e.g. a thread deleted between the list and
+ * this get) is the failure captured as an `error` field on a degraded entry
+ * rather than thrown, so one bad thread doesn't sink the whole search. Falls
+ * back to the list snippet when the full fetch is unavailable. `retryOpts` lets
+ * a caller (or test) tune the retry budget; it defaults to withRetry's defaults.
  */
 export async function summarizeThread(
   gmail: gmail_v1.Gmail,
-  thread: gmail_v1.Schema$Thread
+  thread: gmail_v1.Schema$Thread,
+  retryOpts?: { retries?: number; baseDelayMs?: number }
 ): Promise<ThreadSummary> {
   const threadId = thread.id || "";
   try {
     const id = requireField(thread.id, "thread.id");
-    const full = await gmail.users.threads.get({
-      userId: "me",
-      id,
-      format: "metadata",
-      metadataHeaders: ["Subject", "From", "Date"],
-    });
+    const full = await withRetry(
+      () =>
+        gmail.users.threads.get({
+          userId: "me",
+          id,
+          format: "metadata",
+          metadataHeaders: ["Subject", "From", "Date"],
+        }),
+      retryOpts
+    );
     const first = full.data.messages?.[0];
     return {
       thread_id: id,
@@ -435,16 +461,37 @@ export function resolveAttachments(
             `directories (GMAIL_MCP_ATTACHMENTS_DIR). Refusing to read it.`
         );
       }
-      // Only read regular files: a directory, FIFO, socket, or device inside an
-      // allowed dir is not a valid attachment (and reading a FIFO could block
-      // the server indefinitely). statSync follows to the resolved real path.
-      if (!fs.statSync(resolved).isFile()) {
-        throw new Error(`Attachment ${i}: '${filePath}' is not a regular file.`);
+      // Open the resolved real path once with O_NOFOLLOW, then fstat and read
+      // from that same descriptor. This closes the TOCTOU window between the
+      // containment check and the read: O_NOFOLLOW refuses a symlink swapped in
+      // for the final path component after we resolved it (ELOOP), and operating
+      // on the fd guarantees the regular-file check and the read see the same
+      // inode. O_NOFOLLOW is POSIX-only; it degrades to a no-op (0) elsewhere.
+      const noFollow = fs.constants.O_NOFOLLOW || 0;
+      let fd: number;
+      try {
+        fd = fs.openSync(resolved, fs.constants.O_RDONLY | noFollow);
+      } catch {
+        // ELOOP (final component became a symlink) or ENOENT (vanished after the
+        // check) — refuse rather than read something we didn't just validate.
+        throw new Error(
+          `Attachment ${i}: '${filePath}' could not be opened safely (it may have changed on disk).`
+        );
       }
-      const filename = a.filename || path.basename(filePath);
-      const mimeType = a.mime_type || inferMimeType(filename);
-      const contentBase64 = fs.readFileSync(resolved).toString("base64");
-      return { filename, mimeType, contentBase64 };
+      try {
+        // Only read regular files: a directory, FIFO, socket, or device inside
+        // an allowed dir is not a valid attachment (and reading a FIFO could
+        // block the server indefinitely). fstat sees the opened inode.
+        if (!fs.fstatSync(fd).isFile()) {
+          throw new Error(`Attachment ${i}: '${filePath}' is not a regular file.`);
+        }
+        const filename = a.filename || path.basename(filePath);
+        const mimeType = a.mime_type || inferMimeType(filename);
+        const contentBase64 = fs.readFileSync(fd).toString("base64");
+        return { filename, mimeType, contentBase64 };
+      } finally {
+        fs.closeSync(fd);
+      }
     }
     // Inline base64.
     if (!a.filename) {
@@ -562,8 +609,10 @@ function formatRecipient(recipient: string): string {
   const trimmed = recipient.trim();
   const m = /^(.*)<([^<>]+)>\s*$/.exec(trimmed);
   if (!m) return trimmed; // bare address (or nothing parseable as a name-addr)
-  const name = m[1].trim();
-  const address = m[2].trim();
+  // Both capture groups are present whenever the regex matches; `?? ""` only
+  // satisfies the type checker (the address group can never actually be empty).
+  const name = (m[1] ?? "").trim();
+  const address = (m[2] ?? "").trim();
   if (!name) return `<${address}>`;
   let displayName: string;
   if (!isAscii(name)) {
@@ -705,7 +754,10 @@ function foldHeaderLine(line: string): string {
   let lastSpace = -1; // index of the last space seen within the current segment
   let bytes = 0; // octets accumulated in the current segment so far
   for (let i = 0; i < line.length; i++) {
-    const charBytes = Buffer.byteLength(line[i], "utf-8");
+    // charAt returns "" past the end (never here, since i < length) and is typed
+    // string, unlike line[i] which noUncheckedIndexedAccess widens to undefined.
+    const ch = line.charAt(i);
+    const charBytes = Buffer.byteLength(ch, "utf-8");
     if (bytes + charBytes > LIMIT && lastSpace > segStart) {
       // Fold at the last space: it becomes the next line's leading indent.
       segments.push(line.slice(segStart, lastSpace));
@@ -716,7 +768,7 @@ function foldHeaderLine(line: string): string {
     } else {
       bytes += charBytes;
     }
-    if (line[i] === " ") lastSpace = i;
+    if (ch === " ") lastSpace = i;
   }
   segments.push(line.slice(segStart));
   // Hard-break any segment that has no foldable space but still exceeds the
@@ -955,6 +1007,40 @@ const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const RATE_LIMIT_ONLY = new Set([429]);
 
 /**
+ * Transient transport-level failures (no HTTP status) safe to retry for
+ * *idempotent* calls: connection resets/refusals/timeouts where the request
+ * never reached a definite outcome. Matched by Node's system-error `code`. A
+ * node-fetch request timeout carries no `code` (only `type: "request-timeout"`),
+ * so it is detected separately in isRetryableTransport.
+ */
+const RETRYABLE_TRANSPORT_CODES = new Set([
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ECONNABORTED",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "EPIPE",
+]);
+
+/**
+ * True when an error is a transient transport-level failure worth retrying for
+ * an idempotent call: a known retryable system-error `code`, or a node-fetch
+ * request timeout (surfaced by gaxios as an error with `type: "request-timeout"`
+ * and no `code`). Errors that carry an HTTP status are classified by status, not
+ * here. Retried only for idempotent calls — for a send/draft a timeout could
+ * mean the request was already processed, so a retry might duplicate it.
+ */
+function isRetryableTransport(error: unknown): boolean {
+  const e = error as { code?: number | string; type?: string };
+  if (typeof e?.code === "string" && RETRYABLE_TRANSPORT_CODES.has(e.code)) {
+    return true;
+  }
+  return e?.type === "request-timeout";
+}
+
+/**
  * Run a Gmail API call with bounded, jittered exponential backoff on transient
  * failures. By default (idempotent calls) it retries on rate limiting + 5xx;
  * pass `idempotent: false` for a call with a side effect that must not be
@@ -970,18 +1056,21 @@ export async function withRetry<T>(
 ): Promise<T> {
   const retries = opts.retries ?? 3;
   const baseDelayMs = opts.baseDelayMs ?? 300;
-  const retryable =
-    opts.idempotent === false ? RATE_LIMIT_ONLY : RETRYABLE_STATUSES;
+  const idempotent = opts.idempotent !== false;
+  const retryable = idempotent ? RETRYABLE_STATUSES : RATE_LIMIT_ONLY;
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn();
     } catch (error) {
       const status = httpStatusOf(error);
-      if (
-        attempt >= retries ||
-        status === undefined ||
-        !retryable.has(status)
-      ) {
+      // Retry an HTTP status in the retryable set, or — for idempotent calls
+      // only — a transient transport error (timeout/reset) that carries no
+      // status. A non-idempotent call never retries a transport error: the
+      // request may have been processed, so a retry could duplicate it.
+      const retryableNow =
+        (status !== undefined && retryable.has(status)) ||
+        (idempotent && isRetryableTransport(error));
+      if (attempt >= retries || !retryableNow) {
         throw error;
       }
       const delay =
@@ -1024,9 +1113,16 @@ export function handleGmailError(error: unknown): string {
       return "Error: Rate limit exceeded. Wait before retrying.";
   }
   if (status) return `Error: Gmail API request failed (status ${status}): ${detail}`;
-  // No HTTP status. A string `code` is a transport/system error (DNS failure,
-  // connection reset, timeout) — report it as such rather than as an API
-  // rejection. Otherwise it's a local error (e.g. attachment validation).
+  // No HTTP status. A node-fetch request timeout reaches here with no string
+  // `code` (gaxios copies a code only when the underlying error had one), so
+  // identify it by its `type` and report it as a timeout rather than a generic
+  // error.
+  if ((error as { type?: string })?.type === "request-timeout") {
+    return "Error: Request to Gmail timed out. Check connectivity and retry.";
+  }
+  // A string `code` is a transport/system error (DNS failure, connection reset,
+  // timeout) — report it as such rather than as an API rejection. Otherwise it's
+  // a local error (e.g. attachment validation).
   if (typeof e?.code === "string") {
     return `Error: Network error (${e.code}) reaching Gmail. Check connectivity and retry. (${detail})`;
   }
