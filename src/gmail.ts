@@ -1,7 +1,8 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { google, gmail_v1 } from "googleapis";
+import { createRequire } from "module";
+import type { gmail_v1 } from "@googleapis/gmail";
 import { convert as htmlToTextConvert } from "html-to-text";
 import { getAuthedClient, loadTokens, resolveAccount } from "./auth.js";
 import {
@@ -10,6 +11,14 @@ import {
   gmailRequestTimeoutMs,
   MAX_MESSAGE_BYTES,
 } from "./constants.js";
+
+// @googleapis/gmail is CommonJS. Resolve it through createRequire (instead of a
+// static ESM import) so each call reads the gmail() factory off the package's
+// live exports object. That property is also the single seam the integration
+// tests swap to inject a fake Gmail client (see test/index.test.js).
+const gmailApi = createRequire(import.meta.url)(
+  "@googleapis/gmail"
+) as typeof import("@googleapis/gmail");
 
 /**
  * Map over items running at most `limit` operations concurrently, preserving
@@ -51,9 +60,9 @@ export function gmailFor(account?: string): {
   const resolved = resolveAccount(account, store);
   const auth = getAuthedClient(resolved, store);
   // Set a per-request timeout at the client level so it applies to every call
-  // (it propagates through googleapis to gaxios/node-fetch). Without it a hung
-  // socket would block the tool call until the OS TCP timeout.
-  const gmail = google.gmail({
+  // (it propagates through the Gmail client to gaxios/node-fetch). Without it a
+  // hung socket would block the tool call until the OS TCP timeout.
+  const gmail = gmailApi.gmail({
     version: "v1",
     auth,
     timeout: gmailRequestTimeoutMs(),

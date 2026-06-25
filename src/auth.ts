@@ -1,7 +1,6 @@
 import fs from "fs";
 import path from "path";
 import { OAuth2Client, Credentials } from "google-auth-library";
-import { google } from "googleapis";
 import {
   credentialsPath,
   dataDir,
@@ -99,7 +98,7 @@ export function newOAuthClient(
   redirectUri: string = OAUTH_REDIRECT_URI
 ): OAuth2Client {
   const cfg = loadClientConfig(file);
-  return new google.auth.OAuth2(cfg.client_id, cfg.client_secret, redirectUri);
+  return new OAuth2Client(cfg.client_id, cfg.client_secret, redirectUri);
 }
 
 /** Resolve a stored credentialsFile reference to an absolute path. */
