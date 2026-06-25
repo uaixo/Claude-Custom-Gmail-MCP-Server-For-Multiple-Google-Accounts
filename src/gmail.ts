@@ -1018,9 +1018,10 @@ const RATE_LIMIT_ONLY = new Set([429]);
 /**
  * Transient transport-level failures (no HTTP status) safe to retry for
  * *idempotent* calls: connection resets/refusals/timeouts where the request
- * never reached a definite outcome. Matched by Node's system-error `code`. A
- * node-fetch request timeout carries no `code` (only `type: "request-timeout"`),
- * so it is detected separately in isRetryableTransport.
+ * never reached a definite outcome. Matched by Node's system-error `code`, which
+ * gaxios 7 exposes on the top-level error and on its underlying FetchError
+ * `cause`. A per-request timeout carries no `code` and is detected separately in
+ * isTimeoutError.
  */
 const RETRYABLE_TRANSPORT_CODES = new Set([
   "ETIMEDOUT",
@@ -1034,19 +1035,38 @@ const RETRYABLE_TRANSPORT_CODES = new Set([
 ]);
 
 /**
+ * True when an error is a per-request timeout: the client aborted a stalled
+ * request via its timeout AbortSignal. gaxios 7 surfaces this as a GaxiosError
+ * with no HTTP status and no `code`, whose `cause` is an AbortError; older
+ * (node-fetch) gaxios used `type: "request-timeout"`. Both shapes are recognized,
+ * plus Node's `ABORT_ERR` code, so a timeout is classified consistently across
+ * the stack. A timeout carries no HTTP status, so for a send/draft it is never
+ * retried (see withRetry) — the request may already have been processed.
+ */
+function isTimeoutError(error: unknown): boolean {
+  const e = error as { code?: unknown; type?: string; cause?: { name?: string } };
+  return (
+    e?.code === "ABORT_ERR" ||
+    e?.cause?.name === "AbortError" ||
+    e?.type === "request-timeout"
+  );
+}
+
+/**
  * True when an error is a transient transport-level failure worth retrying for
- * an idempotent call: a known retryable system-error `code`, or a node-fetch
- * request timeout (surfaced by gaxios as an error with `type: "request-timeout"`
- * and no `code`). Errors that carry an HTTP status are classified by status, not
- * here. Retried only for idempotent calls — for a send/draft a timeout could
- * mean the request was already processed, so a retry might duplicate it.
+ * an idempotent call: a known retryable system-error `code` (gaxios 7 sets it on
+ * the top-level error and on its FetchError `cause`), or a per-request timeout.
+ * Errors that carry an HTTP status are classified by status, not here. Retried
+ * only for idempotent calls — for a send/draft a timeout/reset could mean the
+ * request was already processed, so a retry might duplicate it.
  */
 function isRetryableTransport(error: unknown): boolean {
-  const e = error as { code?: number | string; type?: string };
-  if (typeof e?.code === "string" && RETRYABLE_TRANSPORT_CODES.has(e.code)) {
+  const e = error as { code?: number | string; cause?: { code?: number | string } };
+  const codes = [e?.code, e?.cause?.code];
+  if (codes.some((c) => typeof c === "string" && RETRYABLE_TRANSPORT_CODES.has(c))) {
     return true;
   }
-  return e?.type === "request-timeout";
+  return isTimeoutError(error);
 }
 
 /**
@@ -1100,6 +1120,7 @@ export function handleGmailError(error: unknown): string {
       data?: { error?: { message?: string; errors?: Array<{ message?: string }> } };
     };
     errors?: Array<{ message?: string }>;
+    cause?: { code?: number | string };
   };
   // The HTTP status, wherever the client surfaced it (see httpStatusOf).
   const status = httpStatusOf(error);
@@ -1122,18 +1143,22 @@ export function handleGmailError(error: unknown): string {
       return "Error: Rate limit exceeded. Wait before retrying.";
   }
   if (status) return `Error: Gmail API request failed (status ${status}): ${detail}`;
-  // No HTTP status. A node-fetch request timeout reaches here with no string
-  // `code` (gaxios copies a code only when the underlying error had one), so
-  // identify it by its `type` and report it as a timeout rather than a generic
-  // error.
-  if ((error as { type?: string })?.type === "request-timeout") {
+  // No HTTP status. A per-request timeout (the client aborted a stalled request)
+  // has no status and no `code` — identify it via isTimeoutError and report it as
+  // a timeout rather than a generic error.
+  if (isTimeoutError(error)) {
     return "Error: Request to Gmail timed out. Check connectivity and retry.";
   }
-  // A string `code` is a transport/system error (DNS failure, connection reset,
-  // timeout) — report it as such rather than as an API rejection. Otherwise it's
-  // a local error (e.g. attachment validation).
-  if (typeof e?.code === "string") {
-    return `Error: Network error (${e.code}) reaching Gmail. Check connectivity and retry. (${detail})`;
+  // A string `code` is a transport/system error (DNS failure, connection reset);
+  // gaxios 7 sets it on the error and on its FetchError `cause`. Report it as a
+  // network error rather than an API rejection. Otherwise it's a local error
+  // (e.g. attachment validation).
+  const transportCode =
+    (typeof e?.code === "string" && e.code) ||
+    (typeof e?.cause?.code === "string" && e.cause.code) ||
+    undefined;
+  if (transportCode) {
+    return `Error: Network error (${transportCode}) reaching Gmail. Check connectivity and retry. (${detail})`;
   }
   return `Error: ${detail}`;
 }

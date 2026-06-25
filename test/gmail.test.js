@@ -765,6 +765,26 @@ test("handleGmailError reports a request timeout as a timeout, not a generic err
   assert.doesNotMatch(msg, /Gmail API request failed/);
 });
 
+test("handleGmailError reports a gaxios-7 AbortError timeout as a timeout (#g7)", () => {
+  // gaxios 7 aborts a stalled request via its timeout AbortSignal: a GaxiosError
+  // with no status and no `code` whose `cause` is an AbortError. It must still
+  // read as a timeout, not a generic error.
+  const cause = new Error("The operation was aborted.");
+  cause.name = "AbortError";
+  const msg = handleGmailError({ message: "The operation was aborted.", cause });
+  assert.match(msg, /timed out/i);
+  assert.doesNotMatch(msg, /Gmail API request failed/);
+});
+
+test("handleGmailError reads a transport code from the gaxios-7 FetchError cause (#g7)", () => {
+  // A connection failure may carry its system `code` on the FetchError `cause`.
+  const cause = new Error("connect ECONNREFUSED");
+  cause.code = "ECONNREFUSED";
+  const msg = handleGmailError({ message: "request to ... failed", cause });
+  assert.match(msg, /Network error \(ECONNREFUSED\)/);
+  assert.doesNotMatch(msg, /Gmail API request failed/);
+});
+
 test("requireField returns present values and throws on null/undefined", () => {
   assert.equal(requireField("abc", "thread.id"), "abc");
   assert.equal(requireField(0, "n"), 0); // falsy-but-present must pass through
@@ -1283,4 +1303,66 @@ test("withRetry idempotent:false does NOT retry a transport timeout (#3)", async
     /ETIMEDOUT/
   );
   assert.equal(calls, 1); // transport errors are never retried for non-idempotent calls
+});
+
+// gaxios 7 (the generation bump from gaxios 6) changes transport-error shapes: a
+// per-request timeout now surfaces as a GaxiosError whose `cause` is an
+// AbortError (no `code`, no `type`), and a connection failure also carries its
+// system `code` on a FetchError `cause`. These exercise the rewritten detection.
+test("withRetry retries a gaxios-7 AbortError timeout for idempotent calls (#g7)", async () => {
+  let calls = 0;
+  const out = await withRetry(
+    async () => {
+      calls++;
+      if (calls < 2) {
+        const e = new Error("The operation was aborted.");
+        e.cause = new Error("aborted");
+        e.cause.name = "AbortError";
+        throw e;
+      }
+      return "ok";
+    },
+    { retries: 5, baseDelayMs: 1 }
+  );
+  assert.equal(out, "ok");
+  assert.equal(calls, 2); // the AbortError timeout was retried once
+});
+
+test("withRetry idempotent:false does NOT retry a gaxios-7 AbortError timeout (no duplicate send) (#g7)", async () => {
+  // The no-duplicate-send guarantee under gaxios 7: a send/draft timeout may have
+  // already been processed server-side, so it must surface immediately.
+  let calls = 0;
+  await assert.rejects(
+    withRetry(
+      async () => {
+        calls++;
+        const e = new Error("The operation was aborted.");
+        e.cause = new Error("aborted");
+        e.cause.name = "AbortError";
+        throw e;
+      },
+      { retries: 5, baseDelayMs: 1, idempotent: false }
+    ),
+    /aborted/i
+  );
+  assert.equal(calls, 1);
+});
+
+test("withRetry retries a gaxios-7 transport error whose code is on the FetchError cause (#g7)", async () => {
+  let calls = 0;
+  const out = await withRetry(
+    async () => {
+      calls++;
+      if (calls < 2) {
+        const e = new Error("request to ... failed, reason: connect ECONNRESET");
+        e.cause = new Error("connect ECONNRESET");
+        e.cause.code = "ECONNRESET"; // system code on the cause, not the top level
+        throw e;
+      }
+      return "ok";
+    },
+    { retries: 5, baseDelayMs: 1 }
+  );
+  assert.equal(out, "ok");
+  assert.equal(calls, 2);
 });
