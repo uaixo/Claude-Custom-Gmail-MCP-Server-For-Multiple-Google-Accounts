@@ -20,7 +20,6 @@ import readline from "readline";
 import { AddressInfo } from "net";
 import { URL } from "url";
 import { CodeChallengeMethod } from "google-auth-library";
-import { google } from "googleapis";
 import open from "open";
 import {
   accountCredentials,
@@ -271,10 +270,13 @@ async function addAccount(): Promise<void> {
     const { tokens } = await oAuth2Client.getToken({ code, codeVerifier });
     oAuth2Client.setCredentials(tokens);
 
-    // Identify which account just authorized.
-    const oauth2 = google.oauth2({ version: "v2", auth: oAuth2Client });
-    const me = await oauth2.userinfo.get();
-    const email = (me.data.email || "").toLowerCase();
+    // Identify which account just authorized. Call the userinfo endpoint
+    // directly through the authenticated client so we don't pull in the
+    // @googleapis/oauth2 package just for one field.
+    const { data } = await oAuth2Client.request<{ email?: string }>({
+      url: "https://www.googleapis.com/oauth2/v2/userinfo",
+    });
+    const email = (data.email || "").toLowerCase();
     if (!email) throw new Error("Could not determine the account email.");
 
     // Preserve an existing refresh token if Google didn't return a new one.

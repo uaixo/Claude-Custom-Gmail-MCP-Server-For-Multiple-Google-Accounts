@@ -4,19 +4,25 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { google } from "googleapis";
+import { createRequire } from "node:module";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { server } from "../src/index.js";
 
+// @googleapis/gmail is CommonJS; grab its mutable exports object so the before()
+// hook can swap the gmail() factory. Production imports the same named factory,
+// which esbuild/tsx compile to a call-time read of this object's `.gmail`, so
+// the swap below is what every tool call resolves.
+const gmailPkg = createRequire(import.meta.url)("@googleapis/gmail");
+
 // --------------------------------------------------------------------------
 // Handler integration tests (review item #4).
 //
 // These exercise the tool handlers end-to-end through a real in-memory MCP
-// client, with the Gmail API faked. gmailFor() reads google.gmail at call time,
-// so swapping that single factory on the shared googleapis singleton intercepts
-// every tool's Gmail access — no network, and no production-code seam. Each
+// client, with the Gmail API faked. gmailFor() reads gmailPkg.gmail at call
+// time, so swapping that single factory on the @googleapis/gmail exports object
+// intercepts every tool's Gmail access — no network, and no production seam. Each
 // fake records what it was called with, so we can assert the handler shaped the
 // request correctly (q/maxResults, threadId, requestBody, metadata format, ...)
 // and mapped the response into structuredContent.
@@ -92,8 +98,8 @@ before(async () => {
     })
   );
 
-  realGmail = google.gmail;
-  google.gmail = (opts) => {
+  realGmail = gmailPkg.gmail;
+  gmailPkg.gmail = (opts) => {
     if (!currentFake) throw new Error("no fake Gmail installed for this call");
     currentFake.lastAuth = opts.auth;
     return currentFake.client;
@@ -106,7 +112,7 @@ before(async () => {
 
 after(async () => {
   await client.close();
-  google.gmail = realGmail;
+  gmailPkg.gmail = realGmail;
   fs.rmSync(dataDir, { recursive: true, force: true });
   delete process.env.GMAIL_MCP_DATA_DIR;
 });
