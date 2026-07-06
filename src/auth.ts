@@ -168,9 +168,13 @@ const warnedInvalidEntryKeys = new Set<string>();
  *    an empty store so the server keeps running, but writers must not clobber it);
  *  - a readable file is migrated to the current shape and returned.
  */
-function readTokenStore(): { store: TokenStore; corrupt: boolean } {
+function readTokenStore(): {
+  store: TokenStore;
+  corrupt: boolean;
+  preserved: Record<string, unknown>;
+} {
   const file = tokensPath();
-  if (!fs.existsSync(file)) return { store: {}, corrupt: false };
+  if (!fs.existsSync(file)) return { store: {}, corrupt: false, preserved: {} };
   let raw: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf-8"));
@@ -195,10 +199,13 @@ function readTokenStore(): { store: TokenStore; corrupt: boolean } {
         }). Treating it as empty; connected accounts will be unavailable until it is repaired or re-created with \`npm run add-account\`.`
       );
     }
-    return { store: {}, corrupt: true };
+    return { store: {}, corrupt: true, preserved: {} };
   }
   const defaultRef = path.basename(credentialsPath());
   const store: TokenStore = {};
+  // Raw entries we couldn't interpret, kept by their ORIGINAL key so a
+  // subsequent write round-trips them unchanged instead of erasing them.
+  const preserved: Record<string, unknown> = {};
   for (const [email, value] of Object.entries(raw)) {
     // Normalize keys to the documented lower-case invariant. saveAccount always
     // writes lower-cased keys, but a hand-edited or externally written store
@@ -223,19 +230,24 @@ function readTokenStore(): { store: TokenStore; corrupt: boolean } {
         credentialsFile: defaultRef,
       };
     } else {
-      // Malformed entry (null, wrong-typed fields, ...). Skip it — wrapping it
-      // used to plant raw TypeErrors in every downstream consumer — and say so
-      // once, since silently dropping a listed account is confusing.
+      // Malformed entry (null, wrong-typed fields, ...). Skip it for READERS —
+      // wrapping it used to plant raw TypeErrors in every downstream consumer —
+      // but PRESERVE the raw value so a later write doesn't erase it: it may
+      // still hold a refresh token recoverable by hand (the same invariant the
+      // whole-file corrupt-store refusal protects). Warn once, since silently
+      // dropping a listed account from the usable set is confusing.
+      preserved[email] = value;
       if (!warnedInvalidEntryKeys.has(key)) {
         warnedInvalidEntryKeys.add(key);
         console.error(
-          `Warning: ignoring malformed token-store entry for '${email}' in ${file}. ` +
-            `Repair it by hand or re-run \`npm run add-account\` for that account.`
+          `Warning: ignoring malformed token-store entry for '${email}' in ${file} ` +
+            `(it will be kept on disk, not usable). Repair it by hand or re-run ` +
+            `\`npm run add-account\` for that account.`
         );
       }
     }
   }
-  return { store, corrupt: false };
+  return { store, corrupt: false, preserved };
 }
 
 export function loadTokens(): TokenStore {
@@ -254,9 +266,22 @@ function ensureDataDir(): string {
   return dir;
 }
 
-export function saveTokens(store: TokenStore): void {
+export function saveTokens(
+  store: TokenStore,
+  preserved: Record<string, unknown> = {}
+): void {
   const dir = ensureDataDir();
   const file = tokensPath();
+  // Merge any preserved (malformed-on-read) entries back in, keyed as they were
+  // on disk, so an unrelated write never erases a hand-recoverable token. A
+  // preserved entry is dropped only when the same account (case-insensitively)
+  // now exists as a real store entry — i.e. it was repaired or re-added, so the
+  // stale malformed copy should not linger.
+  const merged: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(preserved)) {
+    if (!(k.toLowerCase() in store)) merged[k] = v;
+  }
+  Object.assign(merged, store);
   // Write to a temp file in the same directory, then atomically rename over the
   // target. This prevents a concurrent reader (or a crash mid-write) from ever
   // seeing a partial/corrupt token store. fsync the temp's contents before the
@@ -266,7 +291,7 @@ export function saveTokens(store: TokenStore): void {
   const tmp = path.join(dir, `.tokens.${process.pid}.${Date.now()}.tmp`);
   const fd = fs.openSync(tmp, "w", 0o600);
   try {
-    fs.writeFileSync(fd, JSON.stringify(store, null, 2));
+    fs.writeFileSync(fd, JSON.stringify(merged, null, 2));
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
@@ -399,7 +424,7 @@ async function withTokenLock<T>(fn: () => T): Promise<T> {
 /** Atomically (under the token lock) load the store, mutate it, and save it. */
 async function updateTokens(mutate: (store: TokenStore) => void): Promise<void> {
   await withTokenLock(() => {
-    const { store, corrupt } = readTokenStore();
+    const { store, corrupt, preserved } = readTokenStore();
     if (corrupt) {
       // The file exists but couldn't be parsed. Proceeding would persist the
       // empty fallback (mutated) OVER it, permanently destroying the refresh
@@ -414,7 +439,7 @@ async function updateTokens(mutate: (store: TokenStore) => void): Promise<void> 
       );
     }
     mutate(store);
-    saveTokens(store);
+    saveTokens(store, preserved);
   });
 }
 
