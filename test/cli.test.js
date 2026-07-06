@@ -1,17 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 
 import {
   listenWithFallback,
   escapeHtml,
   validateCallback,
+  withPreservedRefreshToken,
 } from "../src/add-account.js";
 import {
   oauthRedirectUri,
   OAUTH_REDIRECT_PORT,
   attachmentDirs,
+  credentialsFiles,
   gmailRequestTimeoutMs,
   GMAIL_REQUEST_TIMEOUT_MS,
 } from "../src/constants.js";
@@ -100,16 +104,28 @@ test("attachmentDirs is empty when unset and splits the env var on the path deli
 // --------------------------------------------------------------------------
 test("listenWithFallback binds the preferred port when it is free", async () => {
   // Use a port we just confirmed free, rather than assuming 4773 is available.
-  const free = await aFreePort();
-  const s = http.createServer();
-  try {
+  // There is an inherent race between releasing the probe port and re-binding
+  // it (another process can grab it in between, on which listenWithFallback
+  // correctly falls back) — retry with a fresh port a few times so that
+  // infrastructure race can't fail the build spuriously.
+  let bound = null;
+  for (let attempt = 0; attempt < 3 && bound === null; attempt++) {
+    const free = await aFreePort();
+    const s = http.createServer();
     const port = await listenWithFallback(s, free);
-    assert.equal(port, free);
-    assert.equal(s.listening, true);
+    if (port === free) {
+      bound = { s, port };
+    } else {
+      await close(s); // someone stole the probe port; try a fresh one
+    }
+  }
+  assert.ok(bound, "could not bind a just-freed port in 3 attempts");
+  try {
+    assert.equal(bound.s.listening, true);
     // Must bind to loopback, not all interfaces, so it isn't LAN-reachable.
-    assert.equal(s.address().address, "127.0.0.1");
+    assert.equal(bound.s.address().address, "127.0.0.1");
   } finally {
-    await close(s);
+    await close(bound.s);
   }
 });
 
@@ -154,4 +170,69 @@ test("gmailRequestTimeoutMs defaults, honors a valid override, and falls back on
     if (prev === undefined) delete process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS;
     else process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS = prev;
   }
+});
+
+// --------------------------------------------------------------------------
+// credentialsFiles discovery (low) + refresh-token preservation (low)
+// --------------------------------------------------------------------------
+test("credentialsFiles discovers credentials*.json sorted, falls back to client_secret*, honors the env override (low)", () => {
+  const prevDir = process.env.GMAIL_MCP_DATA_DIR;
+  const prevCred = process.env.GMAIL_OAUTH_CREDENTIALS;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-creds-"));
+  try {
+    process.env.GMAIL_MCP_DATA_DIR = dir;
+    delete process.env.GMAIL_OAUTH_CREDENTIALS;
+
+    // Empty dir → nothing discovered.
+    assert.deepEqual(credentialsFiles(), []);
+
+    // Only Google's default download name present → the fallback finds it.
+    fs.writeFileSync(path.join(dir, "client_secret_123.json"), "{}");
+    assert.deepEqual(credentialsFiles(), [path.join(dir, "client_secret_123.json")]);
+
+    // Renamed files present → they win, sorted by name, and the client_secret
+    // fallback must NOT double-list the same client alongside them.
+    fs.writeFileSync(path.join(dir, "credentials2.json"), "{}");
+    fs.writeFileSync(path.join(dir, "credentials.json"), "{}");
+    assert.deepEqual(credentialsFiles(), [
+      path.join(dir, "credentials.json"),
+      path.join(dir, "credentials2.json"),
+    ]);
+
+    // Env override forces a single file and disables discovery entirely.
+    process.env.GMAIL_OAUTH_CREDENTIALS = "/somewhere/else.json";
+    assert.deepEqual(credentialsFiles(), ["/somewhere/else.json"]);
+  } finally {
+    if (prevDir === undefined) delete process.env.GMAIL_MCP_DATA_DIR;
+    else process.env.GMAIL_MCP_DATA_DIR = prevDir;
+    if (prevCred === undefined) delete process.env.GMAIL_OAUTH_CREDENTIALS;
+    else process.env.GMAIL_OAUTH_CREDENTIALS = prevCred;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("withPreservedRefreshToken keeps the stored refresh token on re-consent and is null-safe (low)", () => {
+  const existing = {
+    tokens: { access_token: "old-at", refresh_token: "RT_KEEP" },
+    credentialsFile: "credentials.json",
+  };
+  // Re-consent without a new refresh token → the stored one is preserved.
+  assert.deepEqual(
+    withPreservedRefreshToken({ access_token: "new-at" }, existing),
+    { access_token: "new-at", refresh_token: "RT_KEEP" }
+  );
+  // A fresh refresh token from Google wins.
+  assert.deepEqual(
+    withPreservedRefreshToken({ access_token: "new-at", refresh_token: "RT_NEW" }, existing),
+    { access_token: "new-at", refresh_token: "RT_NEW" }
+  );
+  // No prior account → tokens pass through.
+  assert.deepEqual(withPreservedRefreshToken({ access_token: "a" }, undefined), {
+    access_token: "a",
+  });
+  // A malformed stored entry (tokens: null, from a hand-edit) must not throw —
+  // this crash previously hit AFTER the user completed browser consent.
+  assert.doesNotThrow(() =>
+    withPreservedRefreshToken({ access_token: "a" }, { tokens: null, credentialsFile: "x" })
+  );
 });

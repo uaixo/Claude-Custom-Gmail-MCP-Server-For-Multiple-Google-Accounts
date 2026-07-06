@@ -1821,3 +1821,53 @@ test("retry:false keeps the real Gmail client at one HTTP request per withRetry 
     await new Promise((r) => server.close(r));
   }
 });
+
+test("getThreadReplyHeaders anchors the reply to the last DELIVERED message, skipping drafts (low)", async () => {
+  // threads.get returns unsent drafts inline (DRAFT label). A reply must not
+  // reference a draft's Message-ID — it was never delivered, so recipients'
+  // clients can't thread on it. This is this server's own create_draft(thread)
+  // → send_message(thread) flow.
+  const gmail = mockGmailThread([
+    {
+      labelIds: ["INBOX"],
+      payload: {
+        headers: [
+          { name: "Subject", value: "Topic" },
+          { name: "Message-ID", value: "<real-1@x>" },
+        ],
+      },
+    },
+    {
+      labelIds: ["INBOX"],
+      payload: {
+        headers: [
+          { name: "Message-ID", value: "<real-2@x>" },
+          { name: "References", value: "<real-1@x>" },
+        ],
+      },
+    },
+    {
+      labelIds: ["DRAFT"],
+      payload: {
+        headers: [
+          { name: "Message-ID", value: "<draft@x>" },
+          { name: "References", value: "<real-1@x> <real-2@x>" },
+        ],
+      },
+    },
+  ]);
+  const reply = await getThreadReplyHeaders(gmail, "t");
+  assert.equal(reply.inReplyTo, "<real-2@x>", "must anchor to the last delivered message");
+  assert.equal(reply.references, "<real-1@x> <real-2@x>");
+  assert.doesNotMatch(reply.references, /draft@x/);
+  assert.equal(reply.subject, "Topic");
+
+  // A thread of only drafts yields nothing to thread on (empty headers),
+  // rather than a reference to an undelivered id.
+  const allDrafts = mockGmailThread([
+    { labelIds: ["DRAFT"], payload: { headers: [{ name: "Message-ID", value: "<d@x>" }] } },
+  ]);
+  const none = await getThreadReplyHeaders(allDrafts, "t2");
+  assert.equal(none.inReplyTo, "");
+  assert.equal(none.references, "");
+});

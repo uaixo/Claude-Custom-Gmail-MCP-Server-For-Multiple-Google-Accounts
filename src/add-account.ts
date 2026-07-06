@@ -19,7 +19,8 @@ import http from "http";
 import readline from "readline";
 import { AddressInfo } from "net";
 import { URL } from "url";
-import { CodeChallengeMethod } from "google-auth-library";
+import { CodeChallengeMethod, Credentials } from "google-auth-library";
+import type { StoredAccount } from "./auth.js";
 import open from "open";
 import {
   accountCredentials,
@@ -41,6 +42,24 @@ import {
 
 /** Minutes to wait for the user to complete Google consent before giving up. */
 const CONSENT_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * On re-consent Google often returns no refresh token (one was already issued
+ * for this client+account); keep the stored one so the account stays usable.
+ * Null-safe against a malformed stored entry (`tokens: null` from a hand-edit):
+ * before this was optional-chained, add-account crashed HERE — after the user
+ * had already completed the whole browser consent flow — and the bad entry
+ * could never be repaired by re-running it. Exported for tests.
+ */
+export function withPreservedRefreshToken(
+  tokens: Credentials,
+  existing?: StoredAccount
+): Credentials {
+  if (!tokens.refresh_token && existing?.tokens?.refresh_token) {
+    return { ...tokens, refresh_token: existing.tokens.refresh_token };
+  }
+  return tokens;
+}
 
 /** Escape text for safe interpolation into the loopback callback HTML. */
 export function escapeHtml(s: string): string {
@@ -280,12 +299,9 @@ async function addAccount(): Promise<void> {
     if (!email) throw new Error("Could not determine the account email.");
 
     // Preserve an existing refresh token if Google didn't return a new one.
-    const existing = loadTokens()[email];
-    if (existing?.tokens.refresh_token && !tokens.refresh_token) {
-      tokens.refresh_token = existing.tokens.refresh_token;
-    }
+    const merged = withPreservedRefreshToken(tokens, loadTokens()[email]);
 
-    await saveAccount(email, tokens, credentialsRefFor(credFile));
+    await saveAccount(email, merged, credentialsRefFor(credFile));
     console.log(`\nConnected: ${email}  [${credentialsRefFor(credFile)}]`);
     printAccounts();
   } finally {

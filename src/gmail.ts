@@ -155,10 +155,20 @@ export async function getThreadReplyHeaders(
     metadataHeaders: ["Message-ID", "References", "Subject"],
   });
   const messages = res.data.messages || [];
-  const last = messages[messages.length - 1];
+  // threads.get returns unsent DRAFTs inline in messages[] (they carry the
+  // DRAFT label — present in metadata format). Anchor the reply to the last
+  // DELIVERED message: a draft's Message-ID was never delivered to anyone (and
+  // may be regenerated on send), so recipients' clients can't resolve an
+  // In-Reply-To that names it and display the reply unthreaded. This matters
+  // for this server's own flows: create_draft(thread_id) followed by
+  // send_message(thread_id) would otherwise anchor to the fresh draft.
+  const delivered = messages.filter(
+    (m) => !(m.labelIds || []).includes("DRAFT")
+  );
+  const last = delivered[delivered.length - 1];
   const messageId = header(last?.payload, "Message-ID");
   const priorReferences = header(last?.payload, "References");
-  const subject = header(messages[0]?.payload, "Subject");
+  const subject = header((delivered[0] ?? messages[0])?.payload, "Subject");
   const references = [priorReferences, messageId].filter(Boolean).join(" ");
   return { inReplyTo: messageId, references, subject };
 }
@@ -572,16 +582,18 @@ export function resolveAttachments(
       }
       // Resolve symlinks and "../" before checking containment so the file
       // can't escape the allowed directories.
+      const isWithinAllowed = (p: string): boolean =>
+        allowedDirs.some((dir) => {
+          let realDir: string;
+          try {
+            realDir = fs.realpathSync(dir);
+          } catch {
+            return false; // configured dir doesn't exist; can't contain the file
+          }
+          return p === realDir || p.startsWith(realDir + path.sep);
+        });
       const resolved = fs.realpathSync(filePath);
-      const allowed = allowedDirs.some((dir) => {
-        let realDir: string;
-        try {
-          realDir = fs.realpathSync(dir);
-        } catch {
-          return false; // configured dir doesn't exist; it can't contain the file
-        }
-        return resolved === realDir || resolved.startsWith(realDir + path.sep);
-      });
+      const allowed = isWithinAllowed(resolved);
       if (!allowed) {
         throw new Error(
           `Attachment ${i}: '${filePath}' is outside the allowed attachment ` +
@@ -609,8 +621,33 @@ export function resolveAttachments(
         // Only read regular files: a directory, FIFO, socket, or device inside
         // an allowed dir is not a valid attachment (and reading a FIFO could
         // block the server indefinitely). fstat sees the opened inode.
-        if (!fs.fstatSync(fd).isFile()) {
+        const opened = fs.fstatSync(fd);
+        if (!opened.isFile()) {
           throw new Error(`Attachment ${i}: '${filePath}' is not a regular file.`);
+        }
+        // O_NOFOLLOW guards only the FINAL path component; a racer swapping an
+        // INTERMEDIATE directory for a symlink between realpathSync and openSync
+        // could still have redirected the open outside the allowlist. Close that
+        // window by requiring, after the open, that the path still resolves
+        // inside the allowlist AND names the very inode this fd has open: a
+        // racer can keep the path in-allowlist or keep the fd's inode, but not
+        // both. Defense-in-depth — the earlier checks already block everything
+        // that isn't an actively racing local process.
+        let verified = false;
+        try {
+          const recheck = fs.realpathSync(filePath);
+          const now = fs.statSync(recheck);
+          verified =
+            isWithinAllowed(recheck) &&
+            now.dev === opened.dev &&
+            now.ino === opened.ino;
+        } catch {
+          verified = false; // path vanished/changed under us — refuse
+        }
+        if (!verified) {
+          throw new Error(
+            `Attachment ${i}: '${filePath}' changed on disk while being read; refusing.`
+          );
         }
         const filename = a.filename || path.basename(filePath);
         const mimeType = a.mime_type || inferMimeType(filename);
