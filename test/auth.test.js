@@ -41,7 +41,11 @@ test("saveAccount/loadTokens roundtrip, atomic write, 0600 perms, no temp leftov
   assert.deepEqual(leftover, []);
 });
 
-test("getAuthedClient caches one client per account with a single tokens listener", () => {
+// Each test provisions the accounts it relies on itself (idempotent saves), so
+// running any single test in isolation — `--test-name-pattern`, sharding, a
+// future concurrent runner — behaves identically to the full-file run.
+test("getAuthedClient caches one client per account with a single tokens listener", async () => {
+  await auth.saveAccount("a@b.com", { access_token: "x", refresh_token: "y" }, "credentials.json");
   const c1 = auth.getAuthedClient("a@b.com");
   const c2 = auth.getAuthedClient("A@B.com"); // case-insensitive key
   assert.equal(c1, c2);
@@ -49,11 +53,13 @@ test("getAuthedClient caches one client per account with a single tokens listene
 });
 
 test("different accounts get different cached clients", async () => {
+  await auth.saveAccount("a@b.com", { access_token: "x", refresh_token: "y" }, "credentials.json");
   await auth.saveAccount("c@d.com", { access_token: "z", refresh_token: "w" }, "credentials.json");
   assert.notEqual(auth.getAuthedClient("c@d.com"), auth.getAuthedClient("a@b.com"));
 });
 
 test("removeAccount evicts the cached client and the stored tokens", async () => {
+  await auth.saveAccount("a@b.com", { access_token: "x", refresh_token: "y" }, "credentials.json");
   const before = auth.getAuthedClient("a@b.com");
   assert.equal(await auth.removeAccount("a@b.com"), true);
   assert.ok(!auth.listAccounts().includes("a@b.com"));
@@ -63,8 +69,12 @@ test("removeAccount evicts the cached client and the stored tokens", async () =>
 });
 
 test("resolveAccount disambiguates by count and validates explicit requests", async () => {
-  // Leave exactly one account connected (c@d.com) for a deterministic check.
-  await auth.removeAccount("a@b.com");
+  // Leave exactly one account connected (c@d.com) for a deterministic check,
+  // regardless of what other tests (if any) ran before this one.
+  await auth.saveAccount("c@d.com", { access_token: "z", refresh_token: "w" }, "credentials.json");
+  for (const account of auth.listAccounts()) {
+    if (account !== "c@d.com") await auth.removeAccount(account);
+  }
   assert.equal(auth.listAccounts().length, 1);
   assert.equal(auth.resolveAccount(), "c@d.com");
   assert.equal(auth.resolveAccount("C@D.com"), "c@d.com");
@@ -357,4 +367,124 @@ test("withTokenLock fails instead of writing unlocked when the lock is held (#B3
     else process.env.GMAIL_MCP_LOCK_TIMEOUT_MS = prev;
     fs.rmSync(lock, { force: true });
   }
+});
+
+// --------------------------------------------------------------------------
+// Review cleanup: remaining lows and notes
+// --------------------------------------------------------------------------
+test("the tokens listener persists a snapshot taken at emit time, not the later-mutated object (low)", async () => {
+  // google-auth-library mutates the emitted object AFTER emitting (it stamps
+  // the old refresh token back on). If the persist is delayed by lock
+  // contention, merging the live object would revert a rotation. Hold the lock
+  // during the emit, mutate the object post-emit, then release and check what
+  // actually got persisted.
+  const key = "snap@x.com";
+  await auth.saveAccount(key, { access_token: "A0", refresh_token: "RT_old" }, "credentials.json");
+  auth.getAuthedClient(key); // installs the persistence listener
+  const client = auth.getAuthedClient(key);
+
+  const lock = path.join(dataDir, "tokens.json.lock");
+  fs.writeFileSync(lock, `${process.pid}`); // fresh lock → persist must wait
+  try {
+    const emitted = { access_token: "A_new", refresh_token: "R_new" };
+    client.emit("tokens", emitted);
+    // Simulate the library's post-emit mutation of the same object.
+    emitted.refresh_token = "R_stale_mutation";
+    emitted.access_token = "A_stale_mutation";
+    await new Promise((r) => setTimeout(r, 80)); // listener now parked on the lock
+  } finally {
+    fs.rmSync(lock, { force: true });
+  }
+  // Poll until the delayed persist lands (lock backoff is 25-50ms per retry).
+  let persisted;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    persisted = auth.loadTokens()[key]?.tokens;
+    if (persisted?.refresh_token !== "RT_old") break;
+  }
+  assert.equal(persisted?.refresh_token, "R_new", "must persist the value as of emit time");
+  assert.equal(persisted?.access_token, "A_new");
+  await auth.removeAccount(key);
+});
+
+test("loadTokens lowercases store keys so resolveAccount and getAuthedClient agree (low)", async () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
+  try {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        "Alice@Gmail.com": {
+          tokens: { access_token: "a", refresh_token: "r" },
+          credentialsFile: "credentials.json",
+        },
+      })
+    );
+    const store = auth.loadTokens();
+    assert.deepEqual(Object.keys(store), ["alice@gmail.com"]);
+    // Previously: resolveAccount listed the account yet claimed it wasn't
+    // connected, and the single-account path handed getAuthedClient a key it
+    // couldn't find. Both consumers must now work.
+    assert.equal(auth.resolveAccount("ALICE@gmail.com", store), "alice@gmail.com");
+    assert.equal(auth.resolveAccount(undefined, store), "alice@gmail.com");
+    assert.ok(auth.getAuthedClient("alice@gmail.com", store));
+  } finally {
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
+  }
+});
+
+test("loadTokens skips malformed entries instead of planting TypeErrors (low)", async () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
+  try {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        "null-entry@x.com": null,
+        "null-tokens@x.com": { tokens: null, credentialsFile: "credentials.json" },
+        "bad-credfile@x.com": { tokens: { access_token: "a" }, credentialsFile: 42 },
+        "ok@x.com": {
+          tokens: { access_token: "a", refresh_token: "r" },
+          credentialsFile: "credentials.json",
+        },
+      })
+    );
+    let store;
+    assert.doesNotThrow(() => {
+      store = auth.loadTokens();
+    });
+    // Only the well-formed entry survives; the rest are skipped (with a
+    // one-time stderr warning), not wrapped into crash-later shapes.
+    assert.deepEqual(Object.keys(store), ["ok@x.com"]);
+    assert.ok(auth.getAuthedClient("ok@x.com", store));
+  } finally {
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
+  }
+});
+
+test("loadTokens migrates a legacy raw-Credentials entry to the current shape (low)", () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
+  try {
+    // Pre-per-account-credential stores mapped email -> raw Credentials.
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ "legacy@x.com": { access_token: "la", refresh_token: "lr" } })
+    );
+    const store = auth.loadTokens();
+    assert.deepEqual(store["legacy@x.com"], {
+      tokens: { access_token: "la", refresh_token: "lr" },
+      credentialsFile: "credentials.json",
+    });
+  } finally {
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
+  }
+});
+
+test("newOAuthClient enables forceRefreshOnFailure so a server-side-invalidated token self-heals (note)", () => {
+  const client = auth.newOAuthClient(path.join(dataDir, "credentials.json"));
+  assert.equal(client.forceRefreshOnFailure, true);
 });

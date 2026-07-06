@@ -31,7 +31,7 @@ Every tool except `gmail_list_accounts` accepts `account: "you@gmail.com"`. If o
   - `path` — a local file the server reads from disk (filename and MIME type inferred if omitted). **Disabled by default**: reading by `path` only works when you set `GMAIL_MCP_ATTACHMENTS_DIR` to one or more allowed directories, and the file must resolve to within one of them (symlinks and `../` are resolved before the check). This prevents the server from being coerced into emailing arbitrary local files such as SSH keys or `.env`.
   - `content_base64` — inline standard-base64 content (`filename` required; MIME type inferred from it if omitted).
 
-  Optional `mime_type` overrides the inferred type on either form. With attachments, the message is assembled as `multipart/mixed`. Non-ASCII subjects and filenames are RFC 2047-encoded.
+  Optional `mime_type` overrides the inferred type on either form. With attachments, the message is assembled as `multipart/mixed`. Non-ASCII subjects are RFC 2047-encoded; non-ASCII (or very long) filenames use RFC 2231 extended parameters (`filename*=UTF-8''…`, with continuation segments when long) — encoded-words are not legal inside MIME parameters.
 
 ## One-time setup
 

@@ -151,6 +151,7 @@ mapping companion).
 | C6 | List organisation labels | `list_labels` | No (read) |
 | C7 | Create a label | `create_label` | No (additive write) |
 | C8 | Organise mail (add/remove labels, read-state, archive) | `organize_mail` | **Yes** |
+| C9 | Read a single message by ID (fallback when a conversation exceeds the C3 size caps) | `read_message` | No (read) |
 
 Plus an **out-of-band account-management CLI** (connect / list / remove accounts) — §8.
 
@@ -409,7 +410,7 @@ A provider implementation is **spec-complete** when:
 1. **Multi-account.** With ≥2 accounts connected, each tool operates on the selector-named
    account; omitting the selector with several connected returns the disambiguation error;
    with one connected it defaults correctly. *(FR-ID-1..3)*
-2. **Capabilities.** C1–C8 each satisfy their FRs, verified against a real provider sandbox
+2. **Capabilities.** C1–C9 each satisfy their FRs, verified against a real provider sandbox
    account. *(§6)*
 3. **Onboarding.** The connect CLI completes a PKCE + `state` loopback consent, stores a
    refresh token, identifies the account, and survives a re-consent without server restart.

@@ -54,13 +54,20 @@ interface OAuthClientConfig {
   redirect_uris?: string[];
 }
 
-/** Type guard for the current on-disk account shape. */
+/**
+ * Type guard for the current on-disk account shape. Checks field TYPES, not
+ * just key presence: an entry like `{ tokens: null }` (a hand-edit, e.g. to
+ * "disable" an account) previously passed a key-presence check and then threw
+ * raw TypeErrors deep in getAuthedClient — and crashed add-account AFTER the
+ * user completed browser consent, making the bad entry unrepairable.
+ */
 function isStoredAccount(value: unknown): value is StoredAccount {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as { tokens?: unknown; credentialsFile?: unknown };
   return (
-    typeof value === "object" &&
-    value !== null &&
-    "tokens" in value &&
-    "credentialsFile" in value
+    typeof v.tokens === "object" &&
+    v.tokens !== null &&
+    typeof v.credentialsFile === "string"
   );
 }
 
@@ -112,6 +119,13 @@ export function newOAuthClient(
     clientSecret: cfg.client_secret,
     redirectUri,
     transporterOptions: { timeout: gmailRequestTimeoutMs() },
+    // When credentials carry an expiry_date (ours always do), the library only
+    // refresh-and-retries a 401/403 response if this is set. Without it, an
+    // access token invalidated server-side BEFORE its local expiry (Workspace
+    // session policies, security events) makes every call fail with re-auth
+    // instructions for up to ~55 minutes although one refresh — performed at
+    // most once per request — would fix it.
+    forceRefreshOnFailure: true,
   });
 }
 
@@ -137,6 +151,9 @@ export function credentialsRefFor(file: string): string {
  * successful parse) rather than spamming the log on every read.
  */
 let warnedCorruptTokenStore = false;
+
+/** Malformed store entries we've already warned about this process (per key). */
+const warnedInvalidEntryKeys = new Set<string>();
 
 /**
  * Load the token store, migrating any legacy entries (raw Credentials written
@@ -183,14 +200,39 @@ function readTokenStore(): { store: TokenStore; corrupt: boolean } {
   const defaultRef = path.basename(credentialsPath());
   const store: TokenStore = {};
   for (const [email, value] of Object.entries(raw)) {
+    // Normalize keys to the documented lower-case invariant. saveAccount always
+    // writes lower-cased keys, but a hand-edited or externally written store
+    // may not — and without normalizing, resolveAccount (raw keys) and
+    // getAuthedClient (lowercased lookup) disagree, making the account listed
+    // yet unusable with contradictory errors.
+    const key = email.toLowerCase();
     if (isStoredAccount(value)) {
-      store[email] = value;
-    } else {
-      // Legacy: the value is a raw Credentials object.
-      store[email] = {
-        tokens: value as Credentials,
+      store[key] = value;
+    } else if (
+      typeof value === "object" &&
+      value !== null &&
+      !("tokens" in value) &&
+      !("credentialsFile" in value)
+    ) {
+      // Legacy: the value is a raw Credentials object (pre-per-account
+      // credential files). Only a plain object WITHOUT the current shape's
+      // keys qualifies — an object that has them but with wrong types is a
+      // malformed current-shape entry, not legacy data.
+      store[key] = {
+        tokens: value,
         credentialsFile: defaultRef,
       };
+    } else {
+      // Malformed entry (null, wrong-typed fields, ...). Skip it — wrapping it
+      // used to plant raw TypeErrors in every downstream consumer — and say so
+      // once, since silently dropping a listed account is confusing.
+      if (!warnedInvalidEntryKeys.has(key)) {
+        warnedInvalidEntryKeys.add(key);
+        console.error(
+          `Warning: ignoring malformed token-store entry for '${email}' in ${file}. ` +
+            `Repair it by hand or re-run \`npm run add-account\` for that account.`
+        );
+      }
     }
   }
   return { store, corrupt: false };
@@ -309,13 +351,25 @@ async function withTokenLock<T>(fn: () => T): Promise<T> {
       try {
         // Steal a lock left behind by a crashed holder. Operations under the
         // lock are sub-millisecond, so a lock older than LOCK_STALE_MS is
-        // almost certainly abandoned rather than a live, slow holder.
+        // almost certainly abandoned rather than a live, slow holder. Steal by
+        // ATOMIC RENAME, not unlink: exactly one contender wins the rename, so
+        // a second stealer delayed between its staleness check and its removal
+        // can never delete a fresh lock that the winner (or anyone else) has
+        // since created — the stat-then-unlink form raced exactly that way and
+        // let two writers into the critical section. The graveyard name matches
+        // the `.tokens.*.tmp` pattern so a crash between rename and rm leaves a
+        // file the existing temp sweep cleans up.
         if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
-          fs.rmSync(lockPath, { force: true });
+          const graveyard = path.join(
+            path.dirname(lockPath),
+            `.tokens.lock-stale.${process.pid}.${Date.now()}.tmp`
+          );
+          fs.renameSync(lockPath, graveyard);
+          fs.rmSync(graveyard, { force: true });
           continue;
         }
       } catch {
-        continue; // lock vanished between stat and remove → retry immediately
+        continue; // lock vanished (or another stealer won the rename) → retry
       }
       // Jittered backoff so the server and a concurrent add-account don't retry
       // in lock-step and keep colliding on the same slot.
@@ -395,7 +449,15 @@ export function cleanupStaleTokenTemps(maxAgeMs = 60_000): void {
   const lockPath = `${tokensPath()}.lock`;
   try {
     if (now - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
-      fs.rmSync(lockPath, { force: true });
+      // Same rename-first stealing as withTokenLock, for the same reason: this
+      // sweep must never unlink a lock that a live contender re-created between
+      // our staleness check and our removal.
+      const graveyard = path.join(
+        dir,
+        `.tokens.lock-stale.${process.pid}.${now}.tmp`
+      );
+      fs.renameSync(lockPath, graveyard);
+      fs.rmSync(graveyard, { force: true });
     }
   } catch {
     /* no lock present, or it vanished under us — nothing to clean up */
@@ -504,6 +566,12 @@ export function getAuthedClient(account: string, store?: TokenStore): OAuth2Clie
   // so a concurrent writer's update isn't lost. Fire-and-forget: the library
   // doesn't await listeners, and persistence is best-effort.
   client.on("tokens", (fresh) => {
+    // Snapshot the emitted object SYNCHRONOUSLY: google-auth-library mutates it
+    // after emitting (getRequestMetadataAsync stamps the OLD refresh token back
+    // onto it), and the persist below can run delayed when the token lock is
+    // contended — merging the by-then-mutated object would silently revert a
+    // concurrent re-consent's new refresh token to the old one.
+    const snapshot = { ...fresh };
     // Only the client that is still the cached one for this account may persist.
     // If this client has been superseded (an out-of-process re-consent rebuilt
     // it) or evicted (removeAccount), a late token refresh from it must not
@@ -515,10 +583,10 @@ export function getAuthedClient(account: string, store?: TokenStore): OAuth2Clie
     // read the new token off disk, see it differ from the cached signature, and
     // mistake our own rotation for an out-of-process re-consent — needlessly
     // rebuilding a perfectly good client.
-    if (fresh.refresh_token) cached.refreshToken = fresh.refresh_token;
+    if (snapshot.refresh_token) cached.refreshToken = snapshot.refresh_token;
     void updateTokens((store) => {
       const cur = store[key];
-      if (cur) cur.tokens = { ...cur.tokens, ...fresh };
+      if (cur) cur.tokens = { ...cur.tokens, ...snapshot };
     }).catch(() => {
       /* best-effort persistence; ignore write failures */
     });

@@ -60,6 +60,7 @@
 | C6 | `list_labels` | `users.labels.list` (system + user labels) | combine `GET /me/outlook/masterCategories` (tags) **and** `GET /me/mailFolders` (locations) |
 | C7 | `create_label` | `users.labels.create` (supports `/` nesting) | `POST …/masterCategories` (a tag with a colour preset, no nesting) **or** `POST /me/mailFolders` (a folder; nesting = child folders) — choose by intent |
 | C8 | `organize_mail` | `users.threads.modify` / `users.messages.modify` with `addLabelIds` / `removeLabelIds` | **fans out** — see §3.1 |
+| C9 | `read_message` | `users.messages.get` (`format=full`); same body extraction and size budget as C3 | `GET /me/messages/{id}`; use `body`/`uniqueBody`, prefer `text` content type or convert HTML |
 
 ### 3.1 C8 organise — the fan-out detail  *(spec FR-C8-3, FR-C8-6)*
 
