@@ -1213,6 +1213,64 @@ const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const RATE_LIMIT_ONLY = new Set([429]);
 
 /**
+ * Gmail's usage-limit errors that arrive as HTTP 403 (usageLimits domain)
+ * rather than 429. Google's error guide says to retry these with exponential
+ * backoff; like a 429, the request was rejected before processing, so they are
+ * safe to retry even for non-idempotent calls (send/draft). Distinguished from
+ * a true permission 403 by the structured `reason` field.
+ */
+const RATE_LIMIT_403_REASONS = new Set([
+  "userRateLimitExceeded",
+  "rateLimitExceeded",
+  "dailyLimitExceeded",
+]);
+
+/**
+ * Extract the structured `reason` of the first error item from a Gmail API
+ * error body (error.response.data.error.errors[0].reason, with the top-level
+ * errors array as a fallback shape). This is the documented discriminator
+ * between e.g. a rate-limit 403 and a missing-scope 403.
+ */
+function gmailErrorReason(error: unknown): string | undefined {
+  const e = error as {
+    errors?: Array<{ reason?: string }>;
+    response?: {
+      data?: { error?: { errors?: Array<{ reason?: string }> } | string };
+    };
+  };
+  const errField = e?.response?.data?.error;
+  if (typeof errField === "object" && errField !== null) {
+    const reason = errField.errors?.[0]?.reason;
+    if (reason) return reason;
+  }
+  return e?.errors?.[0]?.reason;
+}
+
+/** True when an error is a Gmail usage-limit 403 (retryable rate limit). */
+function isRateLimit403(error: unknown): boolean {
+  if (httpStatusOf(error) !== 403) return false;
+  const reason = gmailErrorReason(error);
+  return reason !== undefined && RATE_LIMIT_403_REASONS.has(reason);
+}
+
+/**
+ * True when an error is the OAuth token endpoint rejecting the saved grant
+ * (HTTP 400 `invalid_grant`): the refresh token was revoked, expired (e.g. the
+ * 7-day expiry on a Testing-status OAuth client), or invalidated by a password
+ * change. The token endpoint uses the OAuth error shape — `data.error` is the
+ * STRING "invalid_grant" (with optional `data.error_description`) — not the
+ * Gmail API's structured error object.
+ */
+function isInvalidGrant(error: unknown): boolean {
+  if (httpStatusOf(error) !== 400) return false;
+  const e = error as { message?: string; response?: { data?: { error?: unknown } } };
+  return (
+    e?.response?.data?.error === "invalid_grant" ||
+    /invalid_grant/.test(e?.message ?? "")
+  );
+}
+
+/**
  * Transient transport-level failures (no HTTP status) safe to retry for
  * *idempotent* calls: connection resets/refusals/timeouts where the request
  * never reached a definite outcome. Matched by Node's system-error `code`, which
@@ -1289,12 +1347,15 @@ export async function withRetry<T>(
       return await fn();
     } catch (error) {
       const status = httpStatusOf(error);
-      // Retry an HTTP status in the retryable set, or — for idempotent calls
-      // only — a transient transport error (timeout/reset) that carries no
-      // status. A non-idempotent call never retries a transport error: the
-      // request may have been processed, so a retry could duplicate it.
+      // Retry an HTTP status in the retryable set; a usage-limit 403 (Gmail's
+      // alternate rate-limit shape — like a 429, rejected before processing,
+      // so safe even for send/draft); or — for idempotent calls only — a
+      // transient transport error (timeout/reset) that carries no status. A
+      // non-idempotent call never retries a transport error: the request may
+      // have been processed, so a retry could duplicate it.
       const retryableNow =
         (status !== undefined && retryable.has(status)) ||
+        isRateLimit403(error) ||
         (idempotent && isRetryableTransport(error));
       if (attempt >= retries || !retryableNow) {
         throw error;
@@ -1330,10 +1391,36 @@ export function handleGmailError(error: unknown): string {
     e?.message ||
     String(error);
   switch (status) {
+    case 400: {
+      // The OAuth token endpoint rejecting the saved grant (revoked, expired —
+      // e.g. the 7-day expiry on a Testing-status client — or password change)
+      // is the most common way an account dies. Without this branch it read as
+      // a generic Gmail API failure and never mentioned the actual fix.
+      if (isInvalidGrant(error)) {
+        const desc = (
+          error as { response?: { data?: { error_description?: string } } }
+        )?.response?.data?.error_description;
+        return (
+          `Error: The account's saved authorization is no longer valid ` +
+          `(invalid_grant${desc ? `: ${desc}` : ""}). ` +
+          "Re-run `npm run add-account` for this account."
+        );
+      }
+      break; // other 400s fall through to the generic status message
+    }
     case 401:
       return "Error: Authentication failed or token expired. Re-run `npm run add-account` for this account.";
-    case 403:
+    case 403: {
+      // Gmail's usage limits can surface as 403 (usageLimits domain), which is
+      // a transient throttle — telling the user to re-check OAuth scopes for it
+      // sends them to redo consent for nothing. The structured reason
+      // distinguishes the two.
+      const reason = gmailErrorReason(error);
+      if (reason !== undefined && RATE_LIMIT_403_REASONS.has(reason)) {
+        return `Error: Rate limit exceeded (403 ${reason}). Wait before retrying.`;
+      }
       return `Error: Permission denied. The account may not have granted the required scope. (${detail})`;
+    }
     case 404:
       return "Error: Resource not found. Check the message/thread/label ID.";
     case 429:

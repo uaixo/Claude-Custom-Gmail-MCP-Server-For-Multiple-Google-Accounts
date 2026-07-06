@@ -898,6 +898,59 @@ test("handleGmailError reports a transport error distinctly, not as an API failu
   assert.doesNotMatch(net, /Gmail API request failed/);
 });
 
+test("handleGmailError maps invalid_grant (400) to re-auth guidance (M3)", () => {
+  // The OAuth token endpoint's shape: data.error is the STRING "invalid_grant"
+  // (this is how a revoked/expired refresh token — the most common way an
+  // account dies — actually surfaces through google-auth-library).
+  const msg = handleGmailError({
+    status: 400,
+    message: "invalid_grant",
+    response: {
+      status: 400,
+      data: { error: "invalid_grant", error_description: "Token has been expired or revoked." },
+    },
+  });
+  assert.match(msg, /invalid_grant/);
+  assert.match(msg, /Token has been expired or revoked/);
+  assert.match(msg, /add-account/);
+  // A plain 400 (not invalid_grant) keeps the generic status message.
+  const generic = handleGmailError({ status: 400, message: "badRequest" });
+  assert.match(generic, /status 400/);
+  assert.doesNotMatch(generic, /add-account/);
+});
+
+test("handleGmailError distinguishes a rate-limit 403 from a permission 403 (M4)", () => {
+  const rateLimited = handleGmailError({
+    response: {
+      status: 403,
+      data: {
+        error: {
+          errors: [
+            { domain: "usageLimits", reason: "userRateLimitExceeded", message: "User Rate Limit Exceeded" },
+          ],
+        },
+      },
+    },
+  });
+  assert.match(rateLimited, /Rate limit exceeded \(403 userRateLimitExceeded\)/);
+  assert.doesNotMatch(rateLimited, /scope/);
+  // A true permission 403 keeps the scope guidance.
+  const permission = handleGmailError({
+    response: {
+      status: 403,
+      data: {
+        error: {
+          errors: [
+            { domain: "global", reason: "insufficientPermissions", message: "Insufficient Permission" },
+          ],
+        },
+      },
+    },
+  });
+  assert.match(permission, /Permission denied/);
+  assert.match(permission, /scope/);
+});
+
 test("handleGmailError reports a request timeout as a timeout, not a generic error (#3)", () => {
   // A node-fetch timeout has no HTTP status and no string `code`, only `type`.
   const msg = handleGmailError({
@@ -1350,6 +1403,57 @@ test("withRetry gives up after the retry budget and rethrows (#C3)", async () =>
     /rate/
   );
   assert.equal(calls, 3); // initial attempt + 2 retries
+});
+
+test("withRetry retries a usage-limit 403 like a 429 — even for non-idempotent sends (M4)", async () => {
+  // Gmail's alternate rate-limit shape: 403 with a usageLimits reason. Like a
+  // 429 it was rejected before processing, so retrying can't duplicate a send.
+  const rateLimit403 = () => {
+    const e = new Error("User Rate Limit Exceeded");
+    e.response = {
+      status: 403,
+      data: {
+        error: {
+          errors: [{ domain: "usageLimits", reason: "userRateLimitExceeded" }],
+        },
+      },
+    };
+    return e;
+  };
+  for (const idempotent of [true, false]) {
+    let calls = 0;
+    const out = await withRetry(
+      async () => {
+        calls++;
+        if (calls <= 2) throw rateLimit403();
+        return "ok";
+      },
+      { baseDelayMs: 1, idempotent }
+    );
+    assert.equal(out, "ok");
+    assert.equal(calls, 3, `idempotent=${idempotent}: two 403 throttles then success`);
+  }
+
+  // A permission 403 (no rate-limit reason) must NOT retry.
+  let permCalls = 0;
+  await assert.rejects(
+    withRetry(
+      async () => {
+        permCalls++;
+        const e = new Error("Insufficient Permission");
+        e.response = {
+          status: 403,
+          data: {
+            error: { errors: [{ domain: "global", reason: "insufficientPermissions" }] },
+          },
+        };
+        throw e;
+      },
+      { baseDelayMs: 1 }
+    ),
+    /Insufficient Permission/
+  );
+  assert.equal(permCalls, 1, "a permission 403 is not retryable");
 });
 
 test("withRetry idempotent:false does NOT retry a 5xx (no duplicate side effect) (#retry)", async () => {
