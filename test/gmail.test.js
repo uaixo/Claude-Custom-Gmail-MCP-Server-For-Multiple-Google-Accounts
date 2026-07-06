@@ -6,6 +6,7 @@ import path from "node:path";
 
 import {
   extractPlainText,
+  extractPlainTextSafe,
   htmlToText,
   mapWithConcurrency,
   getThreadReplyHeaders,
@@ -118,6 +119,36 @@ test("extractPlainText skips a text/plain attachment that precedes the body part
     ],
   };
   assert.equal(extractPlainText(payload), "ACTUAL BODY");
+});
+
+test("htmlToText survives pathologically deep nesting without a stack overflow (H1)", () => {
+  // ~2,200 nested tags used to overflow the recursive DOM walk (RangeError).
+  // With limits.maxDepth the conversion degrades to the library's ellipsis.
+  const hostile = "<div>".repeat(5000) + "deep text" + "</div>".repeat(5000);
+  let out;
+  assert.doesNotThrow(() => {
+    out = htmlToText(hostile);
+  });
+  assert.equal(typeof out, "string");
+  // Legitimate nesting (real emails are a few dozen levels) is unaffected.
+  const legit = "<div>".repeat(40) + "hello world" + "</div>".repeat(40);
+  assert.equal(htmlToText(legit), "hello world");
+});
+
+test("extractPlainTextSafe degrades a throwing extraction to a marker body (H1)", () => {
+  // A payload whose traversal throws must yield a marker, not an exception —
+  // one hostile message must not sink a whole-thread read.
+  const hostile = {
+    mimeType: "multipart/mixed",
+    get parts() {
+      throw new Error("boom during traversal");
+    },
+  };
+  const out = extractPlainTextSafe(hostile);
+  assert.match(out, /\[Body could not be extracted: boom during traversal\]/);
+  // Normal payloads pass through unchanged.
+  const ok = { mimeType: "text/plain", body: { data: b64url("fine") } };
+  assert.equal(extractPlainTextSafe(ok), "fine");
 });
 
 test("extractPlainText keeps an inline text part as the body", () => {

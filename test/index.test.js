@@ -9,6 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { server } from "../src/index.js";
+import { MAX_THREAD_BODY_CHARS } from "../src/constants.js";
 
 // @googleapis/gmail is CommonJS; grab its mutable exports object so the before()
 // hook can swap the gmail() factory. Production imports the same named factory,
@@ -275,6 +276,87 @@ test("gmail_get_thread caps the message count, keeping the newest and reporting 
   assert.equal(sc.messages[0].message_id, "m5");
   assert.equal(sc.messages[0].body, "body 5");
   assert.equal(sc.messages[99].message_id, "m104");
+});
+
+test("gmail_get_thread spends the body budget on the NEWEST messages first (H2)", async () => {
+  // 5 messages whose bodies each take ~30% of the budget: only the newest 3
+  // fit. The budget must be spent newest-first — the latest replies are what a
+  // reader asks for — while the output stays in chronological order.
+  const bodySize = Math.ceil(MAX_THREAD_BODY_CHARS * 0.3);
+  const bodies = Array.from({ length: 5 }, (_, i) => `B${i}:` + "x".repeat(bodySize - 3));
+  const messages = bodies.map((b, i) => ({
+    id: `m${i}`,
+    labelIds: ["INBOX"],
+    payload: {
+      mimeType: "text/plain",
+      headers: [{ name: "Subject", value: `S${i}` }],
+      body: { data: utf8(b).toString("base64url") },
+    },
+  }));
+  const { result } = await callTool(
+    "gmail_get_thread",
+    { thread_id: "t1", account: "alice@example.com" },
+    { "threads.get": { data: { messages } } }
+  );
+  assert.equal(result.isError, undefined);
+  const sc = result.structuredContent;
+  assert.equal(sc.truncated, true);
+  // Chronological order is preserved...
+  assert.deepEqual(sc.messages.map((m) => m.message_id), ["m0", "m1", "m2", "m3", "m4"]);
+  // ...the newest three bodies are intact...
+  assert.equal(sc.messages[4].body, bodies[4]);
+  assert.equal(sc.messages[3].body, bodies[3]);
+  assert.equal(sc.messages[2].body, bodies[2]);
+  // ...and the budget runs out on the OLDER messages, not the newest.
+  assert.match(sc.messages[1].body, /truncated|omitted/);
+  assert.match(sc.messages[0].body, /omitted/);
+  assert.ok(
+    sc.messages[1].body.startsWith("B1:") || /omitted/.test(sc.messages[1].body),
+    "the crossing message keeps its own body prefix if partially rendered"
+  );
+});
+
+test("gmail_get_thread survives a hostile deeply-nested HTML message without failing the thread (H1)", async () => {
+  // ~2,200 nested tags used to RangeError inside extractPlainText and turn the
+  // ENTIRE thread read into isError — permanently for that thread. With the
+  // parser depth limit (+ per-message fault isolation) the hostile message
+  // degrades and its neighbors stay readable.
+  const hostileHtml = "<div>".repeat(5000) + "deep" + "</div>".repeat(5000);
+  const plainMsg = (id, text) => ({
+    id,
+    labelIds: ["INBOX"],
+    payload: {
+      mimeType: "text/plain",
+      headers: [{ name: "Subject", value: id }],
+      body: { data: utf8(text).toString("base64url") },
+    },
+  });
+  const messages = [
+    plainMsg("m0", "body zero"),
+    {
+      id: "m1",
+      labelIds: ["INBOX"],
+      payload: {
+        mimeType: "text/html",
+        headers: [{ name: "Subject", value: "hostile" }],
+        body: { data: utf8(hostileHtml).toString("base64url") },
+      },
+    },
+    plainMsg("m2", "body two"),
+  ];
+  const { result } = await callTool(
+    "gmail_get_thread",
+    { thread_id: "t1", account: "alice@example.com" },
+    { "threads.get": { data: { messages } } }
+  );
+  assert.equal(result.isError, undefined, "one hostile body must not sink the thread read");
+  const sc = result.structuredContent;
+  assert.equal(sc.messages[0].body, "body zero");
+  assert.equal(sc.messages[2].body, "body two");
+  // The hostile body degraded (ellipsis or marker) rather than throwing, and
+  // no raw markup leaked through.
+  assert.equal(typeof sc.messages[1].body, "string");
+  assert.doesNotMatch(sc.messages[1].body, /<div>/);
 });
 
 // --------------------------------------------------------------------------

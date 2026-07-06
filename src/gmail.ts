@@ -319,6 +319,17 @@ function findPartBody(
 const MAX_HTML_INPUT_CHARS = 1_000_000;
 
 /**
+ * Cap on HTML element nesting handed to the parser. html-to-text walks the DOM
+ * recursively, so without a depth limit ~2,200 nested tags (a few KB of
+ * hostile input — MAX_HTML_INPUT_CHARS does not help) overflow the call stack
+ * and the RangeError escapes to the caller. With the limit, deeper content
+ * degrades to the library's ellipsis instead. Real emails nest a few dozen
+ * levels at most; 150 is far above legitimate content and far below the
+ * ~2,200-frame crash threshold.
+ */
+const MAX_HTML_NESTING_DEPTH = 150;
+
+/**
  * Strip an HTML email body down to readable plain text using the html-to-text
  * library, which parses the markup (handling quoted attributes, comments,
  * malformed nesting, character references, and block structure) rather than
@@ -339,6 +350,8 @@ export function htmlToText(html: string): string {
     // wrapping. Skip non-visible/non-text elements so they can't leak into the
     // body, and drop hrefs/images so only readable text remains.
     wordwrap: false,
+    // Bound the DOM walk's recursion depth (see MAX_HTML_NESTING_DEPTH).
+    limits: { maxDepth: MAX_HTML_NESTING_DEPTH },
     selectors: [
       { selector: "a", options: { ignoreHref: true } },
       { selector: "img", format: "skip" },
@@ -367,6 +380,24 @@ export function extractPlainText(
   const html = findPartBody(payload, "text/html");
   if (html) return htmlToText(html);
   return "";
+}
+
+/**
+ * extractPlainText, but a failure on one message degrades to a marker body
+ * instead of throwing. Thread reads extract every message's body in one pass;
+ * without this isolation a single hostile or malformed body (e.g. HTML the
+ * parser chokes on) rejects the whole tool call and makes every message in the
+ * thread unreadable — permanently, since retrying decodes the same bytes.
+ */
+export function extractPlainTextSafe(
+  payload: gmail_v1.Schema$MessagePart | undefined
+): string {
+  try {
+    return extractPlainText(payload);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return `[Body could not be extracted: ${reason}]`;
+  }
 }
 
 /** A resolved attachment ready to be embedded in a MIME message. */

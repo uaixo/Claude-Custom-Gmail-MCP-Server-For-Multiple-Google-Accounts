@@ -7,8 +7,15 @@ declare module "html-to-text" {
     format?: string;
     options?: Record<string, unknown>;
   }
+  interface HtmlToTextLimits {
+    /** Max DOM depth walked; deeper content degrades to `ellipsis`. */
+    maxDepth?: number;
+    maxInputLength?: number;
+    ellipsis?: string;
+  }
   interface HtmlToTextOptions {
     wordwrap?: number | false | null;
+    limits?: HtmlToTextLimits;
     selectors?: HtmlToTextSelector[];
     [key: string]: unknown;
   }
