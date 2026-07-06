@@ -62,10 +62,18 @@ export function gmailFor(account?: string): {
   // Set a per-request timeout at the client level so it applies to every call
   // (it propagates through the Gmail client to gaxios/node-fetch). Without it a
   // hung socket would block the tool call until the OS TCP timeout.
+  //
+  // retry:false disables gaxios's built-in retry, which googleapis-common
+  // force-enables (options.retry defaults to true) — that layer re-fires GETs
+  // up to 3 times with fixed unjittered delays INSIDE each withRetry attempt,
+  // multiplying to ~16 requests per failing idempotent call and stalling tool
+  // calls for many seconds under throttling. withRetry is the sole retry
+  // policy: bounded, jittered, idempotency-aware.
   const gmail = gmailApi.gmail({
     version: "v1",
     auth,
     timeout: gmailRequestTimeoutMs(),
+    retry: false,
   });
   return { gmail, account: resolved };
 }

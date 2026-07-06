@@ -9,7 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { server } from "../src/index.js";
-import { MAX_THREAD_BODY_CHARS } from "../src/constants.js";
+import { MAX_THREAD_BODY_CHARS, GMAIL_REQUEST_TIMEOUT_MS } from "../src/constants.js";
 
 // @googleapis/gmail is CommonJS; grab its mutable exports object so the before()
 // hook can swap the gmail() factory. Production imports the same named factory,
@@ -73,7 +73,7 @@ async function callTool(name, args, handlers = {}) {
   currentFake = fake;
   try {
     const result = await client.callTool({ name, arguments: args });
-    return { result, calls: fake.calls };
+    return { result, calls: fake.calls, factoryOpts: fake.lastOpts };
   } finally {
     currentFake = null;
   }
@@ -107,6 +107,7 @@ before(async () => {
   gmailPkg.gmail = (opts) => {
     if (!currentFake) throw new Error("no fake Gmail installed for this call");
     currentFake.lastAuth = opts.auth;
+    currentFake.lastOpts = opts;
     return currentFake.client;
   };
 
@@ -971,4 +972,25 @@ test("gmail_send_message requires a subject on a fresh (non-reply) send (N4)", a
   assert.equal(explicit.result.isError, undefined);
   const mime = Buffer.from(sentRaw, "base64url").toString("utf-8");
   assert.match(mime, /^Subject: $/m);
+});
+
+// --------------------------------------------------------------------------
+// Gmail client construction (M5 + M7)
+// --------------------------------------------------------------------------
+test("gmailFor configures the client with the request timeout and no hidden gaxios retry (M5/M7)", async () => {
+  // These options are the sole mechanism behind the documented 30s request
+  // bound and the single-retry-policy guarantee: `timeout` is what
+  // GMAIL_MCP_REQUEST_TIMEOUT_MS feeds, and `retry: false` disables the
+  // internal gaxios retry that googleapis-common force-enables (which would
+  // otherwise multiply withRetry's attempts ~4x). If either option is dropped
+  // or renamed in a dependency bump, this is the test that catches it.
+  const { result, factoryOpts } = await callTool(
+    "gmail_list_labels",
+    { account: "alice@example.com" },
+    { "labels.list": { data: { labels: [] } } }
+  );
+  assert.equal(result.isError, undefined);
+  assert.equal(factoryOpts.version, "v1");
+  assert.equal(factoryOpts.timeout, GMAIL_REQUEST_TIMEOUT_MS);
+  assert.equal(factoryOpts.retry, false);
 });
