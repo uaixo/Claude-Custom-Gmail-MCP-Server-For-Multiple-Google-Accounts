@@ -151,6 +151,30 @@ test("extractPlainTextSafe degrades a throwing extraction to a marker body (H1)"
   assert.equal(extractPlainTextSafe(ok), "fine");
 });
 
+test("extractPlainText treats an inline part WITH a filename as an attachment (M2)", () => {
+  // Some senders (notably Apple Mail) dispose attached files as
+  // 'inline; filename="x.txt"'. Such a file must not shadow the real body: an
+  // HTML-only email with an inline .txt attachment previously returned the
+  // FILE's contents as the message body and never showed the actual message.
+  const payload = {
+    mimeType: "multipart/mixed",
+    parts: [
+      { mimeType: "text/html", body: { data: b64url("<p>The actual email body</p>") } },
+      {
+        mimeType: "text/plain",
+        filename: "notes.txt",
+        headers: [
+          { name: "Content-Disposition", value: 'inline; filename="notes.txt"' },
+        ],
+        body: { data: b64url("ATTACHMENT FILE CONTENT") },
+      },
+    ],
+  };
+  const out = extractPlainText(payload);
+  assert.doesNotMatch(out, /ATTACHMENT FILE CONTENT/);
+  assert.match(out, /The actual email body/);
+});
+
 test("extractPlainText keeps an inline text part as the body", () => {
   // Content-Disposition: inline must NOT be treated as an attachment.
   const payload = {
@@ -705,7 +729,24 @@ test("buildRawMessage encodes a non-ASCII filename as an RFC 2231 parameter, not
   assert.doesNotMatch(mime, /filename="r/);
 });
 
-test("buildRawMessage folds a long non-ASCII filename and round-trips it (#M1)", () => {
+/**
+ * Reassemble an RFC 2231 extended filename from its continuation segments
+ * (`filename*0*=UTF-8''…; filename*1*=…`) in unfolded header text. Returns the
+ * still-percent-encoded value.
+ */
+function joinExtendedFilenameSegments(unfolded) {
+  const segs = [...unfolded.matchAll(/filename\*(\d+)\*=([^;\r\n]*)/g)].sort(
+    (a, b) => Number(a[1]) - Number(b[1])
+  );
+  assert.ok(segs.length > 1, "expected multiple continuation segments");
+  assert.ok(
+    segs[0][2].startsWith("UTF-8''"),
+    "segment 0 must carry the charset prefix"
+  );
+  return segs.map((s, i) => (i === 0 ? s[2].slice(7) : s[2])).join("");
+}
+
+test("buildRawMessage splits a long non-ASCII filename into RFC 2231 continuations that round-trip (#M1)", () => {
   const filename = "報告書".repeat(30) + ".pdf"; // long + multi-byte
   const mime = decodeBase64Url(
     buildRawMessage({
@@ -717,18 +758,89 @@ test("buildRawMessage folds a long non-ASCII filename and round-trips it (#M1)",
       ],
     })
   );
-  // No physical line may exceed RFC 5322's 998-octet hard limit.
+  // Continuations let the filename headers fold at parameter boundaries, so
+  // every filename-bearing line meets the 78-octet fold target — the 998-octet
+  // hard limit is never even approached. (Other lines, e.g. the multipart
+  // boundary, are outside this fix's scope and only bound by the hard limit.)
   for (const line of mime.split("\r\n")) {
-    assert.ok(
-      Buffer.byteLength(line, "utf-8") <= 998,
-      `line exceeds 998 octets (${Buffer.byteLength(line, "utf-8")})`
-    );
+    const octets = Buffer.byteLength(line, "utf-8");
+    assert.ok(octets <= 998, `line exceeds 998 octets (${octets})`);
+    if (/filename\*/.test(line)) {
+      assert.ok(octets <= 78, `filename line exceeds 78 octets (${octets}): ${line}`);
+    }
   }
-  // The percent-encoded value (no spaces, so never folded internally) decodes
-  // back to the original filename.
-  const m = mime.match(/filename\*=UTF-8''([A-Za-z0-9%.\-_]+)/);
-  assert.ok(m, "filename* parameter present");
-  assert.equal(decodeURIComponent(m[1]), filename);
+  const joined = joinExtendedFilenameSegments(mime.replace(/\r\n[ \t]/g, " "));
+  assert.doesNotMatch(joined, / /, "no segment may contain an injected space");
+  assert.equal(decodeURIComponent(joined), filename);
+});
+
+test("buildRawMessage keeps a very long filename intact — no space injected mid-escape (M1)", () => {
+  // The percent-encoded form of this name exceeds the 998-octet hard limit.
+  // The old single-parameter emission hard-broke it by inserting a space INTO
+  // the value — landing mid-%XX-escape — so receiving clients failed to decode
+  // the name. Continuations keep every segment a clean run of escapes.
+  const filename = "あ".repeat(150) + ".pdf";
+  const mime = decodeBase64Url(
+    buildRawMessage({
+      to: ["a@b.com"],
+      subject: "s",
+      body: "b",
+      attachments: [
+        { filename, mimeType: "application/pdf", contentBase64: "QQ==" },
+      ],
+    })
+  );
+  for (const line of mime.split("\r\n")) {
+    const octets = Buffer.byteLength(line, "utf-8");
+    assert.ok(octets <= 998, `line exceeds 998 octets (${octets})`);
+    if (/filename\*/.test(line)) {
+      assert.ok(octets <= 78, `filename line exceeds 78 octets (${octets}): ${line}`);
+    }
+  }
+  const joined = joinExtendedFilenameSegments(mime.replace(/\r\n[ \t]/g, " "));
+  assert.doesNotMatch(joined, / /, "no segment may contain an injected space");
+  assert.doesNotMatch(joined, /%.?$/, "no segment boundary may split a %XX escape");
+  assert.equal(decodeURIComponent(joined), filename);
+});
+
+test("buildRawMessage splits a long quote-safe ASCII filename into quoted continuations (M1)", () => {
+  // A >998-octet space-free ASCII name previously arrived one character longer
+  // (a spurious space inserted by the hard break). Quoted RFC 2231
+  // continuations (filename*0="…"; filename*1="…") preserve it byte-for-byte.
+  const filename = "a".repeat(1104) + ".txt";
+  const mime = decodeBase64Url(
+    buildRawMessage({
+      to: ["a@b.com"],
+      subject: "s",
+      body: "b",
+      attachments: [
+        { filename, mimeType: "text/plain", contentBase64: "QQ==" },
+      ],
+    })
+  );
+  const unfolded = mime.replace(/\r\n[ \t]/g, " ");
+  const segs = [...unfolded.matchAll(/filename\*(\d+)="([^"]*)"/g)].sort(
+    (a, b) => Number(a[1]) - Number(b[1])
+  );
+  assert.ok(segs.length > 1, "expected multiple quoted continuation segments");
+  const joined = segs.map((s) => s[2]).join("");
+  assert.equal(joined.length, filename.length, "length preserved (no injected space)");
+  assert.equal(joined, filename);
+});
+
+test("buildRawMessage re-quotes an already-quoted display name instead of nesting quotes (L3)", () => {
+  // '"Doe, John" <j@x.com>' is exactly how clients render such addresses, so
+  // it's what callers copy-paste. The quotes must be unwrapped and re-applied
+  // canonically — previously the name arrived displaying literal quote marks.
+  const mime = decodeBase64Url(
+    buildRawMessage({ to: ['"Doe, John" <j@x.com>'], subject: "s", body: "b" })
+  ).replace(/\r\n[ \t]/g, " ");
+  assert.equal(mime.match(/^To:.*$/m)[0], 'To: "Doe, John" <j@x.com>');
+  // Escapes inside the quoted form are unwrapped, then re-escaped as needed.
+  const mime2 = decodeBase64Url(
+    buildRawMessage({ to: ['"Say \\"hi\\", Jo" <jo@x.com>'], subject: "s", body: "b" })
+  ).replace(/\r\n[ \t]/g, " ");
+  assert.equal(mime2.match(/^To:.*$/m)[0], 'To: "Say \\"hi\\", Jo" <jo@x.com>');
 });
 
 test("buildRawMessage rejects a message over the 25 MB limit with a clear error", () => {

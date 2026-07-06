@@ -146,6 +146,47 @@ test("a tool rejects an unknown account with an actionable error", async () => {
 });
 
 // --------------------------------------------------------------------------
+// Recipient validation (M3)
+// --------------------------------------------------------------------------
+test("gmail_send_message rejects a comma-joined multi-recipient string in one element (M3)", async () => {
+  // One string carrying two recipients previously passed validation (only the
+  // trailing <...> was checked) and Gmail delivered ONLY to the last one —
+  // everyone else silently never received the message.
+  const { result } = await callTool("gmail_send_message", {
+    to: ["Alice <alice@x.com>, Bob <bob@y.com>"],
+    subject: "s",
+    body: "b",
+    account: "alice@example.com",
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /separate array elements/);
+});
+
+test("gmail_send_message accepts a quoted comma display name and emits it singly-quoted (M3/L3)", async () => {
+  let sentRaw;
+  const { result } = await callTool(
+    "gmail_send_message",
+    {
+      to: ['"Doe, John" <j@x.com>'],
+      subject: "s",
+      body: "b",
+      account: "alice@example.com",
+    },
+    {
+      "messages.send": (p) => {
+        sentRaw = p.requestBody.raw;
+        return { data: { id: "s1", threadId: "t1" } };
+      },
+    }
+  );
+  assert.equal(result.isError, undefined);
+  const mime = Buffer.from(sentRaw, "base64url")
+    .toString("utf-8")
+    .replace(/\r\n[ \t]/g, " ");
+  assert.match(mime, /^To: "Doe, John" <j@x\.com>$/m);
+});
+
+// --------------------------------------------------------------------------
 // gmail_search_threads
 // --------------------------------------------------------------------------
 test("gmail_search_threads forwards the query/max_results and maps summaries", async () => {

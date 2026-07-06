@@ -110,17 +110,27 @@ const accountField = z
 
 /**
  * A recipient: either a bare email address ("alice@x.com") or an RFC 5322
- * name-addr with a display name ("Alice Example <alice@x.com>"). The email part
+ * name-addr with a display name ("Alice Example <alice@x.com>", or the quoted
+ * form '"Doe, John" <j@x.com>' when the name contains specials). The email part
  * (inside the angle brackets when present) must look like an address — a
  * non-empty local part and a non-empty, whitespace-free domain. The domain need
  * not be dotted, so intranet addresses like "ops@localhost" are accepted; Gmail
  * makes the final delivery-time judgment. CR/LF in the value is stripped
  * downstream in buildRawMessage, so a display name can't inject headers.
+ *
+ * The WHOLE element must be one recipient. The pattern anchors both ends and
+ * forbids commas outside a quoted display name, so a comma-joined list in a
+ * single element ("Alice <a@x.com>, Bob <b@y.com>") is rejected. The previous
+ * check validated only the trailing <...> group, which let such a list pass —
+ * everything before the last angle-addr was then emitted as a quoted display
+ * name, and every recipient but the last was silently never delivered to.
  */
 const EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
+/** Display name: a quoted string (commas allowed inside) or a phrase with no comma/angle/quote. */
+const NAME_ADDR_RE = /^(?:"(?:[^"\\]|\\.)*"|[^,<>"]*?)\s*<([^<>]+)>$/;
 function isRecipient(value: string): boolean {
   const trimmed = value.trim();
-  const named = /<([^<>]+)>\s*$/.exec(trimmed);
+  const named = NAME_ADDR_RE.exec(trimmed);
   // When the name-addr form matched, capture group 1 is always present; `?? ""`
   // only satisfies noUncheckedIndexedAccess.
   const email = (named ? (named[1] ?? "") : trimmed).trim();
@@ -129,7 +139,10 @@ function isRecipient(value: string): boolean {
 const recipientSchema = z
   .string()
   .refine(isRecipient, {
-    message: 'Must be an email address or \'Display Name <email@host>\'.',
+    message:
+      'Must be a single recipient: "email@host" or \'Name <email@host>\' ' +
+      "(quote the name if it contains a comma). Pass multiple recipients as " +
+      "separate array elements.",
   });
 
 // ---------------------------------------------------------------------------
