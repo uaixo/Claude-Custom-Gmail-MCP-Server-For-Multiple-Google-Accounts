@@ -10,10 +10,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
-const ROOT = path.resolve(new URL("..", import.meta.url).pathname);
-// On Windows, URL pathname keeps a leading slash before the drive letter.
-const root = process.platform === "win32" ? ROOT.replace(/^[\\/]+(?=[A-Za-z]:)/, "") : ROOT;
+// fileURLToPath handles Windows drive letters correctly; resolving a URL's
+// raw .pathname does not (it doubles the drive: "D:\D:\...").
+const root = fileURLToPath(new URL("..", import.meta.url));
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-smoke-"));
 const env = { ...process.env, GMAIL_MCP_DATA_DIR: dataDir };
