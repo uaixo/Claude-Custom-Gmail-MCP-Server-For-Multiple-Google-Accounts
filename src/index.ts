@@ -19,7 +19,7 @@ import {
   buildReplyHeaders,
   capMessageBodies,
   deriveReplySubject,
-  extractPlainText,
+  extractPlainTextSafe,
   getThreadReplyHeaders,
   gmailFor,
   handleGmailError,
@@ -286,7 +286,7 @@ Returns: JSON {
   "messages": [ { "message_id": string, "from": string, "to": string, "date": string, "subject": string, "body": string, "label_ids": string[] } ]
 }
 
-For very large threads the result may be truncated: "truncated": true is set, and "omitted_message_count" reports how many of the oldest messages were dropped (the newest are kept).`,
+For very large threads the result may be truncated: "truncated": true is set, and "omitted_message_count" reports how many of the oldest messages were dropped (the newest are kept). When the combined bodies exceed the size budget, the newest messages' bodies are kept and older ones are replaced with an omission marker.`,
     inputSchema: {
       thread_id: z.string().min(1).describe("Thread ID to fetch"),
       account: accountField,
@@ -318,11 +318,18 @@ For very large threads the result may be truncated: "truncated": true is set, an
       // usually wants, so drop from the front (oldest) rather than the tail.
       // slice(-N) returns the whole array when there are fewer than N messages.
       const kept = rawMessages.slice(-MAX_THREAD_MESSAGES);
-      const { messages: capped, truncated: bodyTruncated } = capMessageBodies(
-        kept,
-        MAX_THREAD_BODY_CHARS,
-        (m) => extractPlainText(m.payload)
-      );
+      // Spend the body budget on the NEWEST messages first, for the same reason
+      // the count cap keeps them: when a thread's bodies exceed the budget, the
+      // latest replies must be the ones that survive, not the oldest. Feed
+      // capMessageBodies the list reversed (it spends its budget in array
+      // order), then restore chronological order for the output. Extraction is
+      // per-message fault-isolated (extractPlainTextSafe) so one hostile or
+      // malformed body degrades to a marker instead of failing the whole read.
+      const { messages: cappedNewestFirst, truncated: bodyTruncated } =
+        capMessageBodies([...kept].reverse(), MAX_THREAD_BODY_CHARS, (m) =>
+          extractPlainTextSafe(m.payload)
+        );
+      const capped = cappedNewestFirst.reverse();
       const messages = capped.map((m) => ({
         message_id: requireField(m.id, "message.id"),
         from: header(m.payload, "From"),
