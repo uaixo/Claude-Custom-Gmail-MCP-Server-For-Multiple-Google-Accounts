@@ -12,6 +12,8 @@ import {
   oauthRedirectUri,
   OAUTH_REDIRECT_PORT,
   attachmentDirs,
+  gmailRequestTimeoutMs,
+  GMAIL_REQUEST_TIMEOUT_MS,
 } from "../src/constants.js";
 
 const close = (s) => new Promise((r) => s.close(r));
@@ -126,5 +128,30 @@ test("listenWithFallback falls back to an ephemeral port when the preferred one 
   } finally {
     await close(holder);
     await close(fallback);
+  }
+});
+
+test("gmailRequestTimeoutMs defaults, honors a valid override, and falls back on garbage (M7)", () => {
+  const prev = process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS;
+  try {
+    delete process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS;
+    assert.equal(gmailRequestTimeoutMs(), GMAIL_REQUEST_TIMEOUT_MS);
+
+    process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS = "5000";
+    assert.equal(gmailRequestTimeoutMs(), 5000);
+
+    // Non-numeric, non-positive, and empty overrides must fall back to the
+    // default rather than disabling or corrupting the timeout.
+    for (const bad of ["abc", "-5", "0", ""]) {
+      process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS = bad;
+      assert.equal(
+        gmailRequestTimeoutMs(),
+        GMAIL_REQUEST_TIMEOUT_MS,
+        `override ${JSON.stringify(bad)} must fall back to the default`
+      );
+    }
+  } finally {
+    if (prev === undefined) delete process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS;
+    else process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS = prev;
   }
 });

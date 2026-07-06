@@ -1774,3 +1774,50 @@ test("resolveAttachments rejects composite MIME types that cannot be base64-enco
     ])
   );
 });
+
+// --------------------------------------------------------------------------
+// Retry layering (M5): withRetry must be the ONLY retry policy
+// --------------------------------------------------------------------------
+test("retry:false keeps the real Gmail client at one HTTP request per withRetry attempt (M5)", async () => {
+  // googleapis-common force-enables gaxios's internal retry (3 extra requests
+  // per GET on 408/429/5xx, fixed unjittered delays, no Retry-After). Stacked
+  // under withRetry that multiplied to ~16 requests per failing idempotent
+  // call. With retry:false (mirroring gmailFor's factory options), 3 withRetry
+  // attempts must mean exactly 3 requests on the wire.
+  const { gmail: gmailFactory } = await import("@googleapis/gmail");
+  const { OAuth2Client } = await import("google-auth-library");
+  const http = await import("node:http");
+
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    hits++;
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { code: 503, message: "backend unavailable" } }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const auth = new OAuth2Client({ clientId: "c", clientSecret: "s" });
+    // A far-future expiry so the client never attempts a token refresh.
+    auth.setCredentials({ access_token: "at", expiry_date: Date.now() + 3600_000 });
+    const gmail = gmailFactory({
+      version: "v1",
+      auth,
+      timeout: 2000,
+      retry: false,
+      rootUrl: `http://127.0.0.1:${server.address().port}`,
+    });
+    await assert.rejects(
+      withRetry(() => gmail.users.labels.list({ userId: "me" }), {
+        retries: 2,
+        baseDelayMs: 1,
+      })
+    );
+    assert.equal(
+      hits,
+      3,
+      "3 withRetry attempts must produce exactly 3 HTTP requests (no hidden inner retry)"
+    );
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});

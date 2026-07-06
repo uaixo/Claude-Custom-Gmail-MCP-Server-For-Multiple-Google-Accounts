@@ -29,6 +29,14 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Smoke-run compiled output
+        # bin/main and the README's Claude Desktop config point at dist/, but
+        # tests run TypeScript source via tsx — nothing else executes the
+        # tsc-emitted JS under real Node module resolution. Boot dist/index.js
+        # over stdio MCP (initialize + tools/list) and run the CLI's --list so
+        # a CJS-interop or emit regression can't ship green.
+        run: npm run smoke
+
       - name: Lint
         run: npm run lint
 
