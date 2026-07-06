@@ -1549,14 +1549,38 @@ test("formatRecipient quotes an ASCII display name containing an encoded-word ma
   assert.match(mime, /^To: "=\?UTF-8\?B\?SGFja2Vk\?= x" <a@x\.com>$/m);
 });
 
+/**
+ * String.prototype.isWellFormed(), but working on Node 18 too (the API landed
+ * in Node 20 and CI still runs the 18.x line that `engines` supports): scan
+ * for lone surrogates by code unit.
+ */
+function isWellFormedString(s) {
+  if (typeof s.isWellFormed === "function") return s.isWellFormed();
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = s.charCodeAt(i + 1); // NaN past the end — fails the range check
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      i++; // skip the low half of a valid pair
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return false; // low surrogate with no preceding high half
+    }
+  }
+  return true;
+}
+
 test("capMessageBodies never splits a surrogate pair at the truncation cut (L4)", () => {
   const r = capMessageBodies([{ id: 1 }], 5, () => "\u{1F600}".repeat(10));
   assert.equal(r.truncated, true);
   assert.match(r.messages[0].body, /truncated/);
-  assert.equal(r.messages[0].body.isWellFormed(), true, "no lone surrogate may survive");
+  assert.equal(isWellFormedString(r.messages[0].body), true, "no lone surrogate may survive");
   // An even budget still cuts cleanly between pairs.
   const r2 = capMessageBodies([{ id: 1 }], 4, () => "\u{1F600}".repeat(10));
-  assert.equal(r2.messages[0].body.isWellFormed(), true);
+  assert.equal(isWellFormedString(r2.messages[0].body), true);
+  // The helper itself must actually detect ill-formed strings (Node 18 path).
+  assert.equal(isWellFormedString("ok \ud83d"), false, "lone high surrogate must be detected");
+  assert.equal(isWellFormedString("\ude00 tail"), false, "lone low surrogate must be detected");
+  assert.equal(isWellFormedString("\u{1F600}"), true);
 });
 
 test("extractPlainText falls back to HTML when the text/plain part is whitespace-only (L5)", () => {
