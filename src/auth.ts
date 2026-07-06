@@ -4,6 +4,7 @@ import { OAuth2Client, Credentials } from "google-auth-library";
 import {
   credentialsPath,
   dataDir,
+  gmailRequestTimeoutMs,
   OAUTH_REDIRECT_URI,
   tokensPath,
 } from "./constants.js";
@@ -98,7 +99,20 @@ export function newOAuthClient(
   redirectUri: string = OAUTH_REDIRECT_URI
 ): OAuth2Client {
   const cfg = loadClientConfig(file);
-  return new OAuth2Client(cfg.client_id, cfg.client_secret, redirectUri);
+  // Use the object form (not the positional one) so transporterOptions is
+  // honored — the positional constructor calls super({}) and drops it. The
+  // timeout MUST live on the auth client's own transporter: token refreshes
+  // POST directly through it, NOT through the Gmail API client, so the
+  // client-level timeout set in gmailFor does not cover them. Without this a
+  // silently-hung refresh socket wedges every tool call for the account
+  // (google-auth-library serializes refreshes per client, so subsequent calls
+  // await the same never-settling promise) until the server is restarted.
+  return new OAuth2Client({
+    clientId: cfg.client_id,
+    clientSecret: cfg.client_secret,
+    redirectUri,
+    transporterOptions: { timeout: gmailRequestTimeoutMs() },
+  });
 }
 
 /** Resolve a stored credentialsFile reference to an absolute path. */
@@ -129,9 +143,17 @@ let warnedCorruptTokenStore = false;
  * before per-account credential files) to the current shape, defaulting their
  * credential file to the basename of the default credentials path.
  */
-export function loadTokens(): TokenStore {
+/**
+ * Read the token store from disk, distinguishing three states so that writers
+ * can refuse to overwrite a store they couldn't read:
+ *  - a missing file is a normal empty store (`corrupt: false`);
+ *  - a present-but-unparseable file is `corrupt: true` (readers still degrade to
+ *    an empty store so the server keeps running, but writers must not clobber it);
+ *  - a readable file is migrated to the current shape and returned.
+ */
+function readTokenStore(): { store: TokenStore; corrupt: boolean } {
   const file = tokensPath();
-  if (!fs.existsSync(file)) return {};
+  if (!fs.existsSync(file)) return { store: {}, corrupt: false };
   let raw: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf-8"));
@@ -156,7 +178,7 @@ export function loadTokens(): TokenStore {
         }). Treating it as empty; connected accounts will be unavailable until it is repaired or re-created with \`npm run add-account\`.`
       );
     }
-    return {};
+    return { store: {}, corrupt: true };
   }
   const defaultRef = path.basename(credentialsPath());
   const store: TokenStore = {};
@@ -171,7 +193,11 @@ export function loadTokens(): TokenStore {
       };
     }
   }
-  return store;
+  return { store, corrupt: false };
+}
+
+export function loadTokens(): TokenStore {
+  return readTokenStore().store;
 }
 
 /**
@@ -191,9 +217,18 @@ export function saveTokens(store: TokenStore): void {
   const file = tokensPath();
   // Write to a temp file in the same directory, then atomically rename over the
   // target. This prevents a concurrent reader (or a crash mid-write) from ever
-  // seeing a partial/corrupt token store.
+  // seeing a partial/corrupt token store. fsync the temp's contents before the
+  // rename, and the directory after, so a crash/power-loss can't leave a
+  // present-but-garbage tokens.json — the corrupt state that would otherwise be
+  // finished off (overwritten with {}) by the next token refresh.
   const tmp = path.join(dir, `.tokens.${process.pid}.${Date.now()}.tmp`);
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
+  const fd = fs.openSync(tmp, "w", 0o600);
+  try {
+    fs.writeFileSync(fd, JSON.stringify(store, null, 2));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   // Best-effort tighten permissions (no-op on platforms that ignore it).
   try {
     fs.chmodSync(tmp, 0o600);
@@ -201,6 +236,18 @@ export function saveTokens(store: TokenStore): void {
     /* ignore */
   }
   fs.renameSync(tmp, file);
+  // Best-effort durability of the rename itself. Opening a directory for fsync
+  // isn't supported everywhere (e.g. Windows), so ignore failures.
+  try {
+    const dfd = fs.openSync(dir, "r");
+    try {
+      fs.fsyncSync(dfd);
+    } finally {
+      fs.closeSync(dfd);
+    }
+  } catch {
+    /* ignore */
+  }
 }
 
 /**
@@ -298,7 +345,20 @@ async function withTokenLock<T>(fn: () => T): Promise<T> {
 /** Atomically (under the token lock) load the store, mutate it, and save it. */
 async function updateTokens(mutate: (store: TokenStore) => void): Promise<void> {
   await withTokenLock(() => {
-    const store = loadTokens();
+    const { store, corrupt } = readTokenStore();
+    if (corrupt) {
+      // The file exists but couldn't be parsed. Proceeding would persist the
+      // empty fallback (mutated) OVER it, permanently destroying the refresh
+      // tokens that are still recoverable from the corrupt file by hand. Refuse
+      // and surface an actionable error. The refresh-persistence listener
+      // swallows this (best-effort), so an in-memory access token keeps working
+      // until the store is repaired or the server restarts.
+      throw new Error(
+        `Refusing to modify the token store: ${tokensPath()} exists but is ` +
+          `unreadable. Repair or delete it, then retry — overwriting it now ` +
+          `would destroy the connected accounts' saved refresh tokens.`
+      );
+    }
     mutate(store);
     saveTokens(store);
   });

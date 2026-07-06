@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 
 // Point the data dir at a throwaway location before exercising the module.
 // dataDir() reads this env var at call time, so setting it here is sufficient.
@@ -150,6 +151,85 @@ test("loadTokens treats valid-but-non-object JSON as corrupt instead of crashing
     }
   } finally {
     fs.writeFileSync(file, saved); // restore for any later readers
+  }
+});
+
+test("updateTokens refuses to overwrite a corrupt store, preserving the refresh tokens (M1)", async () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
+  // A realistic hand-edit typo: the refresh tokens are still present as text,
+  // but a missing closing brace makes the file unparseable. loadTokens degrades
+  // to {} for readers, but any writer must NOT persist that empty fallback over
+  // this recoverable file (that would destroy every account's refresh token).
+  const corrupt =
+    '{\n "alice@x.com": {"tokens":{"refresh_token":"RT_ALICE"},"credentialsFile":"credentials.json"},\n' +
+    ' "bob@x.com": {"tokens":{"refresh_token":"RT_BOB"},"credentialsFile":"credentials.json"\n';
+  try {
+    // saveAccount must throw and leave the file byte-for-byte unchanged.
+    fs.writeFileSync(file, corrupt);
+    await assert.rejects(
+      () => auth.saveAccount("carol@x.com", { access_token: "c", refresh_token: "RT_C" }, "credentials.json"),
+      /Refusing to modify the token store/
+    );
+    assert.equal(fs.readFileSync(file, "utf-8"), corrupt, "corrupt file must be untouched");
+
+    // removeAccount must refuse too.
+    fs.writeFileSync(file, corrupt);
+    await assert.rejects(() => auth.removeAccount("alice@x.com"), /Refusing to modify/);
+    assert.equal(fs.readFileSync(file, "utf-8"), corrupt);
+
+    // The fire-and-forget refresh listener must not wipe it either.
+    fs.writeFileSync(file, corrupt);
+    const client = auth.getAuthedClient("alice@x.com", {
+      "alice@x.com": {
+        tokens: { refresh_token: "RT_ALICE", access_token: "a", expiry_date: 1 },
+        credentialsFile: "credentials.json",
+      },
+    });
+    client.emit("tokens", { access_token: "NEW", expiry_date: 9999999999999 });
+    await new Promise((r) => setTimeout(r, 100));
+    const after = fs.readFileSync(file, "utf-8");
+    assert.equal(after, corrupt, "refresh listener must not overwrite a corrupt store");
+    assert.match(after, /RT_ALICE/);
+    assert.match(after, /RT_BOB/);
+
+    // Once repaired, writes resume normally.
+    fs.writeFileSync(file, JSON.stringify({}));
+    await auth.saveAccount("dave@x.com", { access_token: "d", refresh_token: "RT_D" }, "credentials.json");
+    assert.ok(auth.listAccounts().includes("dave@x.com"), "writes resume after repair");
+  } finally {
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
+  }
+});
+
+test("newOAuthClient sets a transport timeout so a hung token refresh can't wedge the account (H1)", async () => {
+  const prev = process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS;
+  const server = http.createServer(() => {
+    /* accept the connection, never respond */
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${server.address().port}/token`;
+  try {
+    process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS = "300";
+    const client = auth.newOAuthClient(path.join(dataDir, "credentials.json"), url);
+    // Point the token endpoint at the hung server and force a refresh (expired).
+    client.endpoints = { ...client.endpoints, oauth2TokenUrl: url };
+    client.setCredentials({ refresh_token: "rt", access_token: "at", expiry_date: 1 });
+    // Without the transporter timeout this refresh hangs forever; assert it
+    // rejects well within a ceiling instead (the ceiling wins => "hung" => fail).
+    const outcome = await Promise.race([
+      client.getAccessToken().then(
+        () => "resolved",
+        () => "rejected"
+      ),
+      new Promise((r) => setTimeout(() => r("hung"), 3000)),
+    ]);
+    assert.equal(outcome, "rejected", "a hung token refresh must time out and reject, not hang");
+  } finally {
+    if (prev === undefined) delete process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS;
+    else process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS = prev;
+    await new Promise((r) => server.close(r));
   }
 });
 
