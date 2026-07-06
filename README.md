@@ -11,6 +11,7 @@ This is the multi-account capability the built-in Google connector doesn't offer
 | `gmail_list_accounts` | List connected account emails |
 | `gmail_search_threads` | Search threads with Gmail query syntax |
 | `gmail_get_thread` | Read a full thread (headers + plain-text bodies) |
+| `gmail_get_message` | Read a single message by ID (for threads too large to return whole) |
 | `gmail_create_draft` | Compose a draft (does not send); supports HTML body and attachments |
 | `gmail_send_message` | Send an email immediately; supports HTML body and attachments |
 | `gmail_list_labels` | List labels and their IDs |

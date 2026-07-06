@@ -266,9 +266,15 @@ Returns: JSON {
         threads: detailed,
         ...(nextPageToken ? { next_page_token: nextPageToken } : {}),
       };
+      // Gmail's q-filtered listing can return a short — even empty — page that
+      // still carries a nextPageToken (its result-size estimation is
+      // approximate); "no results" is only true when no token came back.
       const text =
         detailed.length === 0
-          ? `No threads found for query '${query}' in ${acct}.`
+          ? nextPageToken
+            ? `No threads on this page for query '${query}' in ${acct}, but more ` +
+              `pages exist — call again with page_token: ${nextPageToken}`
+            : `No threads found for query '${query}' in ${acct}.`
           : renderJsonText(output, "Refine your query.");
       return { content: [{ type: "text", text }], structuredContent: output };
     } catch (error) {
@@ -393,9 +399,92 @@ For very large threads the result may be truncated: "truncated": true is set, an
               // re-serializing inside renderJsonText (#4).
               jsonTooLargeNotice(
                 fullJson.length,
-                "Thread is very large; read messages individually."
+                "Thread is very large; fetch specific messages with gmail_get_message."
               );
       }
+      return { content: [{ type: "text", text }], structuredContent: output };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: handleGmailError(error) }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// gmail_get_message
+// ---------------------------------------------------------------------------
+server.registerTool(
+  "gmail_get_message",
+  {
+    title: "Get Gmail Message",
+    description: `Retrieve a single email message by its message ID, including headers and plain-text body.
+
+Use when a thread is too large for gmail_get_thread to return every body (its per-message summary lists the message IDs), or when only one specific message is needed.
+
+Args:
+  - message_id (string): The message ID (from gmail_get_thread or gmail_search_threads). Required.
+  - account (string, optional): Which connected account to read from.
+
+Returns: JSON {
+  "account": string,
+  "message_id": string,
+  "thread_id": string,
+  "from": string,
+  "to": string,
+  "date": string,
+  "subject": string,
+  "body": string,
+  "label_ids": string[]
+}
+A very large body is truncated and "truncated": true is set.`,
+    inputSchema: {
+      message_id: z.string().min(1).describe("Message ID to fetch"),
+      account: accountField,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+  async ({ message_id, account }) => {
+    try {
+      const { gmail, account: acct } = gmailFor(account);
+      const res = await withRetry(() =>
+        gmail.users.messages.get({
+          userId: "me",
+          id: message_id,
+          format: "full",
+        })
+      );
+      const m = res.data;
+      // Reuse the thread body budget for a single message: extraction is
+      // fault-isolated and the body is bounded the same way get_thread bounds
+      // its combined bodies.
+      const { messages: capped, truncated } = capMessageBodies(
+        [m],
+        MAX_THREAD_BODY_CHARS,
+        (x) => extractPlainTextSafe(x.payload)
+      );
+      const output = {
+        account: acct,
+        message_id: requireField(m.id, "message.id"),
+        thread_id: m.threadId || "",
+        from: header(m.payload, "From"),
+        to: header(m.payload, "To"),
+        date: header(m.payload, "Date"),
+        subject: header(m.payload, "Subject"),
+        body: capped[0]?.body ?? "",
+        label_ids: m.labelIds || [],
+        ...(truncated ? { truncated: true } : {}),
+      };
+      const text = renderJsonText(
+        output,
+        "Message body was large; the complete result is in structuredContent."
+      );
       return { content: [{ type: "text", text }], structuredContent: output };
     } catch (error) {
       return {
@@ -508,7 +597,11 @@ Returns: JSON { "account": string, "draft_id": string, "message_id": string }`,
         content: [
           {
             type: "text",
-            text: `Draft created in ${acct} (draft_id: ${output.draft_id}).`,
+            // Carry every field the description promises: hosts without
+            // structuredContent support only ever see this text.
+            text: `Draft created in ${acct} (draft_id: ${output.draft_id}${
+              output.message_id ? `, message_id: ${output.message_id}` : ""
+            }).`,
           },
         ],
         structuredContent: output,
@@ -533,7 +626,7 @@ server.registerTool(
 
 Args:
   - to (string[]): Recipient email addresses. Required.
-  - subject (string, optional): Subject line. When omitted on a reply (thread_id set), defaults to the thread's subject, prefixed with "Re:".
+  - subject (string): Subject line. Required unless replying (thread_id set), where omitting it defaults to the thread's subject prefixed with "Re:". Pass "" explicitly to send with no subject.
   - body (string): Message body. Plain text by default, or HTML when is_html is true. Required.
   - is_html (boolean, optional): Treat body as HTML (default false).
   - attachments (object[], optional): Files to attach. Each item provides exactly one of 'path' (local file the server reads) or 'content_base64' (inline base64). 'filename' defaults to the basename for path, required for content_base64; 'mime_type' inferred from extension if omitted.
@@ -552,7 +645,7 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
         .string()
         .optional()
         .describe(
-          "Subject line. Optional when replying (thread_id set): defaults to the thread's subject prefixed with 'Re:'."
+          "Subject line. Required unless replying (thread_id set), where omitting it defaults to the thread's subject prefixed with 'Re:'. Pass an explicit empty string to send with no subject."
         ),
       body: z
         .string()
@@ -600,6 +693,26 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
     in_reply_to,
   }) => {
     try {
+      // `subject` is only optional on a reply (thread_id set), where the
+      // thread's subject is derived. On a fresh send an omitted subject would
+      // silently deliver "(no subject)" — and sending is immediate and
+      // irreversible. Require it explicitly; an empty string is still honored
+      // as a deliberate no-subject send. (Drafts stay permissive: they're
+      // reviewable and editable before sending.)
+      if (subject === undefined && !thread_id) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "Error: subject is required when not replying into a thread. " +
+                'Set subject (pass "" explicitly to send without one), or set ' +
+                "thread_id to reply.",
+            },
+          ],
+          isError: true,
+        };
+      }
       const { gmail, account: acct } = gmailFor(account);
       const resolvedAttachments = resolveAttachments(attachments);
       // When sending into a thread, derive threading headers from it. An
@@ -641,7 +754,11 @@ Returns: JSON { "account": string, "message_id": string, "thread_id": string }`,
         content: [
           {
             type: "text",
-            text: `Message sent from ${acct} (message_id: ${output.message_id}).`,
+            // Carry every field the description promises: hosts without
+            // structuredContent support only ever see this text.
+            text: `Message sent from ${acct} (message_id: ${output.message_id}${
+              output.thread_id ? `, thread_id: ${output.thread_id}` : ""
+            }).`,
           },
         ],
         structuredContent: output,
@@ -889,7 +1006,11 @@ Returns: JSON { "account": string, "target": string, "id": string, "label_ids": 
         content: [
           {
             type: "text",
-            text: `Updated labels on ${output.target} ${id} in ${acct}.`,
+            // Carry the resulting label set the description promises: hosts
+            // without structuredContent support only ever see this text.
+            text: `Updated labels on ${output.target} ${id} in ${acct}. Labels now: ${
+              labelIds.length ? labelIds.join(", ") : "(none)"
+            }.`,
           },
         ],
         structuredContent: output,

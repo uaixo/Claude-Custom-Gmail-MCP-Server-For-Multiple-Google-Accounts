@@ -177,6 +177,44 @@ export interface ThreadSummary {
  * back to the list snippet when the full fetch is unavailable. `retryOpts` lets
  * a caller (or test) tune the retry budget; it defaults to withRetry's defaults.
  */
+/** Named entities the Gmail API uses when escaping snippet fields. */
+const SNIPPET_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+};
+
+/**
+ * Decode the HTML entity escapes the Gmail API applies to `snippet` fields
+ * (&#39;, &amp;, &quot;, numeric references, ...). The API returns snippets
+ * HTML-escaped — unlike bodies, which are decoded via html-to-text — so
+ * without this, search results read "I&#39;ll send the numbers &amp; slides".
+ * Single left-to-right pass, so double-escaped text decodes one level only.
+ */
+function decodeSnippet(snippet: string): string {
+  return snippet.replace(
+    /&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi,
+    (match, body: string) => {
+      if (body.charAt(0) === "#") {
+        const code =
+          body.charAt(1).toLowerCase() === "x"
+            ? parseInt(body.slice(2), 16)
+            : parseInt(body.slice(1), 10);
+        if (Number.isNaN(code) || code < 0 || code > 0x10ffff) return match;
+        try {
+          return String.fromCodePoint(code);
+        } catch {
+          return match; // surrogate-range code point — leave the text as-is
+        }
+      }
+      return SNIPPET_ENTITIES[body.toLowerCase()] ?? match;
+    }
+  );
+}
+
 export async function summarizeThread(
   gmail: gmail_v1.Gmail,
   thread: gmail_v1.Schema$Thread,
@@ -201,7 +239,7 @@ export async function summarizeThread(
       subject: header(first?.payload, "Subject"),
       from: header(first?.payload, "From"),
       date: header(first?.payload, "Date"),
-      snippet: first?.snippet || thread.snippet || "",
+      snippet: decodeSnippet(first?.snippet || thread.snippet || ""),
     };
   } catch (error) {
     return {
@@ -209,7 +247,7 @@ export async function summarizeThread(
       subject: "",
       from: "",
       date: "",
-      snippet: thread.snippet || "",
+      snippet: decodeSnippet(thread.snippet || ""),
       error: handleGmailError(error),
     };
   }
@@ -230,11 +268,29 @@ export async function summarizeThread(
  * still terminates with it. Fields are undefined when there's nothing to thread
  * on.
  */
+/**
+ * Normalize a caller-supplied Message-ID to RFC 5322 msg-id form ("<...>").
+ * Message-IDs are often displayed and copy-pasted without the angle brackets;
+ * emitting the bare token verbatim produces syntactically invalid
+ * In-Reply-To/References headers that receiving clients ignore (the reply then
+ * displays unthreaded for them, invisibly to the sender).
+ */
+function normalizeMsgId(id: string): string {
+  const trimmed = id.trim();
+  if (!trimmed) return "";
+  return trimmed.startsWith("<") && trimmed.endsWith(">")
+    ? trimmed
+    : `<${trimmed}>`;
+}
+
 export function buildReplyHeaders(
   reply: ThreadReplyHeaders | undefined,
   explicitInReplyTo?: string
 ): { inReplyTo?: string; references?: string } {
-  const inReplyTo = explicitInReplyTo || reply?.inReplyTo || "";
+  // Normalize only the caller-supplied id; thread-derived ids come from real
+  // Message-ID headers and are already in msg-id form.
+  const inReplyTo =
+    normalizeMsgId(explicitInReplyTo || "") || reply?.inReplyTo || "";
   let references = reply?.references || "";
   if (inReplyTo) {
     const ids = references ? references.split(/\s+/).filter(Boolean) : [];
@@ -378,7 +434,11 @@ export function extractPlainText(
 ): string {
   if (!payload) return "";
   const plain = findPartBody(payload, "text/plain");
-  if (plain) return plain;
+  // Only a plain part with actual content wins. Some bulk-mail template
+  // systems emit a whitespace-only text/plain alternative (e.g. a bare CRLF)
+  // beside a full text/html part; returning that "body" would make the whole
+  // message look empty when the HTML carries all the content.
+  if (plain.trim()) return plain;
   const html = findPartBody(payload, "text/html");
   if (html) return htmlToText(html);
   return "";
@@ -460,6 +520,23 @@ export interface AttachmentInput {
  * provide exactly one of `path` (read from local disk) or `content_base64`
  * (inline). Throws an Error with an actionable message on bad input.
  */
+/**
+ * Reject composite MIME types for attachments. Attachment parts are emitted
+ * with Content-Transfer-Encoding: base64, which RFC 2046 §5 forbids for
+ * message/* (§5.2.1) and multipart/* (§5.1) entities — emitting them anyway
+ * produces a per-spec-invalid part that strict receivers refuse to parse
+ * (e.g. an attached .eml shown as opaque instead of a forwarded message).
+ */
+function assertEncodableMimeType(index: number, mimeType: string): void {
+  if (/^(message|multipart)\//i.test(mimeType.trim())) {
+    throw new Error(
+      `Attachment ${index}: composite MIME type '${mimeType}' cannot be ` +
+        `base64-encoded (RFC 2046 §5). Attach it as application/octet-stream, ` +
+        `or omit mime_type to infer one from the filename.`
+    );
+  }
+}
+
 export function resolveAttachments(
   inputs: AttachmentInput[] | undefined
 ): ResolvedAttachment[] {
@@ -529,6 +606,7 @@ export function resolveAttachments(
         }
         const filename = a.filename || path.basename(filePath);
         const mimeType = a.mime_type || inferMimeType(filename);
+        assertEncodableMimeType(i, mimeType);
         const contentBase64 = fs.readFileSync(fd).toString("base64");
         return { filename, mimeType, contentBase64 };
       } finally {
@@ -542,6 +620,7 @@ export function resolveAttachments(
       );
     }
     const mimeType = a.mime_type || inferMimeType(a.filename);
+    assertEncodableMimeType(i, mimeType);
     // Validate, and normalize base64url -> standard base64, so we never embed a
     // silently-corrupt attachment. Buffer.from is lenient (it drops invalid
     // chars), so the regex is what actually rejects garbage; re-encoding the
@@ -598,9 +677,13 @@ const MAX_ENCODED_WORD_BYTES = 45;
  * plain subjects stay readable on the wire.
  */
 function encodeHeaderWord(value: string): string {
-  // Pure-ASCII values need no encoding. Checked by code unit rather than a
-  // control-char regex so the function carries no lint-suppression baggage.
-  if (isAscii(value)) return value;
+  // Pure-ASCII values need no encoding — unless the text itself contains an
+  // RFC 2047 encoded-word marker ("=?"): passed through verbatim, recipients'
+  // clients would DECODE it into different text. RFC 2047 §2 requires encoding
+  // such literals; wrapping the whole value preserves it exactly. Checked by
+  // code unit rather than a control-char regex so the function carries no
+  // lint-suppression baggage.
+  if (isAscii(value) && !value.includes("=?")) return value;
   const words: string[] = [];
   let chunk = "";
   let chunkBytes = 0;
@@ -668,7 +751,10 @@ function formatRecipient(recipient: string): string {
     // RFC 2047 encoded-word — legal in a display-name phrase, and (unlike a
     // quoted-string) the right way to carry non-ASCII here.
     displayName = encodeHeaderWord(name);
-  } else if (DISPLAY_NAME_SPECIALS.test(name)) {
+  } else if (DISPLAY_NAME_SPECIALS.test(name) || name.includes("=?")) {
+    // Quote names with specials — and any ASCII name containing "=?", which
+    // would otherwise be decoded by recipients as an RFC 2047 encoded-word
+    // (encoded-words are never recognized inside a quoted-string).
     displayName = `"${name.replace(/(["\\])/g, "\\$1")}"`;
   } else {
     displayName = name;
@@ -871,9 +957,29 @@ function foldHeaderLine(line: string): string {
     if (ch === " ") lastSpace = i;
   }
   segments.push(line.slice(segStart));
+  // RFC 5322 §3.2.2 forbids generating a folded line made up entirely of WSP.
+  // A run of spaces straddling the fold boundary before an unfoldable token can
+  // produce exactly that (two folds at adjacent spaces); merge any all-WSP
+  // segment into the next segment (or the previous one at the end) so the
+  // emitted lines are legal while unfolding still restores the value
+  // byte-for-byte.
+  const merged: string[] = [];
+  let pendingWsp = "";
+  for (const seg of segments) {
+    if (/^[ \t]+$/.test(seg)) {
+      pendingWsp += seg;
+      continue;
+    }
+    merged.push(pendingWsp + seg);
+    pendingWsp = "";
+  }
+  if (pendingWsp !== "") {
+    if (merged.length > 0) merged[merged.length - 1] += pendingWsp;
+    else merged.push(pendingWsp);
+  }
   // Hard-break any segment that has no foldable space but still exceeds the
   // 998-octet hard limit; normal segments pass through unchanged.
-  return segments.flatMap(hardBreakSegment).join("\r\n");
+  return merged.flatMap(hardBreakSegment).join("\r\n");
 }
 
 /** Wrap a long base64 string into 76-char lines per RFC 2045. */
@@ -1306,8 +1412,14 @@ export function capMessageBodies<T>(
     const body = renderBody(item);
     if (body.length > remaining) {
       truncated = true;
+      // Never cut between the halves of a surrogate pair: the resulting lone
+      // surrogate is ill-formed Unicode that strict JSON/Unicode consumers
+      // (e.g. serde-based MCP clients) reject for the whole response.
+      let cut = remaining;
+      const hi = body.charCodeAt(cut - 1);
+      if (hi >= 0xd800 && hi <= 0xdbff) cut -= 1;
       const trimmed =
-        body.slice(0, remaining) + "\n[Body truncated: thread exceeds size limit]";
+        body.slice(0, cut) + "\n[Body truncated: thread exceeds size limit]";
       remaining = 0;
       return { ...item, body: trimmed };
     }

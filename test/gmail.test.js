@@ -1509,3 +1509,164 @@ test("withRetry retries a gaxios-7 transport error whose code is on the FetchErr
   assert.equal(out, "ok");
   assert.equal(calls, 2);
 });
+
+// --------------------------------------------------------------------------
+// Review follow-ups: remaining lows and notes (L1, L2, L4, L5, L6, N2, N3)
+// --------------------------------------------------------------------------
+test("foldHeaderLine never emits a whitespace-only folded line (L1)", () => {
+  // A double space straddling the fold boundary before an unfoldable token
+  // used to produce a line of only WSP — forbidden by RFC 5322 §3.2.2.
+  const subject = "a".repeat(68) + "  " + "b".repeat(100);
+  const mime = decodeBase64Url(buildRawMessage({ to: ["a@b.com"], subject, body: "x" }));
+  for (const line of mime.split("\r\n")) {
+    assert.doesNotMatch(line, /^[ \t]+$/, "no folded line may be all-whitespace");
+  }
+  // Unfolding still restores the subject byte-for-byte.
+  const unfolded = mime.replace(/\r\n(?=[ \t])/g, "");
+  assert.ok(unfolded.includes(`Subject: ${subject}`), "subject must unfold intact");
+});
+
+test("encodeHeaderWord protects ASCII text that looks like an encoded-word (L2)", () => {
+  // Passed through verbatim, recipients would DECODE this into "Hacked".
+  const literal = "=?UTF-8?B?SGFja2Vk?=";
+  const mime = decodeBase64Url(buildRawMessage({ to: ["a@b.com"], subject: literal, body: "x" }));
+  const subjectLine = mime.replace(/\r\n[ \t]/g, " ").match(/^Subject: (.*)$/m)[1];
+  assert.notEqual(subjectLine, literal, "the literal must not go on the wire bare");
+  // The emitted encoded-word(s) decode back to the literal text.
+  const words = subjectLine.match(/=\?UTF-8\?B\?([^?]*)\?=/g);
+  assert.ok(words && words.length > 0, "subject must be RFC 2047-encoded");
+  const decoded = words
+    .map((w) => Buffer.from(w.slice(10, -2), "base64").toString("utf-8"))
+    .join("");
+  assert.equal(decoded, literal);
+});
+
+test("formatRecipient quotes an ASCII display name containing an encoded-word marker (L2)", () => {
+  const mime = decodeBase64Url(
+    buildRawMessage({ to: ["=?UTF-8?B?SGFja2Vk?= x <a@x.com>"], subject: "s", body: "x" })
+  ).replace(/\r\n[ \t]/g, " ");
+  // Quoted-strings are never decoded as encoded-words, so the name survives.
+  assert.match(mime, /^To: "=\?UTF-8\?B\?SGFja2Vk\?= x" <a@x\.com>$/m);
+});
+
+/**
+ * String.prototype.isWellFormed(), but working on Node 18 too (the API landed
+ * in Node 20 and CI still runs the 18.x line that `engines` supports): scan
+ * for lone surrogates by code unit.
+ */
+function isWellFormedString(s) {
+  if (typeof s.isWellFormed === "function") return s.isWellFormed();
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = s.charCodeAt(i + 1); // NaN past the end — fails the range check
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      i++; // skip the low half of a valid pair
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return false; // low surrogate with no preceding high half
+    }
+  }
+  return true;
+}
+
+test("capMessageBodies never splits a surrogate pair at the truncation cut (L4)", () => {
+  const r = capMessageBodies([{ id: 1 }], 5, () => "\u{1F600}".repeat(10));
+  assert.equal(r.truncated, true);
+  assert.match(r.messages[0].body, /truncated/);
+  assert.equal(isWellFormedString(r.messages[0].body), true, "no lone surrogate may survive");
+  // An even budget still cuts cleanly between pairs.
+  const r2 = capMessageBodies([{ id: 1 }], 4, () => "\u{1F600}".repeat(10));
+  assert.equal(isWellFormedString(r2.messages[0].body), true);
+  // The helper itself must actually detect ill-formed strings (Node 18 path).
+  assert.equal(isWellFormedString("ok \ud83d"), false, "lone high surrogate must be detected");
+  assert.equal(isWellFormedString("\ude00 tail"), false, "lone low surrogate must be detected");
+  assert.equal(isWellFormedString("\u{1F600}"), true);
+});
+
+test("extractPlainText falls back to HTML when the text/plain part is whitespace-only (L5)", () => {
+  const payload = {
+    mimeType: "multipart/alternative",
+    parts: [
+      { mimeType: "text/plain", body: { data: b64url("\r\n") } },
+      { mimeType: "text/html", body: { data: b64url("<p>Full content here</p>") } },
+    ],
+  };
+  assert.match(extractPlainText(payload), /Full content here/);
+  // A content-bearing plain part still wins over HTML.
+  const normal = {
+    mimeType: "multipart/alternative",
+    parts: [
+      { mimeType: "text/plain", body: { data: b64url("plain wins") } },
+      { mimeType: "text/html", body: { data: b64url("<p>html</p>") } },
+    ],
+  };
+  assert.equal(extractPlainText(normal), "plain wins");
+});
+
+test("summarizeThread decodes the Gmail API's snippet entity escapes (L6)", async () => {
+  const gmail = mockGmailGet(async () => ({
+    data: {
+      messages: [
+        {
+          snippet: "I&#39;ll send the Q3 numbers &amp; slides &lt;soon&gt;",
+          payload: { headers: [{ name: "Subject", value: "Q3" }] },
+        },
+      ],
+    },
+  }));
+  const out = await summarizeThread(gmail, { id: "t1" });
+  assert.equal(out.snippet, "I'll send the Q3 numbers & slides <soon>");
+
+  // The degraded (fetch-failed) path decodes the list snippet too.
+  const failing = mockGmailGet(async () => {
+    const e = new Error("boom");
+    e.code = 500;
+    throw e;
+  });
+  const degraded = await summarizeThread(
+    failing,
+    { id: "t2", snippet: "Bob &amp; Carol&#x27;s plan" },
+    { retries: 0, baseDelayMs: 1 }
+  );
+  assert.equal(degraded.snippet, "Bob & Carol's plan");
+});
+
+test("buildReplyHeaders normalizes a bare in_reply_to to msg-id form (N2)", () => {
+  // Bare (bracket-less) ids are how Message-IDs are commonly displayed;
+  // emitted verbatim they are invalid and receivers ignore the threading.
+  assert.deepEqual(buildReplyHeaders(undefined, "CAF+abc@mail.gmail.com"), {
+    inReplyTo: "<CAF+abc@mail.gmail.com>",
+    references: "<CAF+abc@mail.gmail.com>",
+  });
+  // A normalized id still matches (and truncates) the thread's chain.
+  const reply = { inReplyTo: "<c@x>", references: "<a@x> <b@x> <c@x>", subject: "T" };
+  const out = buildReplyHeaders(reply, "b@x");
+  assert.equal(out.inReplyTo, "<b@x>");
+  assert.equal(out.references, "<a@x> <b@x>");
+  // Already-bracketed ids pass through unchanged.
+  assert.equal(buildReplyHeaders(undefined, "<ok@x>").inReplyTo, "<ok@x>");
+});
+
+test("resolveAttachments rejects composite MIME types that cannot be base64-encoded (N3)", () => {
+  // RFC 2046 §5 forbids base64 for message/* and multipart/* entities.
+  assert.throws(
+    () =>
+      resolveAttachments([
+        { filename: "original.eml", mime_type: "message/rfc822", content_base64: "QQ==" },
+      ]),
+    /composite MIME type.*application\/octet-stream/
+  );
+  assert.throws(
+    () =>
+      resolveAttachments([
+        { filename: "bundle", mime_type: "multipart/mixed", content_base64: "QQ==" },
+      ]),
+    /composite MIME type/
+  );
+  // Ordinary types are unaffected.
+  assert.doesNotThrow(() =>
+    resolveAttachments([
+      { filename: "a.pdf", mime_type: "application/pdf", content_base64: "QQ==" },
+    ])
+  );
+});

@@ -55,7 +55,11 @@ function makeFake(handlers) {
         get: method("threads.get"),
         modify: method("threads.modify"),
       },
-      messages: { send: method("messages.send"), modify: method("messages.modify") },
+      messages: {
+        send: method("messages.send"),
+        modify: method("messages.modify"),
+        get: method("messages.get"),
+      },
       drafts: { create: method("drafts.create") },
       labels: { list: method("labels.list"), create: method("labels.create") },
     },
@@ -475,7 +479,7 @@ test("gmail_send_message does not retry a 5xx — a transient error can't duplic
   // deliver a second copy.
   const { result, calls } = await callTool(
     "gmail_send_message",
-    { to: ["x@y.com"], body: "b", account: "alice@example.com" },
+    { to: ["x@y.com"], subject: "s", body: "b", account: "alice@example.com" },
     {
       "messages.send": () => {
         const e = new Error("backend unavailable");
@@ -818,4 +822,126 @@ test("gmail_create_draft accepts a dot-less (intranet) recipient domain (#note4)
   );
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.draft_id, "d1");
+});
+
+// --------------------------------------------------------------------------
+// Review follow-ups: remaining lows and notes (L7, L8, N1, N4)
+// --------------------------------------------------------------------------
+test("write tools' text channel carries every field their descriptions promise (L7)", async () => {
+  // Hosts without structuredContent support only ever see the text.
+  const send = await callTool(
+    "gmail_send_message",
+    { to: ["x@y.com"], subject: "s", body: "b", account: "alice@example.com" },
+    { "messages.send": { data: { id: "sent1", threadId: "tSent" } } }
+  );
+  assert.equal(send.result.isError, undefined);
+  assert.match(send.result.content[0].text, /message_id: sent1/);
+  assert.match(send.result.content[0].text, /thread_id: tSent/);
+
+  const draft = await callTool(
+    "gmail_create_draft",
+    { to: ["x@y.com"], subject: "s", body: "b", account: "alice@example.com" },
+    { "drafts.create": { data: { id: "d1", message: { id: "dm1" } } } }
+  );
+  assert.equal(draft.result.isError, undefined);
+  assert.match(draft.result.content[0].text, /draft_id: d1/);
+  assert.match(draft.result.content[0].text, /message_id: dm1/);
+
+  const mod = await callTool(
+    "gmail_modify_labels",
+    { message_id: "m1", add_label_ids: ["STARRED"], account: "alice@example.com" },
+    { "messages.modify": { data: { id: "m1", labelIds: ["INBOX", "STARRED"] } } }
+  );
+  assert.equal(mod.result.isError, undefined);
+  assert.match(mod.result.content[0].text, /Labels now: INBOX, STARRED/);
+});
+
+test("gmail_search_threads surfaces the pagination cursor on an empty page (L8)", async () => {
+  // Gmail's q-filtered listing can return an empty page that still carries a
+  // nextPageToken; the text must not read as a terminal "no results".
+  const { result } = await callTool(
+    "gmail_search_threads",
+    { query: "from:x", account: "alice@example.com" },
+    { "threads.list": { data: { threads: [], nextPageToken: "PAGE2" } } }
+  );
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.next_page_token, "PAGE2");
+  assert.match(result.content[0].text, /more pages exist/);
+  assert.match(result.content[0].text, /page_token: PAGE2/);
+  // A truly empty result (no token) still reads as none found.
+  const empty = await callTool(
+    "gmail_search_threads",
+    { query: "from:x", account: "alice@example.com" },
+    { "threads.list": { data: { threads: [] } } }
+  );
+  assert.match(empty.result.content[0].text, /No threads found/);
+});
+
+test("gmail_get_message fetches a single message and maps headers/body (N1)", async () => {
+  const { result, calls } = await callTool(
+    "gmail_get_message",
+    { message_id: "m42", account: "alice@example.com" },
+    {
+      "messages.get": {
+        data: {
+          id: "m42",
+          threadId: "t7",
+          labelIds: ["INBOX"],
+          payload: {
+            mimeType: "text/plain",
+            headers: [
+              { name: "From", value: "x@y.com" },
+              { name: "To", value: "me@x.com" },
+              { name: "Date", value: "today" },
+              { name: "Subject", value: "Hi" },
+            ],
+            body: { data: utf8("the message body").toString("base64url") },
+          },
+        },
+      },
+    }
+  );
+  assert.equal(result.isError, undefined);
+  const get = calls.find((c) => c.name === "messages.get");
+  assert.equal(get.params.id, "m42");
+  assert.equal(get.params.format, "full");
+  assert.deepEqual(result.structuredContent, {
+    account: "alice@example.com",
+    message_id: "m42",
+    thread_id: "t7",
+    from: "x@y.com",
+    to: "me@x.com",
+    date: "today",
+    subject: "Hi",
+    body: "the message body",
+    label_ids: ["INBOX"],
+  });
+});
+
+test("gmail_send_message requires a subject on a fresh (non-reply) send (N4)", async () => {
+  // Omitting subject without thread_id used to deliver "(no subject)"
+  // silently and irreversibly.
+  const missing = await callTool("gmail_send_message", {
+    to: ["x@y.com"],
+    body: "b",
+    account: "alice@example.com",
+  });
+  assert.equal(missing.result.isError, true);
+  assert.match(missing.result.content[0].text, /subject is required/);
+
+  // An explicit empty string is a deliberate no-subject send and still works.
+  let sentRaw;
+  const explicit = await callTool(
+    "gmail_send_message",
+    { to: ["x@y.com"], subject: "", body: "b", account: "alice@example.com" },
+    {
+      "messages.send": (p) => {
+        sentRaw = p.requestBody.raw;
+        return { data: { id: "s1", threadId: "t1" } };
+      },
+    }
+  );
+  assert.equal(explicit.result.isError, undefined);
+  const mime = Buffer.from(sentRaw, "base64url").toString("utf-8");
+  assert.match(mime, /^Subject: $/m);
 });
