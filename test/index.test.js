@@ -190,6 +190,33 @@ test("gmail_send_message accepts a quoted comma display name and emits it singly
   assert.match(mime, /^To: "Doe, John" <j@x\.com>$/m);
 });
 
+test("gmail_send_message caps recipient length and validates a whitespace-heavy value fast (M2)", async () => {
+  // A >1000-char recipient is rejected by the length cap before the regex runs.
+  const overLong = "a".repeat(1001) + "@x.com";
+  const capped = await callTool("gmail_send_message", {
+    to: [overLong],
+    subject: "s",
+    body: "b",
+    account: "alice@example.com",
+  });
+  assert.equal(capped.result.isError, true);
+  assert.match(capped.result.content[0].text, /too long/i);
+
+  // The previously-quadratic ReDoS shape ("a" + whitespace + "a", no '<'), just
+  // under the cap: the de-overlapped NAME_ADDR_RE must validate it in linear
+  // time. This freezes the whole event loop if the regex ever regresses.
+  const redos = "a" + " ".repeat(996) + "a"; // 998 chars, survives .trim(), no '<'
+  const t0 = Date.now();
+  const bad = await callTool("gmail_send_message", {
+    to: [redos],
+    subject: "s",
+    body: "b",
+    account: "alice@example.com",
+  });
+  assert.equal(bad.result.isError, true); // not a valid recipient -> rejected
+  assert.ok(Date.now() - t0 < 1000, "recipient validation must not take pathological time");
+});
+
 // --------------------------------------------------------------------------
 // gmail_search_threads
 // --------------------------------------------------------------------------

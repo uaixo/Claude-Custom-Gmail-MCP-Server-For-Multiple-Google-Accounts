@@ -126,8 +126,16 @@ const accountField = z
  * name, and every recipient but the last was silently never delivered to.
  */
 const EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
-/** Display name: a quoted string (commas allowed inside) or a phrase with no comma/angle/quote. */
-const NAME_ADDR_RE = /^(?:"(?:[^"\\]|\\.)*"|[^,<>"]*?)\s*<([^<>]+)>$/;
+/**
+ * Display name (a quoted string, commas allowed inside; or a phrase with no
+ * comma/angle/quote) followed by <addr>. The `\s*` between name and `<` lives
+ * ONLY in the quoted branch: the unquoted phrase `[^,<>"]*` already absorbs any
+ * whitespace, and a separate `\s*` there would overlap it, making the match
+ * quadratic on a long whitespace run with no `<` (a ReDoS — see the length cap
+ * on recipientSchema for the second line of defense). `<` is excluded from the
+ * phrase class, so the greedy match stops deterministically at the addr.
+ */
+const NAME_ADDR_RE = /^(?:"(?:[^"\\]|\\.)*"\s*|[^,<>"]*)<([^<>]+)>$/;
 function isRecipient(value: string): boolean {
   const trimmed = value.trim();
   const named = NAME_ADDR_RE.exec(trimmed);
@@ -138,6 +146,9 @@ function isRecipient(value: string): boolean {
 }
 const recipientSchema = z
   .string()
+  // Bound the length before the regex runs: no real recipient approaches this,
+  // and it caps the worst case of NAME_ADDR_RE regardless of future edits.
+  .max(1000, "Recipient is too long (max 1000 characters).")
   .refine(isRecipient, {
     message:
       'Must be a single recipient: "email@host" or \'Name <email@host>\' ' +
