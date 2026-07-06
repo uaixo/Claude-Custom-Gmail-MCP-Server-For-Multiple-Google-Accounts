@@ -271,13 +271,15 @@ export function deriveReplySubject(
  * extraction must skip these: an HTML-only email that also carries a text/plain
  * or text/html attachment (e.g. a .csv or .txt) would otherwise have the
  * attachment's bytes returned as the message body. A part counts as an
- * attachment when its Content-Disposition is "attachment", or when it has a
- * filename and isn't explicitly "inline".
+ * attachment when its Content-Disposition is "attachment", or when it carries a
+ * filename — regardless of an "inline" disposition: some senders (notably
+ * Apple Mail) dispose attached files as `inline; filename="x.txt"`, and such a
+ * file must not outrank the real body. A true body part carries no filename,
+ * so a filename-less inline part is still treated as body.
  */
 function isAttachmentPart(part: gmail_v1.Schema$MessagePart): boolean {
   const disposition = header(part, "Content-Disposition").trim().toLowerCase();
   if (disposition.startsWith("attachment")) return true;
-  if (disposition.startsWith("inline")) return false;
   return !!part.filename;
 }
 
@@ -651,8 +653,15 @@ function formatRecipient(recipient: string): string {
   if (!m) return trimmed; // bare address (or nothing parseable as a name-addr)
   // Both capture groups are present whenever the regex matches; `?? ""` only
   // satisfies the type checker (the address group can never actually be empty).
-  const name = (m[1] ?? "").trim();
+  let name = (m[1] ?? "").trim();
   const address = (m[2] ?? "").trim();
+  // Callers often supply the display name already in RFC 5322 quoted form
+  // ('"Doe, John" <j@x>') — that is how mail clients render such addresses, so
+  // it is what gets copy-pasted. Unwrap a well-formed quoted string (undoing
+  // its \" and \\ escapes) so the quoting below re-quotes canonically instead
+  // of nesting literal quote marks into the visible name.
+  const quoted = /^"((?:[^"\\]|\\.)*)"$/.exec(name);
+  if (quoted) name = (quoted[1] ?? "").replace(/\\(.)/g, "$1");
   if (!name) return `<${address}>`;
   let displayName: string;
   if (!isAscii(name)) {
@@ -719,23 +728,73 @@ function encodeRfc2231(value: string): string {
 }
 
 /**
- * Build a MIME header line carrying a filename parameter, choosing the encoding
- * per RFC 2231: a quote-safe ASCII filename uses the simple quoted form
- * (`filename="report.pdf"`); anything non-ASCII or containing quoting-breaking
- * characters uses an RFC 2231 extended parameter (`filename*=UTF-8''…`), which
- * is the standards-conformant way to carry such names (RFC 2047 encoded-words
- * are illegal inside a quoted string). Either way CR/LF can't survive — the
- * quoted form is gated by isQuotableFilename, and the extended form is
- * percent-encoded — so neither can inject a header.
+ * Payload budget per RFC 2231 continuation segment. Chosen so a full parameter
+ * unit (`; filename*NN*=<chunk>` — up to ~20 octets of overhead) stays within
+ * foldHeaderLine's 78-octet target, letting the header fold legally at the
+ * space after each `;` instead of ever needing a value-corrupting hard break.
+ */
+const RFC2231_SEGMENT_CHARS = 55;
+
+/**
+ * Render a filename as one or more MIME parameters per RFC 2231:
+ *  - a short quote-safe ASCII name → the simple quoted form
+ *    (`filename="report.pdf"`);
+ *  - a long quote-safe ASCII name → quoted continuations
+ *    (`filename*0="…"; filename*1="…"`), RFC 2231 §3;
+ *  - a non-ASCII/unquotable name → the extended form (`filename*=UTF-8''…`),
+ *    split into extended continuations (`filename*0*=UTF-8''…; filename*1*=…`)
+ *    when long, cut only BETWEEN %XX escapes so no segment holds a partial
+ *    escape. Only segment 0 carries the `UTF-8''` charset prefix (§4.1).
+ * Continuations are what the RFC defines for over-long parameter values; the
+ * previous single-parameter emission relied on hardBreakSegment past 998
+ * octets, which inserted a space INTO the value (even mid-escape), corrupting
+ * the filename on the receiving side.
+ */
+function filenameParams(paramName: string, filename: string): string[] {
+  if (isQuotableFilename(filename)) {
+    if (filename.length <= RFC2231_SEGMENT_CHARS) {
+      return [`${paramName}="${filename}"`];
+    }
+    const parts: string[] = [];
+    for (let i = 0; i < filename.length; i += RFC2231_SEGMENT_CHARS) {
+      parts.push(filename.slice(i, i + RFC2231_SEGMENT_CHARS));
+    }
+    return parts.map((p, n) => `${paramName}*${n}="${p}"`);
+  }
+  const encoded = encodeRfc2231(filename);
+  if (encoded.length <= RFC2231_SEGMENT_CHARS) {
+    return [`${paramName}*=UTF-8''${encoded}`];
+  }
+  const chunks: string[] = [];
+  let i = 0;
+  while (i < encoded.length) {
+    let end = Math.min(i + RFC2231_SEGMENT_CHARS, encoded.length);
+    // Never cut inside a %XX escape: back off when the boundary would leave a
+    // bare "%" or "%X" at the end of this chunk.
+    if (end < encoded.length) {
+      if (encoded.charAt(end - 1) === "%") end -= 1;
+      else if (encoded.charAt(end - 2) === "%") end -= 2;
+    }
+    chunks.push(encoded.slice(i, end));
+    i = end;
+  }
+  return chunks.map((c, n) =>
+    n === 0 ? `${paramName}*0*=UTF-8''${c}` : `${paramName}*${n}*=${c}`
+  );
+}
+
+/**
+ * Build a MIME header line carrying a filename parameter (see filenameParams
+ * for the encoding rules). Either way CR/LF can't survive — the quoted forms
+ * are gated by isQuotableFilename, and the extended forms are percent-encoded —
+ * so neither can inject a header.
  */
 function mimeHeaderWithFilename(
   prefix: string,
   paramName: string,
   filename: string
 ): string {
-  return isQuotableFilename(filename)
-    ? `${prefix}; ${paramName}="${filename}"`
-    : `${prefix}; ${paramName}*=UTF-8''${encodeRfc2231(filename)}`;
+  return [prefix, ...filenameParams(paramName, filename)].join("; ");
 }
 
 /** RFC 5322's hard per-line limit (998 octets, excluding the CRLF). */
@@ -748,7 +807,8 @@ const HARD_LINE_LIMIT = 998;
  * character is never cut — and gives each continuation a leading space so the
  * result re-folds as valid FWS. Unlike space-folding this alters the value on
  * unfolding (a space is inserted), but it only triggers for values far longer
- * than any real address, message-id, or filename; everything shorter is
+ * than any real address or message-id (filenames never reach it — they are
+ * split into RFC 2231 continuations upstream); everything shorter is
  * untouched. The alternative — emitting a >998-octet line — risks the whole
  * message being rejected.
  */
