@@ -464,6 +464,53 @@ test("loadTokens skips malformed entries instead of planting TypeErrors (low)", 
   }
 });
 
+test("a malformed entry's recoverable refresh token survives an unrelated write (round-3 M1)", async () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
+  try {
+    // bob is malformed (credentialsFile has the wrong type from a hand-edit)
+    // but still holds a refresh token recoverable by hand. Skipping it on READ
+    // must NOT let a subsequent WRITE for an unrelated account erase it — that
+    // silently destroyed the credential (defeating the corrupt-store-refusal
+    // invariant it was meant to uphold).
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        "alice@x.com": {
+          tokens: { access_token: "a", refresh_token: "RT_ALICE" },
+          credentialsFile: "credentials.json",
+        },
+        "bob@x.com": {
+          tokens: { access_token: "b", refresh_token: "RT_BOB_RECOVERABLE" },
+          credentialsFile: 42,
+        },
+      })
+    );
+    // Readers never see the malformed entry.
+    assert.deepEqual(auth.listAccounts(), ["alice@x.com"]);
+
+    // An unrelated write must preserve bob's token on disk.
+    await auth.saveAccount("carol@x.com", { access_token: "c", refresh_token: "RT_CAROL" }, "credentials.json");
+    let disk = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.equal(disk["bob@x.com"]?.tokens?.refresh_token, "RT_BOB_RECOVERABLE", "malformed entry must survive an unrelated saveAccount");
+
+    // ...and a removal of a DIFFERENT account must not destroy it either.
+    await auth.removeAccount("alice@x.com");
+    disk = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.equal(disk["bob@x.com"]?.tokens?.refresh_token, "RT_BOB_RECOVERABLE", "malformed entry must survive an unrelated removeAccount");
+
+    // Re-adding bob properly REPLACES the malformed copy (no stale duplicate).
+    await auth.saveAccount("bob@x.com", { access_token: "b2", refresh_token: "RT_BOB_NEW" }, "credentials.json");
+    disk = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.equal(disk["bob@x.com"]?.credentialsFile, "credentials.json");
+    assert.equal(disk["bob@x.com"]?.tokens?.refresh_token, "RT_BOB_NEW");
+    assert.ok(auth.listAccounts().includes("bob@x.com"), "bob is usable after repair");
+  } finally {
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
+  }
+});
+
 test("loadTokens migrates a legacy raw-Credentials entry to the current shape (low)", () => {
   const file = path.join(dataDir, "tokens.json");
   const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
