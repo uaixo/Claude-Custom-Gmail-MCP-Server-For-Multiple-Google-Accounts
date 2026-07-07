@@ -18,6 +18,7 @@ import {
   buildRawMessage,
   buildReplyHeaders,
   capMessageBodies,
+  decodeRfc2047,
   deriveReplySubject,
   extractPlainTextSafe,
   getThreadReplyHeaders,
@@ -363,10 +364,10 @@ For very large threads the result may be truncated: "truncated": true is set, an
       const capped = cappedNewestFirst.reverse();
       const messages = capped.map((m) => ({
         message_id: requireField(m.id, "message.id"),
-        from: header(m.payload, "From"),
-        to: header(m.payload, "To"),
+        from: decodeRfc2047(header(m.payload, "From")),
+        to: decodeRfc2047(header(m.payload, "To")),
         date: header(m.payload, "Date"),
-        subject: header(m.payload, "Subject"),
+        subject: decodeRfc2047(header(m.payload, "Subject")),
         body: m.body,
         label_ids: m.labelIds || [],
       }));
@@ -485,10 +486,10 @@ A very large body is truncated and "truncated": true is set.`,
         account: acct,
         message_id: requireField(m.id, "message.id"),
         thread_id: m.threadId || "",
-        from: header(m.payload, "From"),
-        to: header(m.payload, "To"),
+        from: decodeRfc2047(header(m.payload, "From")),
+        to: decodeRfc2047(header(m.payload, "To")),
         date: header(m.payload, "Date"),
-        subject: header(m.payload, "Subject"),
+        subject: decodeRfc2047(header(m.payload, "Subject")),
         body: capped[0]?.body ?? "",
         label_ids: m.labelIds || [],
         ...(truncated ? { truncated: true } : {}),
@@ -865,15 +866,22 @@ Returns: JSON { "account": string, "id": string, "name": string }`,
   async ({ name, account }) => {
     try {
       const { gmail, account: acct } = gmailFor(account);
-      const res = await withRetry(() =>
-        gmail.users.labels.create({
-          userId: "me",
-          requestBody: {
-            name,
-            labelListVisibility: "labelShow",
-            messageListVisibility: "show",
-          },
-        })
+      // Label creation is not idempotent: a lost-response 5xx/timeout after a
+      // server-side commit would make the retry 409 ("name exists"), reporting
+      // a definite-looking failure for a label that WAS created — and losing
+      // its id. Restrict retries to rate limits (rejected before processing),
+      // like send/draft.
+      const res = await withRetry(
+        () =>
+          gmail.users.labels.create({
+            userId: "me",
+            requestBody: {
+              name,
+              labelListVisibility: "labelShow",
+              messageListVisibility: "show",
+            },
+          }),
+        { idempotent: false }
       );
       const output = {
         account: acct,

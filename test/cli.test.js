@@ -147,6 +147,44 @@ test("listenWithFallback falls back to an ephemeral port when the preferred one 
   }
 });
 
+test("listenWithFallback falls back to an ephemeral port on EACCES (Windows reserved port ranges) (round-5)", async () => {
+  // On Windows, Hyper-V/WSL2 reserve whole 100-port blocks; binding a port
+  // inside one fails with EACCES, not EADDRINUSE. Real EACCES can't be
+  // provoked portably (Linux/macOS use it for privileged ports, Windows CI
+  // runs elevated), so drive listenWithFallback through a deterministic stub
+  // that exposes exactly the server surface it uses.
+  const handlers = new Map();
+  let listens = 0;
+  const stub = {
+    once(event, fn) {
+      handlers.set(event, fn);
+    },
+    removeListener(event, fn) {
+      if (handlers.get(event) === fn) handlers.delete(event);
+    },
+    listen(port, host, cb) {
+      listens += 1;
+      if (listens === 1) {
+        assert.equal(port, 4773);
+        const err = Object.assign(
+          new Error("listen EACCES: permission denied 127.0.0.1:4773"),
+          { code: "EACCES" }
+        );
+        queueMicrotask(() => handlers.get("error")?.(err));
+      } else {
+        assert.equal(port, 0, "the fallback must request an ephemeral port");
+        queueMicrotask(cb);
+      }
+    },
+    address() {
+      return { port: 49152 };
+    },
+  };
+  const port = await listenWithFallback(stub, 4773);
+  assert.equal(port, 49152);
+  assert.equal(listens, 2, "exactly one fallback bind attempt");
+});
+
 test("gmailRequestTimeoutMs defaults, honors a valid override, and falls back on garbage (M7)", () => {
   const prev = process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS;
   try {

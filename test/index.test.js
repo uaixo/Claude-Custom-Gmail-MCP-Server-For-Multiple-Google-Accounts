@@ -565,6 +565,31 @@ test("gmail_create_label sends the expected visibility settings", async () => {
   assert.equal(result.structuredContent.id, "Label_1");
 });
 
+test("gmail_create_label does NOT retry a 5xx — a lost-response success must not masquerade as a 409 (round-5)", async () => {
+  // Label creation is not idempotent: if Gmail commits the label but the
+  // response is lost to a 503/timeout, a retry gets 409 "name exists" and the
+  // tool would report a definite-looking failure for a label that WAS created
+  // (losing its id). The create must therefore surface the 5xx on the first
+  // attempt instead of retrying.
+  const { result, calls } = await callTool(
+    "gmail_create_label",
+    { name: "Clients/Acme", account: "alice@example.com" },
+    {
+      "labels.create": () => {
+        const e = new Error("Service Unavailable");
+        e.response = { status: 503 };
+        throw e;
+      },
+    }
+  );
+  assert.equal(result.isError, true);
+  assert.equal(
+    calls.filter((c) => c.name === "labels.create").length,
+    1,
+    "a non-idempotent create must not be retried"
+  );
+});
+
 // --------------------------------------------------------------------------
 // gmail_modify_labels — validation + target handling
 // --------------------------------------------------------------------------

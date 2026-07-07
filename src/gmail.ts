@@ -131,6 +131,93 @@ export function header(
 }
 
 /**
+ * Decode one RFC 2047 encoded-word's payload to a string, or null if it can't
+ * be decoded faithfully (bad base64/quoted-printable, unknown charset) — the
+ * caller then leaves the raw word visible rather than emitting mojibake.
+ */
+function decodeEncodedWord(
+  charset: string,
+  encoding: string,
+  text: string
+): string | null {
+  let bytes: Buffer;
+  if (encoding.toLowerCase() === "b") {
+    // Validate before decoding: Buffer.from is lenient (drops invalid chars),
+    // which would silently garble rather than reject a malformed word.
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(text)) return null;
+    if (text.replace(/=+$/, "").length % 4 === 1) return null;
+    bytes = Buffer.from(text, "base64");
+  } else {
+    // Q encoding: '_' is space, '=XX' is a hex-encoded byte (RFC 2047 §4.2).
+    const out: number[] = [];
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (c === "_") {
+        out.push(0x20);
+      } else if (c === "=") {
+        const hex = text.slice(i + 1, i + 3);
+        if (!/^[0-9A-Fa-f]{2}$/.test(hex)) return null;
+        out.push(parseInt(hex, 16));
+        i += 2;
+      } else {
+        out.push(text.charCodeAt(i));
+      }
+    }
+    bytes = Buffer.from(out);
+  }
+  const label = charset.trim().toLowerCase();
+  if (
+    label === "utf-8" ||
+    label === "utf8" ||
+    label === "us-ascii" ||
+    label === "ascii"
+  ) {
+    return bytes.toString("utf-8");
+  }
+  try {
+    return new TextDecoder(label).decode(bytes);
+  } catch {
+    return null; // unknown charset label — keep the raw word visible
+  }
+}
+
+/**
+ * Best-effort RFC 2047 decoding of a header value for DISPLAY (Subject, From,
+ * To). The Gmail API generally returns payload.headers values already decoded
+ * to Unicode, but non-conforming or malformed messages can carry raw
+ * "=?charset?B?...?=" words through verbatim; decode the well-formed ones so
+ * clients aren't handed base64 gibberish. Any word that doesn't decode cleanly
+ * is left exactly as-is, and non-encoded text always passes through verbatim
+ * (decoding an already-decoded header is a no-op). Protocol headers
+ * (Message-ID/References, the reply-subject derivation) deliberately do NOT go
+ * through this — they must round-trip verbatim.
+ */
+export function decodeRfc2047(value: string): string {
+  // encoded-word := "=?" charset ["*" language] "?" ("B" / "Q") "?" text "?="
+  const word = /=\?([^?*\s]+)(?:\*[^?\s]*)?\?([bq])\?([^?\s]*)\?=/gi;
+  let out = "";
+  let last = 0;
+  let lastDecodedEnd = -1;
+  for (let m = word.exec(value); m !== null; m = word.exec(value)) {
+    const whole = m[0];
+    // All three groups are non-optional in the pattern, so they exist on match.
+    const decoded = decodeEncodedWord(m[1]!, m[2]!, m[3]!);
+    const gap = value.slice(last, m.index);
+    if (decoded === null) {
+      out += gap + whole;
+    } else {
+      // RFC 2047 §6.2: whitespace between two adjacent encoded words is not
+      // displayed (it exists only to satisfy the 76-char encoded-line limit).
+      const dropGap = lastDecodedEnd === last && /^[ \t\r\n]+$/.test(gap);
+      out += (dropGap ? "" : gap) + decoded;
+      lastDecodedEnd = m.index + whole.length;
+    }
+    last = m.index + whole.length;
+  }
+  return last === 0 ? value : out + value.slice(last);
+}
+
+/**
  * Threading headers for replying into an existing thread, derived from its
  * last message: the Message-ID to use as In-Reply-To, the accumulated
  * References chain, and the thread's subject. Fields are empty strings when the
@@ -259,8 +346,8 @@ export async function summarizeThread(
     const first = full.data.messages?.[0];
     return {
       thread_id: id,
-      subject: header(first?.payload, "Subject"),
-      from: header(first?.payload, "From"),
+      subject: decodeRfc2047(header(first?.payload, "Subject")),
+      from: decodeRfc2047(header(first?.payload, "From")),
       date: header(first?.payload, "Date"),
       snippet: decodeSnippet(first?.snippet || thread.snippet || ""),
     };
@@ -565,8 +652,11 @@ export function resolveAttachments(
 ): ResolvedAttachment[] {
   if (!inputs?.length) return [];
   return inputs.map((a, i) => {
-    const hasPath = !!a.path;
-    const hasInline = !!a.content_base64;
+    // Presence, not truthiness: an empty content_base64 is a LEGAL zero-byte
+    // attachment (agents base64-encode empty files to ""), and truthiness
+    // rejected it with a factually wrong "provide exactly one of" error.
+    const hasPath = a.path !== undefined;
+    const hasInline = a.content_base64 !== undefined;
     if (hasPath === hasInline) {
       throw new Error(
         `Attachment ${i}: provide exactly one of 'path' or 'content_base64'.`
@@ -1380,6 +1470,33 @@ function isRetryableTransport(error: unknown): boolean {
 }
 
 /**
+ * Extract an HTTP Retry-After response header from an error, in milliseconds.
+ * Handles both value forms (delta-seconds and HTTP-date) and both header-bag
+ * shapes gaxios surfaces (a fetch Headers instance with .get, or a plain
+ * lower-cased object). Undefined when absent or unparseable.
+ */
+function retryAfterMsOf(error: unknown): number | undefined {
+  const headers = (error as { response?: { headers?: unknown } })?.response
+    ?.headers;
+  if (!headers || typeof headers !== "object") return undefined;
+  let raw: unknown;
+  const getter = (headers as { get?: unknown }).get;
+  if (typeof getter === "function") {
+    raw = (getter as (name: string) => unknown).call(headers, "retry-after");
+  } else {
+    const rec = headers as Record<string, unknown>;
+    raw = rec["retry-after"] ?? rec["Retry-After"];
+  }
+  // Header values are strings; tolerate a numeric delta-seconds just in case.
+  if (typeof raw !== "string" && typeof raw !== "number") return undefined;
+  const s = String(raw).trim();
+  if (s === "") return undefined;
+  if (/^\d+$/.test(s)) return Number(s) * 1000;
+  const date = Date.parse(s);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+}
+
+/**
  * Run a Gmail API call with bounded, jittered exponential backoff on transient
  * failures. By default (idempotent calls) it retries on rate limiting + 5xx;
  * pass `idempotent: false` for a call with a side effect that must not be
@@ -1387,15 +1504,24 @@ function isRetryableTransport(error: unknown): boolean {
  * Non-retryable errors (other 4xx, local validation, transport errors with no
  * HTTP status) and the final attempt throw immediately, so callers' error
  * handling is unchanged except that a transient blip is retried instead of
- * surfaced. Jitter avoids synchronized retries across concurrent calls.
+ * surfaced. Jitter avoids synchronized retries across concurrent calls. A
+ * server-mandated Retry-After that exceeds the computed backoff is honored
+ * (capped at `retryAfterCapMs`, default 30s): retrying inside the mandated
+ * window is guaranteed to fail and would burn the whole retry budget.
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  opts: { retries?: number; baseDelayMs?: number; idempotent?: boolean } = {}
+  opts: {
+    retries?: number;
+    baseDelayMs?: number;
+    idempotent?: boolean;
+    retryAfterCapMs?: number;
+  } = {}
 ): Promise<T> {
   const retries = opts.retries ?? 3;
   const baseDelayMs = opts.baseDelayMs ?? 300;
   const idempotent = opts.idempotent !== false;
+  const retryAfterCapMs = opts.retryAfterCapMs ?? 30_000;
   const retryable = idempotent ? RETRYABLE_STATUSES : RATE_LIMIT_ONLY;
   for (let attempt = 0; ; attempt++) {
     try {
@@ -1415,8 +1541,15 @@ export async function withRetry<T>(
       if (attempt >= retries || !retryableNow) {
         throw error;
       }
-      const delay =
+      const backoff =
         baseDelayMs * 2 ** attempt + Math.floor(Math.random() * baseDelayMs);
+      const retryAfter = retryAfterMsOf(error);
+      // The cap bounds only the server-mandated wait — a hostile or buggy
+      // header must not be able to stall a tool call for minutes.
+      const delay =
+        retryAfter !== undefined && retryAfter > backoff
+          ? Math.min(retryAfter, retryAfterCapMs)
+          : backoff;
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }

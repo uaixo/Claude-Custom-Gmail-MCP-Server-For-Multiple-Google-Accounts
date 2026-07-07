@@ -85,7 +85,12 @@ export function listenWithFallback(
   return new Promise((resolve, reject) => {
     const boundPort = () => (server.address() as AddressInfo).port;
     const onFirstError = (err: NodeJS.ErrnoException) => {
-      if (err.code === "EADDRINUSE") {
+      // EADDRINUSE: another process holds the port. EACCES: the OS refuses it —
+      // on Windows, Hyper-V/WSL2 reserve whole 100-port blocks (`netsh
+      // interface ipv4 show excludedportrange`) that regularly cover 4773.
+      // Both are per-port conditions an ephemeral port sidesteps, and Google's
+      // loopback flow accepts any port on 127.0.0.1.
+      if (err.code === "EADDRINUSE" || err.code === "EACCES") {
         server.once("error", reject);
         server.listen(0, host, () => resolve(boundPort()));
       } else {
