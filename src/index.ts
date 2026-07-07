@@ -35,6 +35,7 @@ import {
 import {
   CHARACTER_LIMIT,
   isMainModule,
+  MAX_MESSAGE_BODY_CHARS,
   MAX_THREAD_BODY_CHARS,
   MAX_THREAD_MESSAGES,
   packageVersion,
@@ -472,12 +473,12 @@ A very large body is truncated and "truncated": true is set.`,
         })
       );
       const m = res.data;
-      // Reuse the thread body budget for a single message: extraction is
-      // fault-isolated and the body is bounded the same way get_thread bounds
-      // its combined bodies.
+      // Bound the single body with the message budget (not the smaller thread
+      // budget): a single-message result has no combined per-message metadata,
+      // so it can use the full render budget. Extraction is fault-isolated.
       const { messages: capped, truncated } = capMessageBodies(
         [m],
-        MAX_THREAD_BODY_CHARS,
+        MAX_MESSAGE_BODY_CHARS,
         (x) => extractPlainTextSafe(x.payload)
       );
       const output = {

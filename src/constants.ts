@@ -60,6 +60,18 @@ export const CHARACTER_LIMIT = 25000;
 export const MAX_THREAD_BODY_CHARS = 20000;
 
 /**
+ * Character budget for a single message body (gmail_get_message). Unlike a
+ * thread read, a single-message result carries no combined per-message
+ * metadata, so it can use the full render budget: a body up to this size is
+ * preserved in structuredContent (the authoritative channel), and the text
+ * channel still renders it as JSON whenever the whole serialized object fits
+ * under CHARACTER_LIMIT, falling back to the notice only for the largest
+ * bodies. Reusing the thread's smaller 20000 budget here needlessly dropped —
+ * and made unretrievable — the 20000..25000 char band of a message.
+ */
+export const MAX_MESSAGE_BODY_CHARS = CHARACTER_LIMIT;
+
+/**
  * Maximum number of per-thread metadata fetches to run concurrently when
  * expanding search results. Bounds the fan-out so large result sets don't
  * trip Gmail's per-user rate limit.

@@ -946,6 +946,34 @@ test("gmail_get_message fetches a single message and maps headers/body (N1)", as
   });
 });
 
+test("gmail_get_message preserves a body up to the full render budget, not the smaller thread cap (L3)", async () => {
+  // A body between MAX_THREAD_BODY_CHARS (20000) and CHARACTER_LIMIT (25000)
+  // used to be truncated at 20000 and made unretrievable by any tool. A single
+  // message has no thread metadata overhead, so it keeps the full body.
+  const body = "y".repeat(23000);
+  const { result } = await callTool(
+    "gmail_get_message",
+    { message_id: "m1", account: "alice@example.com" },
+    {
+      "messages.get": {
+        data: {
+          id: "m1",
+          threadId: "t1",
+          labelIds: ["INBOX"],
+          payload: {
+            mimeType: "text/plain",
+            headers: [{ name: "Subject", value: "Big" }],
+            body: { data: utf8(body).toString("base64url") },
+          },
+        },
+      },
+    }
+  );
+  assert.equal(result.isError, undefined);
+  assert.equal(result.structuredContent.body, body, "the full 23000-char body must be preserved");
+  assert.equal(result.structuredContent.truncated, undefined, "23000 chars is under the message budget");
+});
+
 test("gmail_send_message requires a subject on a fresh (non-reply) send (N4)", async () => {
   // Omitting subject without thread_id used to deliver "(no subject)"
   // silently and irreversibly.

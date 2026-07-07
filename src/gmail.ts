@@ -67,8 +67,13 @@ export function gmailFor(account?: string): {
   // force-enables (options.retry defaults to true) — that layer re-fires GETs
   // up to 3 times with fixed unjittered delays INSIDE each withRetry attempt,
   // multiplying to ~16 requests per failing idempotent call and stalling tool
-  // calls for many seconds under throttling. withRetry is the sole retry
-  // policy: bounded, jittered, idempotency-aware.
+  // calls for many seconds under throttling. withRetry is thus the sole
+  // *bounded, jittered, idempotency-aware* retry layer. One deliberate
+  // exception remains below it: the OAuth2Client is built with
+  // forceRefreshOnFailure (see newOAuthClient in auth.ts), so it performs one
+  // refresh-and-retry on a 401/403 — kept because it self-heals an access
+  // token invalidated server-side before its local expiry, at the accepted
+  // cost of one wasted refresh on a 403 a refresh can't fix.
   const gmail = gmailApi.gmail({
     version: "v1",
     auth,

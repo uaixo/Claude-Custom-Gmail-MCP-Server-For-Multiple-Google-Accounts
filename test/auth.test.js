@@ -127,6 +127,30 @@ test("token store mutations steal a stale lock and release it (#7)", async () =>
   assert.ok(!fs.existsSync(lock), "lock should be released after the write");
 });
 
+test("a fresh (live) lock is never stolen; the write times out without clobbering (L1)", async () => {
+  // Token-verified stealing only takes a lock older than LOCK_STALE_MS. A fresh
+  // lock — a live holder mid-write — must be left intact, and the contending
+  // write must fail loud (time out) rather than proceed unlocked and clobber.
+  await auth.saveAccount("keep@x.com", { access_token: "k", refresh_token: "RT_KEEP" }, "credentials.json");
+  const lock = path.join(dataDir, "tokens.json.lock");
+  const prevTimeout = process.env.GMAIL_MCP_LOCK_TIMEOUT_MS;
+  try {
+    fs.writeFileSync(lock, "another-holder-token"); // fresh mtime => not stale
+    process.env.GMAIL_MCP_LOCK_TIMEOUT_MS = "250";
+    await assert.rejects(
+      () => auth.saveAccount("new@x.com", { access_token: "n", refresh_token: "RT_NEW" }, "credentials.json"),
+      /Could not acquire the token-store lock/
+    );
+    assert.ok(!auth.listAccounts().includes("new@x.com"), "the timed-out write must not apply");
+    assert.ok(auth.listAccounts().includes("keep@x.com"), "the existing store is untouched");
+    assert.equal(fs.readFileSync(lock, "utf-8"), "another-holder-token", "the live holder's lock is left intact");
+  } finally {
+    if (prevTimeout === undefined) delete process.env.GMAIL_MCP_LOCK_TIMEOUT_MS;
+    else process.env.GMAIL_MCP_LOCK_TIMEOUT_MS = prevTimeout;
+    fs.rmSync(lock, { force: true });
+  }
+});
+
 test("loadTokens returns empty without throwing on a corrupt store (#8)", () => {
   const file = path.join(dataDir, "tokens.json");
   const saved = fs.readFileSync(file, "utf-8");
