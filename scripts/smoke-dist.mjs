@@ -19,6 +19,17 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-smoke-"));
 const env = { ...process.env, GMAIL_MCP_DATA_DIR: dataDir };
 
+// Remove the temp data dir on ANY exit, including the process.exit(1) that
+// fail() takes — otherwise every failed run (the common case while debugging a
+// dist regression, or a slow machine tripping a watchdog) orphans a dir.
+process.on("exit", () => {
+  try {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  } catch {
+    /* best-effort */
+  }
+});
+
 const fail = (msg) => {
   console.error(`SMOKE FAIL: ${msg}`);
   process.exit(1);
@@ -132,5 +143,5 @@ await new Promise((resolve) => {
   });
 });
 
-fs.rmSync(dataDir, { recursive: true, force: true });
+// Cleanup runs via the process 'exit' handler above (covers success + failure).
 console.log("smoke: PASS");

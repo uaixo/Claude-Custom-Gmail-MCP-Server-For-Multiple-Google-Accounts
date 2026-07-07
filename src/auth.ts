@@ -163,7 +163,12 @@ export function credentialsRefFor(file: string): string {
  */
 let warnedCorruptTokenStore = false;
 
-/** Malformed store entries we've already warned about this process (per key). */
+/**
+ * Malformed store keys we've already warned about, so the warning fires once
+ * per key rather than on every tool call's loadTokens. Pruned each read to the
+ * keys still malformed (see readTokenStore), so it stays bounded by the store's
+ * entry count instead of growing with every distinct malformed key ever seen.
+ */
 const warnedInvalidEntryKeys = new Set<string>();
 
 /**
@@ -217,6 +222,8 @@ function readTokenStore(): {
   // Raw entries we couldn't interpret, kept by their ORIGINAL key so a
   // subsequent write round-trips them unchanged instead of erasing them.
   const preserved: Record<string, unknown> = {};
+  // Malformed keys seen in this read, used to prune the warn-once set below.
+  const malformedThisRead = new Set<string>();
   for (const [email, value] of Object.entries(raw)) {
     // Normalize keys to the documented lower-case invariant. saveAccount always
     // writes lower-cased keys, but a hand-edited or externally written store
@@ -248,6 +255,7 @@ function readTokenStore(): {
       // whole-file corrupt-store refusal protects). Warn once, since silently
       // dropping a listed account from the usable set is confusing.
       preserved[email] = value;
+      malformedThisRead.add(key);
       if (!warnedInvalidEntryKeys.has(key)) {
         warnedInvalidEntryKeys.add(key);
         console.error(
@@ -257,6 +265,13 @@ function readTokenStore(): {
         );
       }
     }
+  }
+  // Bound the warn-once set to the keys still malformed in THIS read: forget any
+  // key that has since been repaired or removed. Otherwise, since loadTokens
+  // runs on nearly every tool call, an external writer cycling through distinct
+  // malformed keys would grow the set without bound for the process's lifetime.
+  for (const k of warnedInvalidEntryKeys) {
+    if (!malformedThisRead.has(k)) warnedInvalidEntryKeys.delete(k);
   }
   return { store, corrupt: false, preserved };
 }
