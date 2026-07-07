@@ -31,5 +31,17 @@ export default tseslint.config(
       sourceType: "module",
       globals: { ...globals.node },
     },
+  },
+  {
+    // The smoke harness and this config are code too: an undefined identifier
+    // in a fail-only branch of smoke-dist.mjs would otherwise ship green and
+    // surface only when a real dist regression needs those diagnostics.
+    files: ["scripts/**/*.mjs", "eslint.config.js"],
+    extends: [js.configs.recommended],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "module",
+      globals: { ...globals.node },
+    },
   }
 );

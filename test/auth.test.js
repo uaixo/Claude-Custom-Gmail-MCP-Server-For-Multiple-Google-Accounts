@@ -153,7 +153,9 @@ test("a fresh (live) lock is never stolen; the write times out without clobberin
 
 test("loadTokens returns empty without throwing on a corrupt store (#8)", () => {
   const file = path.join(dataDir, "tokens.json");
-  const saved = fs.readFileSync(file, "utf-8");
+  // Guard the read: under --test-name-pattern / sharding no earlier test has
+  // created tokens.json, and an unconditional read ENOENTs spuriously.
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
   try {
     fs.writeFileSync(file, "{ not valid json");
     let result;
@@ -165,13 +167,15 @@ test("loadTokens returns empty without throwing on a corrupt store (#8)", () => 
     // deepEqual would otherwise fail on the prototype difference alone.
     assert.deepEqual({ ...result }, {});
   } finally {
-    fs.writeFileSync(file, saved); // restore for any later readers
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
   }
 });
 
 test("loadTokens treats valid-but-non-object JSON as corrupt instead of crashing (#1)", () => {
   const file = path.join(dataDir, "tokens.json");
-  const saved = fs.readFileSync(file, "utf-8");
+  // Guarded like the test above: isolated runs start with no tokens.json.
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
   try {
     // `null` is the dangerous case: Object.entries(null) throws, which would
     // crash callers like startup's listAccounts(). An array or bare string used
@@ -188,7 +192,8 @@ test("loadTokens treats valid-but-non-object JSON as corrupt instead of crashing
       assert.deepEqual(auth.listAccounts(), [], `listAccounts(${bad}) should be empty`);
     }
   } finally {
-    fs.writeFileSync(file, saved); // restore for any later readers
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
   }
 });
 
@@ -267,6 +272,12 @@ test("newOAuthClient sets a transport timeout so a hung token refresh can't wedg
   } finally {
     if (prev === undefined) delete process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS;
     else process.env.GMAIL_MCP_REQUEST_TIMEOUT_MS = prev;
+    // Destroy any live connection BEFORE the graceful close: in the failure
+    // mode this test guards (the transporter timeout stops applying), the
+    // still-pending refresh holds its socket open forever, and a bare
+    // server.close() waits on it — hanging the whole test run at the workflow
+    // timeout instead of reporting the crisp assertion failure above.
+    server.closeAllConnections();
     await new Promise((r) => server.close(r));
   }
 });

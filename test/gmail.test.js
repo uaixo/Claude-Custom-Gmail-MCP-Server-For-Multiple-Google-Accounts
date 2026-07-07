@@ -744,7 +744,19 @@ function joinExtendedFilenameSegments(unfolded) {
     segs[0][2].startsWith("UTF-8''"),
     "segment 0 must carry the charset prefix"
   );
-  return segs.map((s, i) => (i === 0 ? s[2].slice(7) : s[2])).join("");
+  const values = segs.map((s, i) => (i === 0 ? s[2].slice(7) : s[2]));
+  // Check each SEGMENT before joining: joining erases the boundaries, so a
+  // boundary that splits a %XX escape (a segment ending "%" or "%E") is
+  // invisible to any assertion on the joined string — receiving clients,
+  // which decode per-segment context, would garble the filename.
+  values.forEach((v, i) => {
+    assert.doesNotMatch(
+      v,
+      /%[0-9A-Fa-f]?$/,
+      `segment ${i} ends mid-%XX escape: "${v.slice(-6)}"`
+    );
+  });
+  return values.join("");
 }
 
 test("buildRawMessage splits a long non-ASCII filename into RFC 2231 continuations that round-trip (#M1)", () => {
@@ -800,7 +812,9 @@ test("buildRawMessage keeps a very long filename intact — no space injected mi
   }
   const joined = joinExtendedFilenameSegments(mime.replace(/\r\n[ \t]/g, " "));
   assert.doesNotMatch(joined, / /, "no segment may contain an injected space");
-  assert.doesNotMatch(joined, /%.?$/, "no segment boundary may split a %XX escape");
+  // Mid-escape segment boundaries are asserted per-segment inside
+  // joinExtendedFilenameSegments — on the joined string the boundaries are
+  // already erased, so a check here could never fail.
   assert.equal(decodeURIComponent(joined), filename);
 });
 
