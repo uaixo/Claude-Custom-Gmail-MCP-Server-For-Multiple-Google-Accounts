@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { randomBytes } from "crypto";
 import { OAuth2Client, Credentials } from "google-auth-library";
 import {
   credentialsPath,
@@ -125,6 +126,16 @@ export function newOAuthClient(
     // session policies, security events) makes every call fail with re-auth
     // instructions for up to ~55 minutes although one refresh — performed at
     // most once per request — would fix it.
+    //
+    // Tradeoff (kept deliberately): the library couples the 401 and 403 cases
+    // (isAuthErr = 401 || 403) with no per-status setting, so this also fires a
+    // refresh + re-request on 403s a refresh can never fix (permission and
+    // rate-limit errors), which stacks on top of withRetry's own retries. Under
+    // sustained throttling that roughly doubles the request/refresh count per
+    // attempt. We accept that bounded, self-recovering cost because avoiding a
+    // ~55-minute outage on a pre-expiry invalidation is the better user
+    // experience; it is the one intentional exception to withRetry being the
+    // sole bounded retry layer (see gmailFor in gmail.ts).
     forceRefreshOnFailure: true,
   });
 }
@@ -356,46 +367,87 @@ function lockAcquireTimeoutMs(): number {
     : LOCK_ACQUIRE_TIMEOUT_MS;
 }
 
-async function withTokenLock<T>(fn: () => T): Promise<T> {
+/**
+ * Best-effort removal of a token-store lock that appears abandoned (older than
+ * LOCK_STALE_MS). Returns true if a stale lock was cleared (or had already
+ * vanished), false if the lock is fresh/live or turned out to be live and was
+ * left untouched.
+ *
+ * The removal is token-verified to avoid the stat/rename TOCTOU that a plain
+ * "rename it aside" cannot close: rename targets the PATH, not the specific
+ * stale inode we stat'd, so a live holder that recreated the lock between our
+ * stat and our rename would otherwise be silently displaced. We therefore
+ * re-read the lock's content, rename it aside, and confirm the moved file still
+ * carries the exact content we observed as stale. If it doesn't, we grabbed a
+ * fresh lock — restore it untouched and report failure so no one proceeds as if
+ * the slot were free.
+ */
+function tryStealStaleLock(lockPath: string): boolean {
+  let observed: string;
+  let mtimeMs: number;
+  try {
+    mtimeMs = fs.statSync(lockPath).mtimeMs;
+    observed = fs.readFileSync(lockPath, "utf-8");
+  } catch {
+    return true; // gone already → nothing holds it
+  }
+  if (Date.now() - mtimeMs <= LOCK_STALE_MS) return false; // fresh/live holder
+  // Graveyard name matches the `.tokens.*.tmp` pattern so a crash mid-steal
+  // leaves a file the existing temp sweep cleans up.
+  const graveyard = path.join(
+    path.dirname(lockPath),
+    `.tokens.lock-stale.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`
+  );
+  try {
+    fs.renameSync(lockPath, graveyard);
+  } catch {
+    return true; // another contender moved it first → gone from our POV
+  }
+  let grabbed: string | null;
+  try {
+    grabbed = fs.readFileSync(graveyard, "utf-8");
+  } catch {
+    grabbed = null;
+  }
+  if (grabbed === observed) {
+    fs.rmSync(graveyard, { force: true }); // took the exact stale lock we saw
+    return true;
+  }
+  // We displaced a DIFFERENT (fresh) lock — a live holder recreated it between
+  // our stat and our rename. Restore it and report failure.
+  try {
+    fs.renameSync(graveyard, lockPath);
+  } catch {
+    fs.rmSync(graveyard, { force: true });
+  }
+  return false;
+}
+
+async function withTokenLock<T>(fn: (assertHeld: () => void) => T): Promise<T> {
   ensureDataDir();
   const lockPath = `${tokensPath()}.lock`;
   const timeoutMs = lockAcquireTimeoutMs();
+  // A token unique to THIS acquisition, written into the lock file. It lets the
+  // holder prove at commit time that it still owns the lock (see assertHeld),
+  // and lets tryStealStaleLock distinguish the exact stale inode from a fresh
+  // one recreated concurrently.
+  const token = `${process.pid}.${randomBytes(8).toString("hex")}.${Date.now()}`;
   let held = false;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      // Atomic exclusive create; record the holder PID so a stuck lock is
-      // diagnosable (and a future holder can tell who left it behind).
-      fs.writeFileSync(lockPath, `${process.pid}`, { flag: "wx" });
+      // Atomic exclusive create; only one process can win it for a given path.
+      fs.writeFileSync(lockPath, token, { flag: "wx" });
       held = true;
       break;
     } catch (e) {
       // A non-EEXIST error is a real filesystem failure (permissions, etc.);
       // surface it rather than masking it as lock contention.
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      try {
-        // Steal a lock left behind by a crashed holder. Operations under the
-        // lock are sub-millisecond, so a lock older than LOCK_STALE_MS is
-        // almost certainly abandoned rather than a live, slow holder. Steal by
-        // ATOMIC RENAME, not unlink: exactly one contender wins the rename, so
-        // a second stealer delayed between its staleness check and its removal
-        // can never delete a fresh lock that the winner (or anyone else) has
-        // since created — the stat-then-unlink form raced exactly that way and
-        // let two writers into the critical section. The graveyard name matches
-        // the `.tokens.*.tmp` pattern so a crash between rename and rm leaves a
-        // file the existing temp sweep cleans up.
-        if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
-          const graveyard = path.join(
-            path.dirname(lockPath),
-            `.tokens.lock-stale.${process.pid}.${Date.now()}.tmp`
-          );
-          fs.renameSync(lockPath, graveyard);
-          fs.rmSync(graveyard, { force: true });
-          continue;
-        }
-      } catch {
-        continue; // lock vanished (or another stealer won the rename) → retry
-      }
+      // A lock exists. If it's abandoned (crashed holder), token-verified-steal
+      // it and retry immediately; otherwise back off. Operations under the lock
+      // are sub-millisecond, so a lock older than LOCK_STALE_MS is abandoned.
+      if (tryStealStaleLock(lockPath)) continue;
       // Jittered backoff so the server and a concurrent add-account don't retry
       // in lock-step and keep colliding on the same slot.
       await sleep(25 + Math.floor(Math.random() * 25));
@@ -409,21 +461,45 @@ async function withTokenLock<T>(fn: () => T): Promise<T> {
         `Another process may be updating it; please retry.`
     );
   }
-  try {
-    return fn();
-  } finally {
-    // force:true → no throw if the lock was already removed (e.g. stolen).
+  // Confirm we still own the lock. Call this immediately before committing a
+  // write. Token-verified stealing prevents a live lock from being taken in the
+  // first place (the finding's two-writer interleaving), and for this tool's
+  // at-most-two-writers reality that is sufficient; assertHeld is the backstop
+  // for the irreducible micro-windows (e.g. a lock briefly absent during a
+  // restore) — if our token is no longer in the file, we abort the write and
+  // let the caller retry rather than clobber another process's update.
+  const assertHeld = (): void => {
+    let current: string | null = null;
     try {
-      fs.rmSync(lockPath, { force: true });
+      current = fs.readFileSync(lockPath, "utf-8");
     } catch {
-      /* ignore */
+      /* lock gone → we no longer hold it */
+    }
+    if (current !== token) {
+      throw new Error(
+        `Lost the token-store lock at ${lockPath} to a concurrent writer before ` +
+          `committing; aborting to avoid clobbering its update. Please retry.`
+      );
+    }
+  };
+  try {
+    return fn(assertHeld);
+  } finally {
+    // Release only the lock we still own, so we never delete a lock another
+    // process legitimately created after ours was stolen.
+    try {
+      if (fs.readFileSync(lockPath, "utf-8") === token) {
+        fs.rmSync(lockPath, { force: true });
+      }
+    } catch {
+      /* already gone / unreadable — nothing to release */
     }
   }
 }
 
 /** Atomically (under the token lock) load the store, mutate it, and save it. */
 async function updateTokens(mutate: (store: TokenStore) => void): Promise<void> {
-  await withTokenLock(() => {
+  await withTokenLock((assertHeld) => {
     const { store, corrupt, preserved } = readTokenStore();
     if (corrupt) {
       // The file exists but couldn't be parsed. Proceeding would persist the
@@ -439,6 +515,9 @@ async function updateTokens(mutate: (store: TokenStore) => void): Promise<void> 
       );
     }
     mutate(store);
+    // We're about to overwrite tokens.json. Confirm we still hold the lock: if
+    // a concurrent writer displaced us, abort rather than clobber its update.
+    assertHeld();
     saveTokens(store, preserved);
   });
 }
@@ -471,22 +550,10 @@ export function cleanupStaleTokenTemps(maxAgeMs = 60_000): void {
   // happens to contend on it. A lock older than LOCK_STALE_MS can't belong to a
   // live holder — operations under it are sub-millisecond — which is exactly the
   // threshold withTokenLock uses to steal one, so applying it here is safe.
-  const lockPath = `${tokensPath()}.lock`;
-  try {
-    if (now - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
-      // Same rename-first stealing as withTokenLock, for the same reason: this
-      // sweep must never unlink a lock that a live contender re-created between
-      // our staleness check and our removal.
-      const graveyard = path.join(
-        dir,
-        `.tokens.lock-stale.${process.pid}.${now}.tmp`
-      );
-      fs.renameSync(lockPath, graveyard);
-      fs.rmSync(graveyard, { force: true });
-    }
-  } catch {
-    /* no lock present, or it vanished under us — nothing to clean up */
-  }
+  // Also remove a lock file abandoned by a crashed holder, via the same
+  // token-verified steal withTokenLock uses so this sweep never displaces a
+  // lock a live contender recreated between our staleness check and our removal.
+  tryStealStaleLock(`${tokensPath()}.lock`);
 }
 
 /** Persist (or update) one account's tokens and credential-file reference. */
