@@ -35,7 +35,7 @@ Every tool except `gmail_list_accounts` accepts `account: "you@gmail.com"`. If o
 
 ## Prerequisites
 
-- **Node.js ≥ 18.18** (20.x and 22.x also work and are covered by CI). Check with `node -v`; on macOS the easiest install is [Homebrew](https://brew.sh) — `brew install node`.
+- **Node.js ≥ 18.18** (20.x and 22.x also work and are covered by CI; **20+ recommended**). Check with `node -v`; on macOS the easiest install is [Homebrew](https://brew.sh) — `brew install node`. On Node 18, `npm install` may print harmless `EBADENGINE` warnings (one dependency declares Node 20+ but currently runs fine on 18); installs configured with `engine-strict=true` will refuse — use Node 20+ there.
 - **git**, to clone the repo and pull updates later.
 
 Clone the project and work from its folder (the example names the folder `gmail-mcp-server`; any path works):
