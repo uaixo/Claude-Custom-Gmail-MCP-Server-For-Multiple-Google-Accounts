@@ -174,7 +174,7 @@ const warnedInvalidEntryKeys = new Set<string>();
 /**
  * Load the token store, migrating any legacy entries (raw Credentials written
  * before per-account credential files) to the current shape, defaulting their
- * credential file to the basename of the default credentials path.
+ * credential file to a reference to the configured default credentials path.
  */
 /**
  * Read the token store from disk, distinguishing three states so that writers
@@ -190,7 +190,11 @@ function readTokenStore(): {
   preserved: Record<string, unknown>;
 } {
   const file = tokensPath();
-  if (!fs.existsSync(file)) return { store: {}, corrupt: false, preserved: {} };
+  const empty = () => ({
+    store: Object.create(null) as TokenStore,
+    preserved: Object.create(null) as Record<string, unknown>,
+  });
+  if (!fs.existsSync(file)) return { ...empty(), corrupt: false };
   let raw: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf-8"));
@@ -215,13 +219,26 @@ function readTokenStore(): {
         }). Treating it as empty; connected accounts will be unavailable until it is repaired or re-created with \`npm run add-account\`.`
       );
     }
-    return { store: {}, corrupt: true, preserved: {} };
+    return { ...empty(), corrupt: true };
   }
-  const defaultRef = path.basename(credentialsPath());
-  const store: TokenStore = {};
+  // Reference the default credential file the way saveAccount would: basename
+  // for a file inside the data dir, absolute path otherwise. Taking just the
+  // basename here broke every migrated account when GMAIL_OAUTH_CREDENTIALS
+  // pointed outside the data dir (the basename then resolved to a
+  // data-dir-relative path that doesn't exist) — and the first store write
+  // persisted that broken ref.
+  const defaultRef = credentialsRefFor(credentialsPath());
+  // Null-prototype maps: tokens.json is user-editable, so a key literally named
+  // "__proto__" must become an ordinary own entry, not a prototype mutation
+  // that hides the entry from every Object.keys/entries walk (and lets the
+  // next write silently erase it from disk).
+  const store: TokenStore = Object.create(null) as TokenStore;
   // Raw entries we couldn't interpret, kept by their ORIGINAL key so a
   // subsequent write round-trips them unchanged instead of erasing them.
-  const preserved: Record<string, unknown> = {};
+  const preserved: Record<string, unknown> = Object.create(null) as Record<
+    string,
+    unknown
+  >;
   // Malformed keys seen in this read, used to prune the warn-once set below.
   const malformedThisRead = new Set<string>();
   for (const [email, value] of Object.entries(raw)) {
@@ -236,13 +253,17 @@ function readTokenStore(): {
     } else if (
       typeof value === "object" &&
       value !== null &&
+      !Array.isArray(value) &&
       !("tokens" in value) &&
       !("credentialsFile" in value)
     ) {
       // Legacy: the value is a raw Credentials object (pre-per-account
       // credential files). Only a plain object WITHOUT the current shape's
       // keys qualifies — an object that has them but with wrong types is a
-      // malformed current-shape entry, not legacy data.
+      // malformed current-shape entry, not legacy data, and an ARRAY is never
+      // legacy Credentials: wrapping one used to produce a listed-but-broken
+      // account (opaque auth-library error on every call) and rewrote the
+      // garbage on disk in wrapped form instead of preserving it untouched.
       store[key] = {
         tokens: value,
         credentialsFile: defaultRef,
@@ -303,9 +324,15 @@ export function saveTokens(
   // preserved entry is dropped only when the same account (case-insensitively)
   // now exists as a real store entry — i.e. it was repaired or re-added, so the
   // stale malformed copy should not linger.
-  const merged: Record<string, unknown> = {};
+  // Null-prototype + hasOwn: a preserved key named "constructor" (or any
+  // Object.prototype property name) must not look "already in the store" via
+  // the prototype chain — that would silently drop it from the merged output.
+  const merged: Record<string, unknown> = Object.create(null) as Record<
+    string,
+    unknown
+  >;
   for (const [k, v] of Object.entries(preserved)) {
-    if (!(k.toLowerCase() in store)) merged[k] = v;
+    if (!Object.hasOwn(store, k.toLowerCase())) merged[k] = v;
   }
   Object.assign(merged, store);
   // Write to a temp file in the same directory, then atomically rename over the
@@ -401,8 +428,18 @@ function tryStealStaleLock(lockPath: string): boolean {
   let observed: string;
   let mtimeMs: number;
   try {
-    mtimeMs = fs.statSync(lockPath).mtimeMs;
-    observed = fs.readFileSync(lockPath, "utf-8");
+    // fstat + read through ONE file descriptor so the mtime and the content
+    // always describe the SAME inode. A path-based stat-then-read pair can
+    // interleave with a concurrent steal + fresh-lock recreation: we'd observe
+    // the stale inode's mtime but the fresh lock's content, "verify" the fresh
+    // content below, and delete a live holder's lock.
+    const fd = fs.openSync(lockPath, "r");
+    try {
+      mtimeMs = fs.fstatSync(fd).mtimeMs;
+      observed = fs.readFileSync(fd, "utf-8");
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {
     return true; // gone already → nothing holds it
   }
@@ -602,7 +639,9 @@ export async function removeAccount(email: string): Promise<boolean> {
   const key = email.toLowerCase();
   let existed = false;
   await updateTokens((store, preserved) => {
-    if (key in store) {
+    // hasOwn, not `in`: `"constructor" in store` matches the prototype chain,
+    // which would report success for an entry that never existed.
+    if (Object.hasOwn(store, key)) {
       delete store[key];
       existed = true;
     }

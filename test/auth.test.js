@@ -160,7 +160,10 @@ test("loadTokens returns empty without throwing on a corrupt store (#8)", () => 
     assert.doesNotThrow(() => {
       result = auth.loadTokens();
     });
-    assert.deepEqual(result, {});
+    // Spread first: the store is deliberately a null-prototype object (so a
+    // key literally named "__proto__" stays an ordinary entry), and strict
+    // deepEqual would otherwise fail on the prototype difference alone.
+    assert.deepEqual({ ...result }, {});
   } finally {
     fs.writeFileSync(file, saved); // restore for any later readers
   }
@@ -180,7 +183,8 @@ test("loadTokens treats valid-but-non-object JSON as corrupt instead of crashing
       assert.doesNotThrow(() => {
         result = auth.loadTokens();
       }, `loadTokens threw on ${bad}`);
-      assert.deepEqual(result, {}, `loadTokens(${bad}) should be empty`);
+      // Spread first — the store is a null-prototype object by design.
+      assert.deepEqual({ ...result }, {}, `loadTokens(${bad}) should be empty`);
       assert.deepEqual(auth.listAccounts(), [], `listAccounts(${bad}) should be empty`);
     }
   } finally {
@@ -589,6 +593,154 @@ test("loadTokens migrates a legacy raw-Credentials entry to the current shape (l
       tokens: { access_token: "la", refresh_token: "lr" },
       credentialsFile: "credentials.json",
     });
+  } finally {
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
+  }
+});
+
+test("legacy migration keeps an external GMAIL_OAUTH_CREDENTIALS ref absolute (round-5 M1)", () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
+  const prevEnv = process.env.GMAIL_OAUTH_CREDENTIALS;
+  const extDir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-extcred-"));
+  const extCred = path.join(extDir, "gmail-client.json");
+  try {
+    // README-documented setup: the OAuth client lives OUTSIDE the data dir.
+    fs.writeFileSync(
+      extCred,
+      JSON.stringify({ installed: { client_id: "cid", client_secret: "secret" } })
+    );
+    process.env.GMAIL_OAUTH_CREDENTIALS = extCred;
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ "legacy@x.com": { access_token: "la", refresh_token: "lr" } })
+    );
+    const store = auth.loadTokens();
+    // A basename-only ref would resolve against the data dir — where this file
+    // does not exist — breaking every call for the migrated account and baking
+    // the broken ref into tokens.json on the next write.
+    assert.equal(store["legacy@x.com"]?.credentialsFile, extCred);
+    assert.ok(
+      auth.getAuthedClient("legacy@x.com", store),
+      "the migrated account must be usable with the env-configured credentials"
+    );
+  } finally {
+    if (prevEnv === undefined) delete process.env.GMAIL_OAUTH_CREDENTIALS;
+    else process.env.GMAIL_OAUTH_CREDENTIALS = prevEnv;
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
+    fs.rmSync(extDir, { recursive: true, force: true });
+  }
+});
+
+test("prototype-named keys are ordinary entries: listed, preserved across writes, removable (round-5)", async () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
+  try {
+    // tokens.json is user-editable, so keys named after Object.prototype
+    // properties must behave like any other key. "__proto__" used to mutate
+    // the store's prototype (an invisible phantom entry, erased by the next
+    // write); a malformed "constructor" was dropped by the preserve merge
+    // (`in` consulted the prototype chain) and removeAccount("constructor")
+    // reported success on a store that never contained it.
+    fs.writeFileSync(
+      file,
+      // Computed keys: a literal `"__proto__":` in an object initializer sets
+      // the object's PROTOTYPE (spec B.3.1) instead of creating an own
+      // property, so JSON.stringify would silently drop the entry.
+      JSON.stringify({
+        "keep@x.com": {
+          tokens: { access_token: "k", refresh_token: "RT_KEEP" },
+          credentialsFile: "credentials.json",
+        },
+        ["__proto__"]: {
+          tokens: { access_token: "p", refresh_token: "RT_PROTO" },
+          credentialsFile: "credentials.json",
+        },
+        ["constructor"]: {
+          tokens: { access_token: "c", refresh_token: "RT_CTOR" },
+          credentialsFile: 42, // malformed → lives in the preserved map
+        },
+      })
+    );
+    const store = auth.loadTokens();
+    assert.ok(
+      Object.keys(store).includes("__proto__"),
+      "a valid-shaped __proto__ entry is a real, listed entry"
+    );
+    assert.equal(store["tokens"], undefined, "no prototype pollution");
+    assert.equal(store["credentialsFile"], undefined, "no prototype pollution");
+
+    // An unrelated write must keep BOTH prototype-named records on disk.
+    await auth.saveAccount(
+      "other@x.com",
+      { access_token: "o", refresh_token: "RT_OTHER" },
+      "credentials.json"
+    );
+    let disk = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.equal(
+      disk["__proto__"]?.tokens?.refresh_token,
+      "RT_PROTO",
+      "__proto__ entry must survive an unrelated write"
+    );
+    assert.equal(
+      disk["constructor"]?.tokens?.refresh_token,
+      "RT_CTOR",
+      "preserved 'constructor' entry must survive an unrelated write"
+    );
+
+    // Removal reports honestly and actually removes.
+    assert.equal(await auth.removeAccount("nosuch@x.com"), false);
+    assert.equal(await auth.removeAccount("constructor"), true);
+    assert.equal(await auth.removeAccount("__proto__"), true);
+    assert.equal(
+      await auth.removeAccount("constructor"),
+      false,
+      "a second removal reports not-connected"
+    );
+    disk = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.ok(!Object.keys(disk).includes("__proto__"));
+    assert.ok(!Object.keys(disk).includes("constructor"));
+    assert.equal(disk["keep@x.com"]?.tokens?.refresh_token, "RT_KEEP");
+  } finally {
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
+  }
+});
+
+test("an array-valued entry is preserved as malformed, not misclassified as legacy (round-5)", async () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
+  try {
+    // An array is `typeof "object"` without the current shape's keys, so it
+    // used to take the legacy-Credentials branch: listed as a connected
+    // account, failing opaquely on every call, and rewritten on disk in
+    // wrapped form. It must be treated as malformed instead: unlisted, warned
+    // about, and round-tripped on writes byte-for-byte.
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        "ok@x.com": {
+          tokens: { access_token: "a", refresh_token: "r" },
+          credentialsFile: "credentials.json",
+        },
+        "work@x.com": [],
+      })
+    );
+    assert.deepEqual(auth.listAccounts(), ["ok@x.com"], "array entry must not be listed");
+
+    await auth.saveAccount(
+      "carol@x.com",
+      { access_token: "c", refresh_token: "rc" },
+      "credentials.json"
+    );
+    const disk = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.deepEqual(
+      disk["work@x.com"],
+      [],
+      "the array must survive on disk untouched (preserved, not wrapped)"
+    );
   } finally {
     if (saved !== null) fs.writeFileSync(file, saved);
     else fs.rmSync(file, { force: true });

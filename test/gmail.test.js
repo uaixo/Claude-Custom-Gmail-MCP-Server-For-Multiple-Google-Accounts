@@ -17,6 +17,7 @@ import {
   resolveAttachments,
   decodeBase64Url,
   capMessageBodies,
+  decodeRfc2047,
   deriveReplySubject,
   requireField,
   renderJsonText,
@@ -1927,4 +1928,150 @@ test("getThreadReplyHeaders anchors the reply to the last DELIVERED message, ski
   const none = await getThreadReplyHeaders(allDrafts, "t2");
   assert.equal(none.inReplyTo, "");
   assert.equal(none.references, "");
+});
+
+// --------------------------------------------------------------------------
+// decodeRfc2047 — defensive display decoding of header values  (round-5)
+// --------------------------------------------------------------------------
+test("decodeRfc2047 decodes B- and Q-encoded words and passes plain text through (round-5)", () => {
+  assert.equal(decodeRfc2047("=?UTF-8?B?5pel5pys6Kqe?="), "日本語");
+  assert.equal(decodeRfc2047("=?utf-8?q?caf=C3=A9_au_lait?="), "café au lait");
+  assert.equal(decodeRfc2047("=?ISO-8859-1?Q?caf=E9?="), "café");
+  // Already-decoded (the common Gmail API case) and plain values are no-ops.
+  assert.equal(decodeRfc2047("plain ascii subject"), "plain ascii subject");
+  assert.equal(decodeRfc2047("Re: 日本語 (fwd)"), "Re: 日本語 (fwd)");
+  // Text around an encoded word is kept verbatim.
+  assert.equal(decodeRfc2047("Re: =?UTF-8?B?5pel5pys6Kqe?= (fwd)"), "Re: 日本語 (fwd)");
+  // RFC 2231 language suffix on the charset is tolerated.
+  assert.equal(decodeRfc2047("=?UTF-8*ja?B?5pel5pys6Kqe?="), "日本語");
+});
+
+test("decodeRfc2047 drops whitespace between adjacent encoded words (RFC 2047 §6.2)", () => {
+  // The split exists only to satisfy the 76-char encoded-line limit.
+  assert.equal(decodeRfc2047("=?UTF-8?B?5pel5pys?= =?UTF-8?B?6Kqe?="), "日本語");
+  // ...but whitespace between a word and plain text is real content.
+  assert.equal(decodeRfc2047("=?UTF-8?B?5pel5pys6Kqe?= news"), "日本語 news");
+});
+
+test("decodeRfc2047 leaves undecodable words raw instead of emitting mojibake (round-5)", () => {
+  const unknownCharset = "=?X-KLINGON?B?5pel?=";
+  assert.equal(decodeRfc2047(unknownCharset), unknownCharset);
+  const badBase64 = "=?UTF-8?B?!!!!?=";
+  assert.equal(decodeRfc2047(badBase64), badBase64);
+  const badQuoted = "=?UTF-8?Q?=ZZ?=";
+  assert.equal(decodeRfc2047(badQuoted), badQuoted);
+});
+
+test("summarizeThread decodes RFC 2047 subject/from for display (round-5)", async () => {
+  const fake = {
+    users: {
+      threads: {
+        get: async () => ({
+          data: {
+            messages: [
+              {
+                payload: {
+                  headers: [
+                    { name: "Subject", value: "=?UTF-8?B?5pel5pys6Kqe?=" },
+                    { name: "From", value: "=?UTF-8?Q?Caf=C3=A9?= <cafe@x.com>" },
+                    { name: "Date", value: "Mon, 1 Jan 2024 00:00:00 +0000" },
+                  ],
+                },
+                snippet: "s",
+              },
+            ],
+          },
+        }),
+      },
+    },
+  };
+  const out = await summarizeThread(fake, { id: "t1" });
+  assert.equal(out.subject, "日本語");
+  assert.equal(out.from, "Café <cafe@x.com>");
+  assert.equal(out.date, "Mon, 1 Jan 2024 00:00:00 +0000");
+});
+
+// --------------------------------------------------------------------------
+// resolveAttachments — zero-byte inline attachments  (round-5)
+// --------------------------------------------------------------------------
+test("resolveAttachments accepts a zero-byte content_base64 attachment (round-5)", () => {
+  // "" is the base64 of an empty file — a legal attachment. Truthiness checks
+  // used to reject it with a factually wrong "provide exactly one of" error.
+  const [att] = resolveAttachments([{ content_base64: "", filename: "empty.txt" }]);
+  assert.equal(att.contentBase64, "");
+  assert.equal(att.filename, "empty.txt");
+  // The exactly-one rule is still enforced on real violations.
+  assert.throws(() => resolveAttachments([{ filename: "x.txt" }]), /exactly one/);
+  assert.throws(
+    () => resolveAttachments([{ path: "p", content_base64: "", filename: "x.txt" }]),
+    /exactly one/
+  );
+});
+
+// --------------------------------------------------------------------------
+// withRetry — Retry-After honoring  (round-5)
+// --------------------------------------------------------------------------
+test("withRetry honors a delta-seconds Retry-After larger than the backoff (Headers shape) (round-5)", async () => {
+  const err = Object.assign(new Error("rate limited"), {
+    response: {
+      status: 429,
+      headers: { get: (n) => (n === "retry-after" ? "1" : null) },
+    },
+  });
+  let calls = 0;
+  const t0 = Date.now();
+  const out = await withRetry(
+    () => {
+      calls += 1;
+      if (calls === 1) throw err;
+      return Promise.resolve("ok");
+    },
+    { retries: 1, baseDelayMs: 1 }
+  );
+  const elapsed = Date.now() - t0;
+  assert.equal(out, "ok");
+  assert.equal(calls, 2);
+  // Backoff alone would be ~2ms; the mandated wait is 1000ms.
+  assert.ok(elapsed >= 900, `waited ${elapsed}ms; expected the ~1s mandated wait`);
+});
+
+test("withRetry caps a hostile/huge Retry-After (plain-object header shape) (round-5)", async () => {
+  const err = Object.assign(new Error("unavailable"), {
+    response: { status: 503, headers: { "retry-after": "3600" } },
+  });
+  let calls = 0;
+  const t0 = Date.now();
+  const out = await withRetry(
+    () => {
+      calls += 1;
+      if (calls === 1) throw err;
+      return Promise.resolve("ok");
+    },
+    { retries: 1, baseDelayMs: 1, retryAfterCapMs: 50 }
+  );
+  const elapsed = Date.now() - t0;
+  assert.equal(out, "ok");
+  // An uncapped wait would be an hour; the cap bounds it to ~50ms.
+  assert.ok(elapsed < 2000, `capped wait took ${elapsed}ms; expected ~50ms`);
+});
+
+test("withRetry honors an HTTP-date Retry-After (capital-case plain key) (round-5)", async () => {
+  // toUTCString truncates milliseconds, so give it 2s of slack and assert
+  // against a comfortably smaller bound to stay clock-jitter-proof.
+  const date = new Date(Date.now() + 2000).toUTCString();
+  const err = Object.assign(new Error("rate limited"), {
+    response: { status: 429, headers: { "Retry-After": date } },
+  });
+  let calls = 0;
+  const t0 = Date.now();
+  await withRetry(
+    () => {
+      calls += 1;
+      if (calls === 1) throw err;
+      return Promise.resolve("ok");
+    },
+    { retries: 1, baseDelayMs: 1 }
+  );
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed >= 800, `waited ${elapsed}ms; expected most of the ~1-2s mandated wait`);
 });
