@@ -513,7 +513,9 @@ async function withTokenLock<T>(fn: (assertHeld: () => void) => T): Promise<T> {
 }
 
 /** Atomically (under the token lock) load the store, mutate it, and save it. */
-async function updateTokens(mutate: (store: TokenStore) => void): Promise<void> {
+async function updateTokens(
+  mutate: (store: TokenStore, preserved: Record<string, unknown>) => void
+): Promise<void> {
   await withTokenLock((assertHeld) => {
     const { store, corrupt, preserved } = readTokenStore();
     if (corrupt) {
@@ -529,7 +531,7 @@ async function updateTokens(mutate: (store: TokenStore) => void): Promise<void> 
           `would destroy the connected accounts' saved refresh tokens.`
       );
     }
-    mutate(store);
+    mutate(store, preserved);
     // We're about to overwrite tokens.json. Confirm we still hold the lock: if
     // a concurrent writer displaced us, abort rather than clobber its update.
     assertHeld();
@@ -599,10 +601,22 @@ export function accountCredentials(): Record<string, string> {
 export async function removeAccount(email: string): Promise<boolean> {
   const key = email.toLowerCase();
   let existed = false;
-  await updateTokens((store) => {
+  await updateTokens((store, preserved) => {
     if (key in store) {
       delete store[key];
       existed = true;
+    }
+    // A malformed entry for this address lives only in `preserved` (it never
+    // parses into `store`), so the check above would miss it and saveTokens
+    // would faithfully re-persist it. Purge any preserved entry whose key
+    // matches this address (case-insensitively) too, so a disconnect actually
+    // removes the on-disk record — including its recoverable refresh token —
+    // instead of misreporting the account as "not connected".
+    for (const rawKey of Object.keys(preserved)) {
+      if (rawKey.toLowerCase() === key) {
+        delete preserved[rawKey];
+        existed = true;
+      }
     }
   });
   authedClients.delete(key);

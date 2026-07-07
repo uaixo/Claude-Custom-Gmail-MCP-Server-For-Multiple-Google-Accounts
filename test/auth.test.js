@@ -535,6 +535,46 @@ test("a malformed entry's recoverable refresh token survives an unrelated write 
   }
 });
 
+test("removeAccount purges a malformed (preserved) entry instead of misreporting it as not-connected (round-4)", async () => {
+  const file = path.join(dataDir, "tokens.json");
+  const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
+  try {
+    // bob is malformed on read (credentialsFile has the wrong type) but still
+    // holds a recoverable refresh token, so it lives only in the `preserved`
+    // map, never in the readable store. A user who runs a disconnect for bob
+    // must actually remove that on-disk record — including the recoverable
+    // secret — not get told "was not connected" while the token lingers.
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        "alice@x.com": {
+          tokens: { access_token: "a", refresh_token: "RT_ALICE" },
+          credentialsFile: "credentials.json",
+        },
+        "bob@x.com": {
+          tokens: { access_token: "b", refresh_token: "RT_BOB_RECOVERABLE" },
+          credentialsFile: 42,
+        },
+      })
+    );
+    // Readers never see the malformed entry, and it's not in the usable set.
+    assert.deepEqual(auth.listAccounts(), ["alice@x.com"]);
+
+    // Removing bob must report success (it DID exist on disk) and wipe the
+    // record, recoverable refresh token and all. Case-insensitively, too.
+    assert.equal(await auth.removeAccount("BOB@x.com"), true, "removeAccount must report a preserved entry as removed");
+    const disk = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.ok(!("bob@x.com" in disk), "the malformed entry must be gone from disk");
+    assert.equal(disk["alice@x.com"]?.tokens?.refresh_token, "RT_ALICE", "unrelated accounts are untouched");
+
+    // A second removal now finds nothing and reports it honestly.
+    assert.equal(await auth.removeAccount("bob@x.com"), false, "a second removal reports not-connected");
+  } finally {
+    if (saved !== null) fs.writeFileSync(file, saved);
+    else fs.rmSync(file, { force: true });
+  }
+});
+
 test("loadTokens migrates a legacy raw-Credentials entry to the current shape (low)", () => {
   const file = path.join(dataDir, "tokens.json");
   const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null;
