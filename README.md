@@ -33,6 +33,20 @@ Every tool except `gmail_list_accounts` accepts `account: "you@gmail.com"`. If o
 
   Optional `mime_type` overrides the inferred type on either form. With attachments, the message is assembled as `multipart/mixed`. Non-ASCII subjects are RFC 2047-encoded; non-ASCII (or very long) filenames use RFC 2231 extended parameters (`filename*=UTF-8''…`, with continuation segments when long) — encoded-words are not legal inside MIME parameters.
 
+## Prerequisites
+
+- **Node.js ≥ 18.18** (20.x and 22.x also work and are covered by CI). Check with `node -v`; on macOS the easiest install is [Homebrew](https://brew.sh) — `brew install node`.
+- **git**, to clone the repo and pull updates later.
+
+Clone the project and work from its folder (the example names the folder `gmail-mcp-server`; any path works):
+
+```bash
+git clone https://github.com/uaixo/Claude-Custom-Gmail-MCP-Server-For-Multiple-Google-Accounts.git gmail-mcp-server
+cd gmail-mcp-server
+```
+
+Every `npm run …` command below is run from this folder.
+
 ## One-time setup
 
 ### 1. Create a Google OAuth client
@@ -185,7 +199,20 @@ If you stored credentials/tokens somewhere non-default, pass the data dir throug
 
 Restart Claude Desktop. Ask it to "list my connected Gmail accounts" to confirm.
 
-> **Node on PATH:** `"command": "node"` requires Node to be discoverable. Check with `node --version`. If it isn't found (more common on Windows), use the full path to the binary instead — Mac: `/usr/local/bin/node` or `/opt/homebrew/bin/node`; Windows: `C:\\Program Files\\nodejs\\node.exe`.
+> **Node on PATH:** `"command": "node"` requires Node to be discoverable. Check with `node --version`. If it isn't found (more common on Windows), use the full path to the binary instead — find it with `which node` (Mac, typically `/usr/local/bin/node` or `/opt/homebrew/bin/node`) or `where node` (Windows, typically `C:\\Program Files\\nodejs\\node.exe`).
+
+## Updating
+
+`dist/` and `node_modules/` aren't committed (they're built locally), so after pulling new code, reinstall and rebuild:
+
+```bash
+cd gmail-mcp-server   # your clone
+git pull
+npm install
+npm run build
+```
+
+Then restart Claude Desktop. Your connected accounts persist across updates — `~/.gmail-mcp/` (tokens and credentials) is never touched by an update.
 
 ## Notes
 
