@@ -1456,6 +1456,47 @@ test("withRetry retries a usage-limit 403 like a 429 — even for non-idempotent
   assert.equal(permCalls, 1, "a permission 403 is not retryable");
 });
 
+test("a dailyLimitExceeded 403 is NOT retried and gets a distinct daily-quota message (N2)", async () => {
+  // A hard per-day quota can't reset within a few seconds of backoff, so
+  // retrying only adds latency — unlike the transient per-second throttles.
+  const dailyLimit = () => {
+    const e = new Error("Daily Limit Exceeded");
+    e.response = {
+      status: 403,
+      data: { error: { errors: [{ domain: "usageLimits", reason: "dailyLimitExceeded" }] } },
+    };
+    return e;
+  };
+  let calls = 0;
+  await assert.rejects(
+    withRetry(
+      async () => {
+        calls++;
+        throw dailyLimit();
+      },
+      { baseDelayMs: 1, idempotent: false }
+    )
+  );
+  assert.equal(calls, 1, "dailyLimitExceeded must not be retried");
+  // ...and it must read as a quota problem, not a rate limit or a scope error.
+  const msg = handleGmailError(dailyLimit());
+  assert.match(msg, /Daily Gmail quota exceeded/);
+  assert.match(msg, /dailyLimitExceeded/);
+  assert.doesNotMatch(msg, /scope/);
+});
+
+test("capMessageBodies truncation markers don't say 'thread' (N3)", () => {
+  // capMessageBodies serves single-message reads (gmail_get_message) too, so the
+  // marker must not describe a single message as a thread.
+  const truncated = capMessageBodies([{ id: 1 }], 5, () => "x".repeat(30000));
+  assert.match(truncated.messages[0].body, /\[Body truncated: exceeds size limit\]/);
+  assert.doesNotMatch(truncated.messages[0].body, /thread/);
+
+  const omitted = capMessageBodies([{ id: 1 }, { id: 2 }], 3, () => "yyy");
+  assert.match(omitted.messages[1].body, /\[Body omitted: exceeds size limit\]/);
+  assert.doesNotMatch(omitted.messages[1].body, /thread/);
+});
+
 test("withRetry idempotent:false does NOT retry a 5xx (no duplicate side effect) (#retry)", async () => {
   // A non-idempotent call (send/draft): a 5xx after the server may already have
   // processed the request must NOT be retried, or it could duplicate the effect.

@@ -1263,17 +1263,22 @@ const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const RATE_LIMIT_ONLY = new Set([429]);
 
 /**
- * Gmail's usage-limit errors that arrive as HTTP 403 (usageLimits domain)
- * rather than 429. Google's error guide says to retry these with exponential
- * backoff; like a 429, the request was rejected before processing, so they are
- * safe to retry even for non-idempotent calls (send/draft). Distinguished from
- * a true permission 403 by the structured `reason` field.
+ * Transient per-second usage-limit errors that arrive as HTTP 403 (usageLimits
+ * domain) rather than 429. Google's error guide says to retry these with
+ * exponential backoff; like a 429, the request was rejected before processing,
+ * so they are safe to retry even for non-idempotent calls (send/draft).
  */
-const RATE_LIMIT_403_REASONS = new Set([
-  "userRateLimitExceeded",
-  "rateLimitExceeded",
-  "dailyLimitExceeded",
-]);
+const RETRYABLE_403_REASONS = new Set(["userRateLimitExceeded", "rateLimitExceeded"]);
+
+/**
+ * All usage-limit 403 reasons (the transient ones plus the hard per-day quota).
+ * Used only to give an accurate message that distinguishes a quota 403 from a
+ * true permission 403. dailyLimitExceeded is deliberately NOT in the retryable
+ * set above: a per-day quota can't reset within a few seconds of backoff, so
+ * retrying it only adds latency before surfacing the same error (Google's guide
+ * says request more quota / wait, don't retry).
+ */
+const QUOTA_403_REASONS = new Set([...RETRYABLE_403_REASONS, "dailyLimitExceeded"]);
 
 /**
  * Extract the structured `reason` of the first error item from a Gmail API
@@ -1300,7 +1305,7 @@ function gmailErrorReason(error: unknown): string | undefined {
 function isRateLimit403(error: unknown): boolean {
   if (httpStatusOf(error) !== 403) return false;
   const reason = gmailErrorReason(error);
-  return reason !== undefined && RATE_LIMIT_403_REASONS.has(reason);
+  return reason !== undefined && RETRYABLE_403_REASONS.has(reason);
 }
 
 /**
@@ -1466,7 +1471,10 @@ export function handleGmailError(error: unknown): string {
       // sends them to redo consent for nothing. The structured reason
       // distinguishes the two.
       const reason = gmailErrorReason(error);
-      if (reason !== undefined && RATE_LIMIT_403_REASONS.has(reason)) {
+      if (reason === "dailyLimitExceeded") {
+        return "Error: Daily Gmail quota exceeded (403 dailyLimitExceeded). This resets on a 24-hour window — wait for the reset or request more quota; retrying now won't help.";
+      }
+      if (reason !== undefined && QUOTA_403_REASONS.has(reason)) {
         return `Error: Rate limit exceeded (403 ${reason}). Wait before retrying.`;
       }
       return `Error: Permission denied. The account may not have granted the required scope. (${detail})`;
@@ -1544,7 +1552,7 @@ export function capMessageBodies<T>(
     if (remaining <= 0) {
       // Budget already spent — omit without rendering (the point of laziness).
       truncated = true;
-      return { ...item, body: "[Body omitted: thread exceeds size limit]" };
+      return { ...item, body: "[Body omitted: exceeds size limit]" };
     }
     const body = renderBody(item);
     if (body.length > remaining) {
@@ -1556,7 +1564,7 @@ export function capMessageBodies<T>(
       const hi = body.charCodeAt(cut - 1);
       if (hi >= 0xd800 && hi <= 0xdbff) cut -= 1;
       const trimmed =
-        body.slice(0, cut) + "\n[Body truncated: thread exceeds size limit]";
+        body.slice(0, cut) + "\n[Body truncated: exceeds size limit]";
       remaining = 0;
       return { ...item, body: trimmed };
     }
