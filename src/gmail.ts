@@ -1551,8 +1551,11 @@ export function capMessageBodies<T>(
   const messages = items.map((item) => {
     if (remaining <= 0) {
       // Budget already spent — omit without rendering (the point of laziness).
+      // The marker blames the RESPONSE limit, not the body: this body was
+      // never rendered, so its size is unknown — it may even be empty — and
+      // claiming it "exceeds" a limit would mislabel it.
       truncated = true;
-      return { ...item, body: "[Body omitted: exceeds size limit]" };
+      return { ...item, body: "[Body omitted: response size limit reached]" };
     }
     const body = renderBody(item);
     if (body.length > remaining) {
@@ -1564,7 +1567,7 @@ export function capMessageBodies<T>(
       const hi = body.charCodeAt(cut - 1);
       if (hi >= 0xd800 && hi <= 0xdbff) cut -= 1;
       const trimmed =
-        body.slice(0, cut) + "\n[Body truncated: exceeds size limit]";
+        body.slice(0, cut) + "\n[Body truncated: response size limit reached]";
       remaining = 0;
       return { ...item, body: trimmed };
     }

@@ -19,10 +19,24 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-smoke-"));
 const env = { ...process.env, GMAIL_MCP_DATA_DIR: dataDir };
 
-// Remove the temp data dir on ANY exit, including the process.exit(1) that
-// fail() takes — otherwise every failed run (the common case while debugging a
-// dist regression, or a slow machine tripping a watchdog) orphans a dir.
+// Children spawned by this script, reaped on exit below. The in-parser fail()
+// paths call process.exit(1) without returning to code that can kill the
+// server child, which would otherwise orphan a live `node` process on every
+// failed run — the same class of leak the dataDir cleanup below prevents.
+const children = [];
+
+// Remove the temp data dir and kill any live child on ANY exit, including the
+// process.exit(1) that fail() takes — otherwise every failed run (the common
+// case while debugging a dist regression, or a slow machine tripping a
+// watchdog) orphans a dir and possibly a server process.
 process.on("exit", () => {
+  for (const child of children) {
+    try {
+      child.kill();
+    } catch {
+      /* already dead */
+    }
+  }
   try {
     fs.rmSync(dataDir, { recursive: true, force: true });
   } catch {
@@ -41,6 +55,7 @@ await new Promise((resolve) => {
     env,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  children.push(child);
   let out = "";
   let stderr = "";
   let done = false;
@@ -124,6 +139,7 @@ await new Promise((resolve) => {
     [path.join(root, "dist", "add-account.js"), "--list"],
     { env }
   );
+  children.push(child);
   let out = "";
   let stderr = "";
   child.stdout.on("data", (d) => (out += d));

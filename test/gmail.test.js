@@ -1489,12 +1489,28 @@ test("capMessageBodies truncation markers don't say 'thread' (N3)", () => {
   // capMessageBodies serves single-message reads (gmail_get_message) too, so the
   // marker must not describe a single message as a thread.
   const truncated = capMessageBodies([{ id: 1 }], 5, () => "x".repeat(30000));
-  assert.match(truncated.messages[0].body, /\[Body truncated: exceeds size limit\]/);
+  assert.match(truncated.messages[0].body, /\[Body truncated: response size limit reached\]/);
   assert.doesNotMatch(truncated.messages[0].body, /thread/);
 
   const omitted = capMessageBodies([{ id: 1 }, { id: 2 }], 3, () => "yyy");
-  assert.match(omitted.messages[1].body, /\[Body omitted: exceeds size limit\]/);
+  assert.match(omitted.messages[1].body, /\[Body omitted: response size limit reached\]/);
   assert.doesNotMatch(omitted.messages[1].body, /thread/);
+});
+
+test("capMessageBodies markers blame the response limit, not the unrendered body (round-4 N1)", () => {
+  // A body arriving after the budget is spent is never rendered (the lazy
+  // contract), so the marker cannot know its size — the body may even be
+  // EMPTY. The old text "[Body omitted: exceeds size limit]" asserted the
+  // body exceeded something; the marker must only blame the response limit.
+  const r = capMessageBodies([{ id: 1 }, { id: 2 }], 3, (m) =>
+    m.id === 1 ? "yyy" : ""
+  );
+  assert.equal(r.messages[1].body, "[Body omitted: response size limit reached]");
+  assert.doesNotMatch(r.messages[1].body, /exceeds/);
+  // Same for the crossing body: it exceeded the REMAINING budget, not
+  // necessarily "the size limit" — blame the response limit there too.
+  const crossing = capMessageBodies([{ id: 1 }], 2, () => "zzzz");
+  assert.doesNotMatch(crossing.messages[0].body, /exceeds/);
 });
 
 test("withRetry idempotent:false does NOT retry a 5xx (no duplicate side effect) (#retry)", async () => {
