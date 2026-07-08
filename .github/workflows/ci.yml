@@ -5,9 +5,21 @@ on:
     branches: ["**"]
   pull_request:
 
+# Cancel superseded runs of the same ref: rapid follow-up pushes otherwise
+# leave stale 9-job matrices occupying runners while the relevant commit's
+# verdict queues behind them. Push and PR runs have different refs, so this
+# never cancels across the two triggers.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     runs-on: ${{ matrix.os }}
+    # A hung run (the class of regression the H1 test guards) otherwise rides
+    # to GitHub's 360-minute default in every matrix cell. The full gate takes
+    # ~1-2 minutes; 15 is generous headroom for cold caches and slow runners.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
