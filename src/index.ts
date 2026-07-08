@@ -265,10 +265,17 @@ Returns: JSON {
       // fan-out so large result sets don't trip Gmail's rate limit. A single
       // thread's fetch failing degrades to an entry with an `error` field rather
       // than failing the whole search (see summarizeThread).
+      //
+      // Bounded retries: per-item retry waits MULTIPLY across the fan-out
+      // (items / concurrency batches run sequentially), so honoring a large
+      // server-mandated Retry-After per item could stall one search call for
+      // many minutes under sustained throttling. One retry with a 1s mandated-
+      // wait cap bounds the worst case to tens of seconds; items that still
+      // fail degrade to per-thread `error` entries the caller can see.
       const detailed = await mapWithConcurrency(
         threads,
         THREAD_FETCH_CONCURRENCY,
-        (t) => summarizeThread(gmail, t)
+        (t) => summarizeThread(gmail, t, { retries: 1, retryAfterCapMs: 1_000 })
       );
       // Surface Gmail's pagination cursor so callers can fetch the next page;
       // present only when more results exist for this query.

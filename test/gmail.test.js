@@ -1976,6 +1976,18 @@ test("decodeRfc2047 leaves undecodable words raw instead of emitting mojibake (r
   assert.equal(decodeRfc2047(badQuoted), badQuoted);
 });
 
+test("decodeRfc2047 leaves a Q word containing literal non-ASCII raw, never truncated mod 256 (round-6)", () => {
+  // Q encoded-text is printable ASCII by definition. A subject QUOTING an
+  // encoded-word example arrives from the Gmail API as this literal text; the
+  // Q byte loop used to push charCodeAt() values into a byte buffer, turning
+  // "café" into "caf�" (and CJK into mod-256 garbage/NUL) instead of
+  // leaving the sender's actual text untouched.
+  const accented = "=?UTF-8?Q?café?=";
+  assert.equal(decodeRfc2047(accented), accented);
+  const cjk = "=?UTF-8?Q?日本語?=";
+  assert.equal(decodeRfc2047(cjk), cjk);
+});
+
 test("summarizeThread decodes RFC 2047 subject/from for display (round-5)", async () => {
   const fake = {
     users: {
@@ -2003,6 +2015,25 @@ test("summarizeThread decodes RFC 2047 subject/from for display (round-5)", asyn
   assert.equal(out.subject, "日本語");
   assert.equal(out.from, "Café <cafe@x.com>");
   assert.equal(out.date, "Mon, 1 Jan 2024 00:00:00 +0000");
+});
+
+test("a display name pasted with an embedded newline is normalized and quoted (round-6)", () => {
+  // `.` doesn't match a newline, so the name-addr parse used to fail on a
+  // pasted two-line display name; the whole string skipped formatRecipient's
+  // quoting and went out (after header-level CRLF sanitization) as an
+  // unquoted phrase containing ';' — a spec-invalid To header that Gmail
+  // rejects opaquely or downstream clients misparse.
+  const mime = decodeBase64Url(
+    buildRawMessage({
+      to: ["Ops Team;\nOn-call <oncall@example.com>"],
+      subject: "s",
+      body: "b",
+    })
+  );
+  assert.ok(
+    mime.split("\r\n").includes('To: "Ops Team; On-call" <oncall@example.com>'),
+    `To header must be a quoted single-line phrase; got:\n${mime.split("\r\n").find((l) => l.startsWith("To:"))}`
+  );
 });
 
 // --------------------------------------------------------------------------

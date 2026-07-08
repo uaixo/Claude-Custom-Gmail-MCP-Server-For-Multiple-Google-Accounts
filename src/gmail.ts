@@ -160,7 +160,14 @@ function decodeEncodedWord(
         out.push(parseInt(hex, 16));
         i += 2;
       } else {
-        out.push(text.charCodeAt(i));
+        const code = text.charCodeAt(i);
+        // Q encoded-text is printable ASCII by definition. A literal non-ASCII
+        // char here (e.g. a subject QUOTING an encoded-word: "=?UTF-8?Q?café?=")
+        // means this isn't really an encoded word — bail out and leave it raw.
+        // Pushing the code unit into a byte buffer would truncate it mod 256,
+        // rendering garbage/NUL instead of the sender's actual text.
+        if (code < 0x20 || code > 0x7e) return null;
+        out.push(code);
       }
     }
     bytes = Buffer.from(out);
@@ -328,7 +335,7 @@ function decodeSnippet(snippet: string): string {
 export async function summarizeThread(
   gmail: gmail_v1.Gmail,
   thread: gmail_v1.Schema$Thread,
-  retryOpts?: { retries?: number; baseDelayMs?: number }
+  retryOpts?: { retries?: number; baseDelayMs?: number; retryAfterCapMs?: number }
 ): Promise<ThreadSummary> {
   const threadId = thread.id || "";
   try {
@@ -871,7 +878,12 @@ const DISPLAY_NAME_SPECIALS = /[()<>[\]:;@\\,".]/;
  * display name can't inject a header regardless of this formatting.
  */
 function formatRecipient(recipient: string): string {
-  const trimmed = recipient.trim();
+  // Collapse internal CR/LF/tabs to spaces BEFORE parsing: `.` doesn't match a
+  // newline, so a pasted multi-line display name ("Ops Team;\nOn-call <a@x>")
+  // used to fail the name-addr parse below, skip the quoting entirely, and go
+  // out as an unquoted phrase with specials once header-level sanitization
+  // flattened the newline — a spec-invalid To/Cc/Bcc header.
+  const trimmed = recipient.replace(/[\r\n\t]+/g, " ").trim();
   const m = /^(.*)<([^<>]+)>\s*$/.exec(trimmed);
   if (!m) return trimmed; // bare address (or nothing parseable as a name-addr)
   // Both capture groups are present whenever the regex matches; `?? ""` only
