@@ -151,6 +151,39 @@ test("a fresh (live) lock is never stolen; the write times out without clobberin
   }
 });
 
+test("an unstealable stale lock backs off asynchronously instead of busy-spinning the event loop (round-6 M1)", async () => {
+  // Make the lock path a DIRECTORY: openSync/readFileSync fail with a
+  // non-ENOENT error (EISDIR on Linux/macOS, EISDIR/EPERM on Windows), the
+  // same class as an unreadable root-owned lock or a Windows AV holding the
+  // file. tryStealStaleLock used to report ANY error as "lock gone", making
+  // withTokenLock `continue` past its only await — a synchronous busy-spin
+  // that froze the whole event loop at 100% CPU for the acquire timeout.
+  const lock = path.join(dataDir, "tokens.json.lock");
+  const prevTimeout = process.env.GMAIL_MCP_LOCK_TIMEOUT_MS;
+  fs.mkdirSync(lock);
+  const old = Date.now() / 1000 - 3600;
+  fs.utimesSync(lock, old, old); // stale by mtime, but unstealable
+  let ticks = 0;
+  const interval = setInterval(() => (ticks += 1), 5);
+  try {
+    process.env.GMAIL_MCP_LOCK_TIMEOUT_MS = "250";
+    await assert.rejects(
+      () => auth.saveAccount("spin@x.com", { access_token: "s" }, "credentials.json"),
+      /Could not acquire the token-store lock/
+    );
+    // The event loop must have kept turning during the 250ms wait. The old
+    // synchronous spin yielded ZERO ticks; the async backoff yields dozens —
+    // assert a conservative floor so a loaded CI runner can't flake it.
+    assert.ok(ticks >= 3, `event loop starved during lock wait (${ticks} ticks)`);
+    assert.ok(fs.existsSync(lock), "the unstealable lock must be left in place");
+  } finally {
+    clearInterval(interval);
+    if (prevTimeout === undefined) delete process.env.GMAIL_MCP_LOCK_TIMEOUT_MS;
+    else process.env.GMAIL_MCP_LOCK_TIMEOUT_MS = prevTimeout;
+    fs.rmdirSync(lock);
+  }
+});
+
 test("loadTokens returns empty without throwing on a corrupt store (#8)", () => {
   const file = path.join(dataDir, "tokens.json");
   // Guard the read: under --test-name-pattern / sharding no earlier test has
@@ -682,6 +715,16 @@ test("prototype-named keys are ordinary entries: listed, preserved across writes
     );
     assert.equal(store["tokens"], undefined, "no prototype pollution");
     assert.equal(store["credentialsFile"], undefined, "no prototype pollution");
+
+    // accountCredentials (the list-accounts data source) must record the
+    // entry too: its plain-{} output map used to hit the __proto__ setter,
+    // printing "[object Object]" for this account (round-6).
+    const creds = auth.accountCredentials();
+    assert.equal(
+      creds["__proto__"],
+      "credentials.json",
+      "accountCredentials must carry a __proto__-keyed account"
+    );
 
     // An unrelated write must keep BOTH prototype-named records on disk.
     await auth.saveAccount(

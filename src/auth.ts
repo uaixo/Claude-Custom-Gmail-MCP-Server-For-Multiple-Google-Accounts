@@ -412,8 +412,10 @@ function lockAcquireTimeoutMs(): number {
 /**
  * Best-effort removal of a token-store lock that appears abandoned (older than
  * LOCK_STALE_MS). Returns true if a stale lock was cleared (or had already
- * vanished), false if the lock is fresh/live or turned out to be live and was
- * left untouched.
+ * vanished), false if the lock is fresh/live, turned out to be live and was
+ * left untouched, or exists but cannot be read/renamed (permissions, sharing
+ * violations) — callers must treat false as "back off and retry later", never
+ * as an invitation to retry immediately.
  *
  * The removal is token-verified to avoid the stat/rename TOCTOU that a plain
  * "rename it aside" cannot close: rename targets the PATH, not the specific
@@ -440,8 +442,14 @@ function tryStealStaleLock(lockPath: string): boolean {
     } finally {
       fs.closeSync(fd);
     }
-  } catch {
-    return true; // gone already → nothing holds it
+  } catch (e) {
+    // ONLY a missing file means "nothing holds it". Any other error (EACCES on
+    // a root-owned lock from a sudo'd run, EISDIR, Windows sharing violations)
+    // means the lock exists but we can't inspect it — report failure so the
+    // caller backs off asynchronously. Returning true here made withTokenLock
+    // `continue` past its only await and busy-spin synchronously at 100% CPU
+    // for the whole acquire timeout, freezing the entire event loop.
+    return (e as NodeJS.ErrnoException).code === "ENOENT";
   }
   if (Date.now() - mtimeMs <= LOCK_STALE_MS) return false; // fresh/live holder
   // Graveyard name matches the `.tokens.*.tmp` pattern so a crash mid-steal
@@ -452,8 +460,13 @@ function tryStealStaleLock(lockPath: string): boolean {
   );
   try {
     fs.renameSync(lockPath, graveyard);
-  } catch {
-    return true; // another contender moved it first → gone from our POV
+  } catch (e) {
+    // ENOENT: another contender moved it first → gone from our POV. Anything
+    // else (EPERM from an immutable attribute, EBUSY from a Windows AV/indexer
+    // holding it open without FILE_SHARE_DELETE, EACCES from an unwritable
+    // dir) means the stale lock is stuck in place — report failure so the
+    // caller sleeps between attempts instead of spinning synchronously.
+    return (e as NodeJS.ErrnoException).code === "ENOENT";
   }
   let grabbed: string | null;
   try {
@@ -628,7 +641,13 @@ export function listAccounts(): string[] {
 /** Return the credentialsFile reference recorded for each account. */
 export function accountCredentials(): Record<string, string> {
   const store = loadTokens();
-  const out: Record<string, string> = {};
+  // Null-prototype like the store itself: assigning a "__proto__" key to a
+  // plain {} would silently hit the prototype setter instead of recording the
+  // entry, and list-accounts would print "[object Object]" for it.
+  const out: Record<string, string> = Object.create(null) as Record<
+    string,
+    string
+  >;
   for (const [email, entry] of Object.entries(store)) {
     out[email] = entry.credentialsFile;
   }

@@ -221,6 +221,44 @@ test("gmail_send_message caps recipient length and validates a whitespace-heavy 
 // --------------------------------------------------------------------------
 // gmail_search_threads
 // --------------------------------------------------------------------------
+test("gmail_search_threads bounds per-thread retry waits so throttling can't stall the call for minutes (round-6 M2)", async () => {
+  // Per-item Retry-After honoring MULTIPLIES across the fan-out (items /
+  // concurrency batches run sequentially). With the default 30s cap and 3
+  // retries, 100 throttled threads could stall one search ~30 minutes. The
+  // fan-out passes { retries: 1, retryAfterCapMs: 1000 }: each thread makes
+  // exactly 2 attempts with a ≤1s mandated wait, then degrades to a
+  // per-thread error entry.
+  const throttled = () => {
+    const e = new Error("rate limited");
+    e.response = { status: 429, headers: { "retry-after": "3600" } };
+    throw e;
+  };
+  const t0 = Date.now();
+  const { result, calls } = await callTool(
+    "gmail_search_threads",
+    { query: "x", account: "alice@example.com", max_results: 2 },
+    {
+      "threads.list": { data: { threads: [{ id: "t1" }, { id: "t2" }] } },
+      "threads.get": throttled,
+    }
+  );
+  const elapsed = Date.now() - t0;
+  assert.notEqual(result.isError, true, "the search itself must not fail");
+  const threads = result.structuredContent.threads;
+  assert.equal(threads.length, 2);
+  for (const t of threads) {
+    assert.match(t.error ?? "", /rate limit/i, "each thread degrades to an error entry");
+  }
+  assert.equal(
+    calls.filter((c) => c.name === "threads.get").length,
+    4,
+    "exactly one retry per thread (2 attempts x 2 threads)"
+  );
+  // Two threads run in one concurrency batch: ~1s mandated wait total. Allow
+  // generous slack for slow CI while still catching the uncapped 30s+ waits.
+  assert.ok(elapsed < 15_000, `fan-out stalled ${elapsed}ms; retry waits are unbounded`);
+});
+
 test("gmail_search_threads forwards the query/max_results and maps summaries", async () => {
   const { result, calls } = await callTool(
     "gmail_search_threads",
