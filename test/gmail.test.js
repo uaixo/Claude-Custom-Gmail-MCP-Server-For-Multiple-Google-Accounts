@@ -2096,6 +2096,11 @@ test("withRetry caps a hostile/huge Retry-After (plain-object header shape) (rou
   );
   const elapsed = Date.now() - t0;
   assert.equal(out, "ok");
+  // Two-sided bound: the lower edge proves the lowercase plain-object header
+  // was actually PARSED and honored-then-capped (~50ms). Without it this test
+  // passed identically when the header lookup was dropped entirely (a ~2ms
+  // pure-backoff wait also satisfies `< 2000`) — a vacuous guard (round-6).
+  assert.ok(elapsed >= 40, `waited only ${elapsed}ms; Retry-After was not parsed`);
   // An uncapped wait would be an hour; the cap bounds it to ~50ms.
   assert.ok(elapsed < 2000, `capped wait took ${elapsed}ms; expected ~50ms`);
 });
