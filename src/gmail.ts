@@ -456,6 +456,107 @@ function isAttachmentPart(part: gmail_v1.Schema$MessagePart): boolean {
   return !!part.filename;
 }
 
+/** Metadata for one downloadable attachment, surfaced to clients. */
+export interface AttachmentMeta {
+  attachment_id: string;
+  filename: string;
+  mime_type: string;
+  size: number;
+}
+
+/**
+ * Walk a message's part tree and list its downloadable attachments. Descends
+ * into multipart containers but never into an attachment part's own subtree
+ * (a forwarded message/rfc822 attachment is ONE attachment, not its inner
+ * parts — mirroring findPartBody). Parts without an attachmentId (rare tiny
+ * parts whose bytes Gmail embeds directly in the payload) are skipped: the
+ * attachments API cannot fetch them, so listing them would advertise an ID
+ * that doesn't exist.
+ */
+export function listAttachments(
+  payload: gmail_v1.Schema$MessagePart | undefined
+): AttachmentMeta[] {
+  const out: AttachmentMeta[] = [];
+  const walk = (part: gmail_v1.Schema$MessagePart | undefined): void => {
+    if (!part) return;
+    if (isAttachmentPart(part)) {
+      const id = part.body?.attachmentId;
+      if (id) {
+        out.push({
+          attachment_id: id,
+          filename: part.filename || "",
+          mime_type: part.mimeType || "application/octet-stream",
+          size: part.body?.size ?? 0,
+        });
+      }
+      return;
+    }
+    for (const child of part.parts || []) walk(child);
+  };
+  walk(payload);
+  return out;
+}
+
+/**
+ * Reduce an attachment filename to a safe basename for saving. Attachment
+ * names are ATTACKER-CONTROLLED (the sender picks them): strip directory
+ * components so "../../../etc/passwd" or "..\\evil.exe" can't escape the
+ * download directory, replace control characters and Windows-reserved
+ * characters, and never return an empty or dots-only name.
+ */
+export function sanitizeAttachmentFilename(name: string): string {
+  const base = name.split(/[/\\]/).pop() || "";
+  let cleaned = "";
+  for (const ch of base) {
+    const code = ch.codePointAt(0) ?? 0;
+    cleaned +=
+      code < 0x20 || code === 0x7f || '<>:"|?*'.includes(ch) ? "_" : ch;
+  }
+  cleaned = cleaned.trim();
+  if (cleaned === "" || /^\.+$/.test(cleaned)) return "attachment";
+  return cleaned;
+}
+
+/**
+ * Write attachment bytes into the FIRST GMAIL_MCP_ATTACHMENTS_DIR directory
+ * (the same allowlist that gates reading local files on the send path) under a
+ * sanitized name, uniquifying with " (n)" on collision instead of overwriting.
+ * The exclusive-create flag makes the collision check race-free. Returns the
+ * absolute path written. Throws with an actionable message when no directory
+ * is configured.
+ */
+export function saveAttachment(bytes: Buffer, filename: string): string {
+  const dirs = attachmentDirs();
+  if (dirs.length === 0) {
+    throw new Error(
+      "Saving attachments to disk is disabled. Set GMAIL_MCP_ATTACHMENTS_DIR " +
+        "to an allowed directory, or fetch a small attachment inline " +
+        '(mode "inline").'
+    );
+  }
+  const dir = dirs[0]!;
+  const safe = sanitizeAttachmentFilename(filename);
+  const ext = path.extname(safe);
+  const stem = safe.slice(0, safe.length - ext.length);
+  for (let n = 0; n < 1000; n++) {
+    const candidate = path.join(dir, n === 0 ? safe : `${stem} (${n})${ext}`);
+    try {
+      const fd = fs.openSync(candidate, "wx");
+      try {
+        fs.writeFileSync(fd, bytes);
+      } finally {
+        fs.closeSync(fd);
+      }
+      return candidate;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    }
+  }
+  throw new Error(
+    `Could not find a free filename for '${safe}' in ${dir} (1000 name collisions).`
+  );
+}
+
 /** Extract the charset from a part's Content-Type header, if one is declared. */
 function partCharset(
   part: gmail_v1.Schema$MessagePart | undefined

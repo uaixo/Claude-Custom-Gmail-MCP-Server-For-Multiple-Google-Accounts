@@ -23,6 +23,9 @@ import {
   renderJsonText,
   jsonTooLargeNotice,
   withRetry,
+  listAttachments,
+  sanitizeAttachmentFilename,
+  saveAttachment,
 } from "../src/gmail.js";
 import { packageVersion } from "../src/constants.js";
 
@@ -2124,4 +2127,105 @@ test("withRetry honors an HTTP-date Retry-After (capital-case plain key) (round-
   );
   const elapsed = Date.now() - t0;
   assert.ok(elapsed >= 800, `waited ${elapsed}ms; expected most of the ~1-2s mandated wait`);
+});
+
+// --------------------------------------------------------------------------
+// Attachment fetching — listAttachments / sanitizeAttachmentFilename /
+// saveAttachment  (attachment-download feature)
+// --------------------------------------------------------------------------
+test("listAttachments walks nested multiparts but never descends into an attachment's subtree", () => {
+  const payload = {
+    mimeType: "multipart/mixed",
+    parts: [
+      {
+        mimeType: "multipart/alternative",
+        parts: [
+          { mimeType: "text/plain", body: { data: b64url("hi"), size: 2 } },
+          { mimeType: "text/html", body: { data: b64url("<p>hi</p>"), size: 9 } },
+        ],
+      },
+      {
+        mimeType: "application/pdf",
+        filename: "report.pdf",
+        body: { attachmentId: "A1", size: 111 },
+      },
+      {
+        // A forwarded message attachment is ONE attachment; its inner parts
+        // (including their own attachments) must not be enumerated.
+        mimeType: "message/rfc822",
+        filename: "fwd.eml",
+        body: { attachmentId: "A2", size: 222 },
+        parts: [
+          {
+            mimeType: "application/zip",
+            filename: "inner.zip",
+            body: { attachmentId: "INNER", size: 999 },
+          },
+        ],
+      },
+      {
+        // Apple-Mail style: inline disposition but carries a filename.
+        mimeType: "image/png",
+        filename: "logo.png",
+        headers: [{ name: "Content-Disposition", value: 'inline; filename="logo.png"' }],
+        body: { attachmentId: "A3", size: 333 },
+      },
+      {
+        // No attachmentId (bytes embedded in payload) — unfetchable, skipped.
+        mimeType: "text/calendar",
+        filename: "invite.ics",
+        body: { data: b64url("BEGIN:VCALENDAR"), size: 15 },
+      },
+    ],
+  };
+  assert.deepEqual(listAttachments(payload).map((a) => a.attachment_id), ["A1", "A2", "A3"]);
+  assert.deepEqual(listAttachments(payload)[0], {
+    attachment_id: "A1",
+    filename: "report.pdf",
+    mime_type: "application/pdf",
+    size: 111,
+  });
+  assert.deepEqual(listAttachments(undefined), []);
+});
+
+test("sanitizeAttachmentFilename strips traversal, control chars, and reserved characters", () => {
+  assert.equal(sanitizeAttachmentFilename("../../../etc/passwd"), "passwd");
+  assert.equal(sanitizeAttachmentFilename("..\\..\\evil.exe"), "evil.exe");
+  assert.equal(sanitizeAttachmentFilename("C:\\Users\\x\\doc.pdf"), "doc.pdf");
+  assert.equal(sanitizeAttachmentFilename("re:port|v2?.pdf"), "re_port_v2_.pdf");
+  assert.equal(sanitizeAttachmentFilename("bad \r\nname.txt"), "bad __name.txt");
+  assert.equal(sanitizeAttachmentFilename(""), "attachment");
+  assert.equal(sanitizeAttachmentFilename(".."), "attachment");
+  assert.equal(sanitizeAttachmentFilename("normal name (1).pdf"), "normal name (1).pdf");
+  assert.equal(sanitizeAttachmentFilename("日本語レポート.pdf"), "日本語レポート.pdf");
+});
+
+test("saveAttachment requires the allowlist, saves inside it, and uniquifies collisions", () => {
+  const prev = process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+  delete process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+  try {
+    assert.throws(
+      () => saveAttachment(Buffer.from("x"), "a.txt"),
+      /GMAIL_MCP_ATTACHMENTS_DIR/,
+      "saving without an allowlist must fail with an actionable error"
+    );
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-save-"));
+    process.env.GMAIL_MCP_ATTACHMENTS_DIR = dir;
+    try {
+      const p1 = saveAttachment(Buffer.from("one"), "report.pdf");
+      const p2 = saveAttachment(Buffer.from("two"), "report.pdf");
+      const p3 = saveAttachment(Buffer.from("three"), "report.pdf");
+      assert.equal(path.dirname(p1), dir);
+      assert.equal(path.basename(p1), "report.pdf");
+      assert.equal(path.basename(p2), "report (1).pdf");
+      assert.equal(path.basename(p3), "report (2).pdf");
+      assert.equal(fs.readFileSync(p1, "utf-8"), "one", "collision must not overwrite");
+      assert.equal(fs.readFileSync(p2, "utf-8"), "two");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  } finally {
+    if (prev === undefined) delete process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+    else process.env.GMAIL_MCP_ATTACHMENTS_DIR = prev;
+  }
 });

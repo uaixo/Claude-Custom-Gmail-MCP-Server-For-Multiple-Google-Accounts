@@ -9,7 +9,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { server } from "../src/index.js";
-import { MAX_THREAD_BODY_CHARS, GMAIL_REQUEST_TIMEOUT_MS } from "../src/constants.js";
+import {
+  MAX_THREAD_BODY_CHARS,
+  GMAIL_REQUEST_TIMEOUT_MS,
+  MAX_INLINE_ATTACHMENT_BYTES,
+} from "../src/constants.js";
 
 // @googleapis/gmail is CommonJS; grab its mutable exports object so the before()
 // hook can swap the gmail() factory. Production imports the same named factory,
@@ -59,6 +63,7 @@ function makeFake(handlers) {
         send: method("messages.send"),
         modify: method("messages.modify"),
         get: method("messages.get"),
+        attachments: { get: method("attachments.get") },
       },
       drafts: { create: method("drafts.create") },
       labels: { list: method("labels.list"), create: method("labels.create") },
@@ -1007,6 +1012,153 @@ test("gmail_get_message fetches a single message and maps headers/body (N1)", as
     body: "the message body",
     label_ids: ["INBOX"],
   });
+});
+
+test("gmail_get_message surfaces attachment metadata so clients can download them", async () => {
+  const { result } = await callTool(
+    "gmail_get_message",
+    { message_id: "m1", account: "alice@example.com" },
+    {
+      "messages.get": {
+        data: {
+          id: "m1",
+          threadId: "t1",
+          labelIds: [],
+          payload: {
+            mimeType: "multipart/mixed",
+            headers: [{ name: "Subject", value: "s" }],
+            parts: [
+              {
+                mimeType: "text/plain",
+                body: { data: utf8("hi").toString("base64url"), size: 2 },
+              },
+              {
+                mimeType: "application/pdf",
+                filename: "report.pdf",
+                headers: [
+                  { name: "Content-Disposition", value: 'attachment; filename="report.pdf"' },
+                ],
+                body: { attachmentId: "ATT1", size: 12345 },
+              },
+            ],
+          },
+        },
+      },
+    }
+  );
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(result.structuredContent.attachments, [
+    {
+      attachment_id: "ATT1",
+      filename: "report.pdf",
+      mime_type: "application/pdf",
+      size: 12345,
+    },
+  ]);
+  assert.equal(result.structuredContent.body, "hi", "attachment must not leak into the body");
+});
+
+test("gmail_get_attachment returns small attachments inline as standard base64", async () => {
+  const bytes = utf8("hello attachment");
+  const { result, calls } = await callTool(
+    "gmail_get_attachment",
+    {
+      message_id: "m1",
+      attachment_id: "ATT1",
+      filename: "notes.txt",
+      account: "alice@example.com",
+    },
+    { "attachments.get": { data: { size: bytes.length, data: bytes.toString("base64url") } } }
+  );
+  assert.equal(result.isError, undefined);
+  const get = calls.find((c) => c.name === "attachments.get");
+  assert.equal(get.params.messageId, "m1");
+  assert.equal(get.params.id, "ATT1");
+  assert.deepEqual(result.structuredContent, {
+    account: "alice@example.com",
+    message_id: "m1",
+    attachment_id: "ATT1",
+    filename: "notes.txt",
+    size: bytes.length,
+    content_base64: bytes.toString("base64"),
+  });
+});
+
+test("gmail_get_attachment mode=inline rejects an oversized attachment with an actionable error", async () => {
+  const big = Buffer.alloc(MAX_INLINE_ATTACHMENT_BYTES + 1);
+  const { result } = await callTool(
+    "gmail_get_attachment",
+    { message_id: "m1", attachment_id: "A", mode: "inline", account: "alice@example.com" },
+    { "attachments.get": { data: { size: big.length, data: big.toString("base64url") } } }
+  );
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /too large to return inline/);
+});
+
+test("gmail_get_attachment mode=auto on an oversized attachment explains the save requirement when saving is disabled", async () => {
+  const prev = process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+  delete process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+  try {
+    const big = Buffer.alloc(MAX_INLINE_ATTACHMENT_BYTES + 1);
+    const { result } = await callTool(
+      "gmail_get_attachment",
+      { message_id: "m1", attachment_id: "A", account: "alice@example.com" },
+      { "attachments.get": { data: { size: big.length, data: big.toString("base64url") } } }
+    );
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /GMAIL_MCP_ATTACHMENTS_DIR/);
+  } finally {
+    if (prev === undefined) delete process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+    else process.env.GMAIL_MCP_ATTACHMENTS_DIR = prev;
+  }
+});
+
+test("gmail_get_attachment mode=save sanitizes hostile filenames and never overwrites", async () => {
+  const prev = process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-dl-"));
+  process.env.GMAIL_MCP_ATTACHMENTS_DIR = dir;
+  try {
+    const bytes = utf8("PDFDATA");
+    const handlers = {
+      "attachments.get": { data: { size: bytes.length, data: bytes.toString("base64url") } },
+    };
+    // A sender-controlled filename must not escape the download directory.
+    const first = await callTool(
+      "gmail_get_attachment",
+      {
+        message_id: "m1",
+        attachment_id: "A",
+        filename: "../../evil.bin",
+        mode: "save",
+        account: "alice@example.com",
+      },
+      handlers
+    );
+    assert.equal(first.result.isError, undefined);
+    const savedTo = first.result.structuredContent.saved_to;
+    assert.equal(path.dirname(savedTo), dir, "must save INSIDE the allowlisted dir");
+    assert.equal(path.basename(savedTo), "evil.bin");
+    assert.equal(fs.readFileSync(savedTo, "utf-8"), "PDFDATA");
+
+    // A second download of the same name uniquifies instead of overwriting.
+    const second = await callTool(
+      "gmail_get_attachment",
+      {
+        message_id: "m1",
+        attachment_id: "A",
+        filename: "evil.bin",
+        mode: "save",
+        account: "alice@example.com",
+      },
+      handlers
+    );
+    assert.equal(second.result.isError, undefined);
+    assert.equal(path.basename(second.result.structuredContent.saved_to), "evil (1).bin");
+  } finally {
+    if (prev === undefined) delete process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+    else process.env.GMAIL_MCP_ATTACHMENTS_DIR = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("gmail_get_message preserves a body up to the full render budget, not the smaller thread cap (L3)", async () => {
