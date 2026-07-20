@@ -72,6 +72,15 @@ export const MAX_THREAD_BODY_CHARS = 20000;
 export const MAX_MESSAGE_BODY_CHARS = CHARACTER_LIMIT;
 
 /**
+ * Largest attachment (raw bytes) gmail_get_attachment returns inline as
+ * base64. Base64 inflates 4/3, so 512 KiB raw is ~700K characters of
+ * structuredContent — large but transportable; the text channel falls back to
+ * jsonTooLargeNotice automatically. Bigger attachments must be saved to disk
+ * via GMAIL_MCP_ATTACHMENTS_DIR instead, where size is no concern.
+ */
+export const MAX_INLINE_ATTACHMENT_BYTES = 512 * 1024;
+
+/**
  * Maximum number of per-thread metadata fetches to run concurrently when
  * expanding search results. Bounds the fan-out so large result sets don't
  * trip Gmail's per-user rate limit.

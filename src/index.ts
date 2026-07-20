@@ -11,6 +11,7 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import path from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { cleanupStaleTokenTemps, listAccounts } from "./auth.js";
@@ -26,16 +27,19 @@ import {
   handleGmailError,
   header,
   jsonTooLargeNotice,
+  listAttachments,
   mapWithConcurrency,
   renderJsonText,
   requireField,
   resolveAttachments,
+  saveAttachment,
   summarizeThread,
   withRetry,
 } from "./gmail.js";
 import {
   CHARACTER_LIMIT,
   isMainModule,
+  MAX_INLINE_ATTACHMENT_BYTES,
   MAX_MESSAGE_BODY_CHARS,
   MAX_THREAD_BODY_CHARS,
   MAX_THREAD_MESSAGES,
@@ -322,8 +326,9 @@ Args:
 Returns: JSON {
   "account": string,
   "thread_id": string,
-  "messages": [ { "message_id": string, "from": string, "to": string, "date": string, "subject": string, "body": string, "label_ids": string[] } ]
+  "messages": [ { "message_id": string, "from": string, "to": string, "date": string, "subject": string, "body": string, "label_ids": string[], "attachments"?: [{ "attachment_id": string, "filename": string, "mime_type": string, "size": number }] } ]
 }
+Each message's "attachments" array (present only when it has any) can be downloaded with gmail_get_attachment.
 
 For very large threads the result may be truncated: "truncated": true is set, and "omitted_message_count" reports how many of the oldest messages were dropped (the newest are kept). When the combined bodies exceed the size budget, the newest messages' bodies are kept and older ones are replaced with an omission marker.`,
     inputSchema: {
@@ -369,15 +374,19 @@ For very large threads the result may be truncated: "truncated": true is set, an
           extractPlainTextSafe(m.payload)
         );
       const capped = cappedNewestFirst.reverse();
-      const messages = capped.map((m) => ({
-        message_id: requireField(m.id, "message.id"),
-        from: decodeRfc2047(header(m.payload, "From")),
-        to: decodeRfc2047(header(m.payload, "To")),
-        date: header(m.payload, "Date"),
-        subject: decodeRfc2047(header(m.payload, "Subject")),
-        body: m.body,
-        label_ids: m.labelIds || [],
-      }));
+      const messages = capped.map((m) => {
+        const attachments = listAttachments(m.payload);
+        return {
+          message_id: requireField(m.id, "message.id"),
+          from: decodeRfc2047(header(m.payload, "From")),
+          to: decodeRfc2047(header(m.payload, "To")),
+          date: header(m.payload, "Date"),
+          subject: decodeRfc2047(header(m.payload, "Subject")),
+          body: m.body,
+          label_ids: m.labelIds || [],
+          ...(attachments.length ? { attachments } : {}),
+        };
+      });
       const truncated = bodyTruncated || omittedMessages > 0;
       const output = {
         account: acct,
@@ -456,9 +465,10 @@ Returns: JSON {
   "date": string,
   "subject": string,
   "body": string,
-  "label_ids": string[]
+  "label_ids": string[],
+  "attachments": [{ "attachment_id": string, "filename": string, "mime_type": string, "size": number }]  // present only when the message has attachments
 }
-A very large body is truncated and "truncated": true is set.`,
+A very large body is truncated and "truncated": true is set. Download an attachment with gmail_get_attachment.`,
     inputSchema: {
       message_id: z.string().min(1).describe("Message ID to fetch"),
       account: accountField,
@@ -489,6 +499,7 @@ A very large body is truncated and "truncated": true is set.`,
         MAX_MESSAGE_BODY_CHARS,
         (x) => extractPlainTextSafe(x.payload)
       );
+      const attachments = listAttachments(m.payload);
       const output = {
         account: acct,
         message_id: requireField(m.id, "message.id"),
@@ -499,11 +510,118 @@ A very large body is truncated and "truncated": true is set.`,
         subject: decodeRfc2047(header(m.payload, "Subject")),
         body: capped[0]?.body ?? "",
         label_ids: m.labelIds || [],
+        ...(attachments.length ? { attachments } : {}),
         ...(truncated ? { truncated: true } : {}),
       };
       const text = renderJsonText(
         output,
         "Message body was large; the complete result is in structuredContent."
+      );
+      return { content: [{ type: "text", text }], structuredContent: output };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: handleGmailError(error) }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// gmail_get_attachment
+// ---------------------------------------------------------------------------
+server.registerTool(
+  "gmail_get_attachment",
+  {
+    title: "Get Gmail Attachment",
+    description: `Download one attachment from a message — inline as base64, or saved to a local file.
+
+Use gmail_get_message or gmail_get_thread first: their "attachments" arrays carry each attachment's attachment_id, filename, and size.
+
+Args:
+  - message_id (string): The message carrying the attachment. Required.
+  - attachment_id (string): The attachment's ID from the message's attachments list. Required.
+  - filename (string, optional): Name used when saving and echoed back. Pass the filename from the attachments list; defaults to "attachment". Sanitized to a safe basename before saving.
+  - mode ("auto" | "inline" | "save", optional): "inline" returns content_base64 (attachments up to ${MAX_INLINE_ATTACHMENT_BYTES} bytes); "save" writes the file into the first GMAIL_MCP_ATTACHMENTS_DIR directory and returns its path; "auto" (default) returns inline when small enough, otherwise saves.
+  - account (string, optional): Which connected account to read from.
+
+Returns: JSON { "account": string, "message_id": string, "attachment_id": string, "filename": string, "size": number } plus either "content_base64" (standard base64) or "saved_to" (absolute path). Saving never overwrites: name collisions get a " (n)" suffix, and in save mode "filename" echoes the name actually saved (sanitized, possibly uniquified) — matching saved_to.`,
+    inputSchema: {
+      message_id: z
+        .string()
+        .min(1)
+        .describe("Message ID that carries the attachment"),
+      attachment_id: z
+        .string()
+        .min(1)
+        .describe("Attachment ID from the message's attachments list"),
+      filename: z
+        .string()
+        .optional()
+        .describe(
+          "Name used when saving (pass the filename from the attachments list)"
+        ),
+      mode: z
+        .enum(["auto", "inline", "save"])
+        .optional()
+        .describe(
+          'Delivery: "inline" (base64, small files), "save" (to GMAIL_MCP_ATTACHMENTS_DIR), or "auto" (default: inline when small enough, else save)'
+        ),
+      account: accountField,
+    },
+    annotations: {
+      // Not read-only: mode "save" writes a file on the server's machine
+      // (inside the GMAIL_MCP_ATTACHMENTS_DIR allowlist). Not destructive:
+      // saving uniquifies on collision and never overwrites.
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async ({ message_id, attachment_id, filename, mode, account }) => {
+    try {
+      const { gmail, account: acct } = gmailFor(account);
+      const res = await withRetry(() =>
+        gmail.users.messages.attachments.get({
+          userId: "me",
+          messageId: message_id,
+          id: attachment_id,
+        })
+      );
+      // Gmail returns attachment bytes base64url-encoded.
+      const bytes = Buffer.from(res.data.data || "", "base64url");
+      const name = filename || "attachment";
+      const chosen = mode ?? "auto";
+      const inlineOk = bytes.length <= MAX_INLINE_ATTACHMENT_BYTES;
+      const base = {
+        account: acct,
+        message_id,
+        attachment_id,
+        filename: name,
+        size: bytes.length,
+      };
+      if (chosen === "inline" && !inlineOk) {
+        throw new Error(
+          `Attachment is ${bytes.length} bytes — too large to return inline ` +
+            `(limit ${MAX_INLINE_ATTACHMENT_BYTES}). Use mode "save" ` +
+            `(requires GMAIL_MCP_ATTACHMENTS_DIR).`
+        );
+      }
+      let output;
+      if (chosen === "save" || !inlineOk) {
+        const savedTo = saveAttachment(bytes, name);
+        // Echo the name ACTUALLY saved (sanitized, possibly uniquified with
+        // " (n)"), not the raw caller-supplied string — a client that records
+        // `filename` as the saved name must not get a traversal-looking or
+        // pre-collision value that contradicts saved_to.
+        output = { ...base, filename: path.basename(savedTo), saved_to: savedTo };
+      } else {
+        output = { ...base, content_base64: bytes.toString("base64") };
+      }
+      const text = renderJsonText(
+        output,
+        "Attachment content is in structuredContent."
       );
       return { content: [{ type: "text", text }], structuredContent: output };
     } catch (error) {
