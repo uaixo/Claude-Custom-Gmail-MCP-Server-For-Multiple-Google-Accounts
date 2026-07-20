@@ -1113,6 +1113,32 @@ test("gmail_get_attachment mode=auto on an oversized attachment explains the sav
   }
 });
 
+test("gmail_get_attachment reports a save failure as a local disk problem, not a Gmail network error", async () => {
+  // A raw fs errno error carries a string `code`, which handleGmailError's
+  // transport heuristic reads as "Network error (...) reaching Gmail. Check
+  // connectivity and retry." — wrong diagnosis and futile advice for a local
+  // misconfiguration. saveAttachment must wrap fs failures in codeless Errors.
+  const prev = process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+  process.env.GMAIL_MCP_ATTACHMENTS_DIR = path.join(
+    os.tmpdir(),
+    "gmail-mcp-definitely-does-not-exist-" + process.pid
+  );
+  try {
+    const bytes = utf8("DATA");
+    const { result } = await callTool(
+      "gmail_get_attachment",
+      { message_id: "m1", attachment_id: "A", mode: "save", account: "alice@example.com" },
+      { "attachments.get": { data: { size: bytes.length, data: bytes.toString("base64url") } } }
+    );
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /exists and is writable/);
+    assert.doesNotMatch(result.content[0].text, /Network error/);
+  } finally {
+    if (prev === undefined) delete process.env.GMAIL_MCP_ATTACHMENTS_DIR;
+    else process.env.GMAIL_MCP_ATTACHMENTS_DIR = prev;
+  }
+});
+
 test("gmail_get_attachment mode=save sanitizes hostile filenames and never overwrites", async () => {
   const prev = process.env.GMAIL_MCP_ATTACHMENTS_DIR;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-dl-"));
@@ -1138,6 +1164,11 @@ test("gmail_get_attachment mode=save sanitizes hostile filenames and never overw
     const savedTo = first.result.structuredContent.saved_to;
     assert.equal(path.dirname(savedTo), dir, "must save INSIDE the allowlisted dir");
     assert.equal(path.basename(savedTo), "evil.bin");
+    assert.equal(
+      first.result.structuredContent.filename,
+      "evil.bin",
+      "filename must echo the SAVED name, not the raw traversal input"
+    );
     assert.equal(fs.readFileSync(savedTo, "utf-8"), "PDFDATA");
 
     // A second download of the same name uniquifies instead of overwriting.
@@ -1154,6 +1185,11 @@ test("gmail_get_attachment mode=save sanitizes hostile filenames and never overw
     );
     assert.equal(second.result.isError, undefined);
     assert.equal(path.basename(second.result.structuredContent.saved_to), "evil (1).bin");
+    assert.equal(
+      second.result.structuredContent.filename,
+      "evil (1).bin",
+      "filename must reflect the uniquified name actually saved"
+    );
   } finally {
     if (prev === undefined) delete process.env.GMAIL_MCP_ATTACHMENTS_DIR;
     else process.env.GMAIL_MCP_ATTACHMENTS_DIR = prev;

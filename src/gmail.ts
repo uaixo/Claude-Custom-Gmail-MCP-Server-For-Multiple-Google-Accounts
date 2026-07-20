@@ -498,22 +498,66 @@ export function listAttachments(
 }
 
 /**
+ * Byte cap for a sanitized attachment basename. Filesystems commonly limit
+ * names to 255 BYTES (Linux NAME_MAX, macOS, NTFS in UTF-16 units); staying
+ * comfortably under leaves room for the " (n)" uniquify suffix and multi-byte
+ * boundaries, so an overlong sender-controlled name degrades to a truncated
+ * save instead of failing every attempt with ENAMETOOLONG.
+ */
+const MAX_ATTACHMENT_NAME_BYTES = 200;
+
+/** Windows reserved device names — invalid as a filename stem on Windows. */
+const WINDOWS_DEVICE_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+/**
  * Reduce an attachment filename to a safe basename for saving. Attachment
- * names are ATTACKER-CONTROLLED (the sender picks them): strip directory
- * components so "../../../etc/passwd" or "..\\evil.exe" can't escape the
- * download directory, replace control characters and Windows-reserved
- * characters, and never return an empty or dots-only name.
+ * names are ATTACKER-CONTROLLED (the sender picks them):
+ *  - strip directory components so "../../../etc/passwd" or "..\\evil.exe"
+ *    can't escape the download directory;
+ *  - replace control characters, Windows-reserved characters, and bidi
+ *    override characters (which visually reverse "annexe.txt" into a name
+ *    reading as ".exe" in file listings);
+ *  - strip trailing dots/spaces (Windows silently drops them, so
+ *    "evil.exe." would materialize as evil.exe);
+ *  - neutralize Windows reserved device stems (CON, NUL, COM1, ... — with or
+ *    without an extension) by prefixing "_";
+ *  - truncate to a byte budget so an overlong name can't make every save
+ *    attempt fail with ENAMETOOLONG;
+ *  - never return an empty or dots-only name.
  */
 export function sanitizeAttachmentFilename(name: string): string {
   const base = name.split(/[/\\]/).pop() || "";
   let cleaned = "";
   for (const ch of base) {
     const code = ch.codePointAt(0) ?? 0;
+    const isBidi =
+      (code >= 0x202a && code <= 0x202e) || (code >= 0x2066 && code <= 0x2069);
     cleaned +=
-      code < 0x20 || code === 0x7f || '<>:"|?*'.includes(ch) ? "_" : ch;
+      code < 0x20 || code === 0x7f || isBidi || '<>:"|?*'.includes(ch)
+        ? "_"
+        : ch;
   }
-  cleaned = cleaned.trim();
+  cleaned = cleaned.trim().replace(/[. ]+$/, "");
   if (cleaned === "" || /^\.+$/.test(cleaned)) return "attachment";
+  const stem = cleaned.split(".")[0] ?? "";
+  if (WINDOWS_DEVICE_NAMES.test(stem)) cleaned = `_${cleaned}`;
+  if (Buffer.byteLength(cleaned, "utf-8") > MAX_ATTACHMENT_NAME_BYTES) {
+    // Chop code points off the STEM, preserving the extension (itself bounded
+    // by the same budget in the degenerate all-extension case).
+    const ext = path.extname(cleaned);
+    const extBytes = Buffer.byteLength(ext, "utf-8");
+    const keepExt = extBytes <= 50 ? ext : "";
+    const budget = MAX_ATTACHMENT_NAME_BYTES - Buffer.byteLength(keepExt, "utf-8");
+    let head = cleaned.slice(0, cleaned.length - ext.length);
+    while (head.length > 0 && Buffer.byteLength(head, "utf-8") > budget) {
+      head = head.slice(0, -1);
+      // Never end on a lone high surrogate (a split pair is ill-formed).
+      const tail = head.charCodeAt(head.length - 1);
+      if (tail >= 0xd800 && tail <= 0xdbff) head = head.slice(0, -1);
+    }
+    cleaned = head + keepExt;
+    if (cleaned === "" || /^\.+$/.test(cleaned)) return "attachment";
+  }
   return cleaned;
 }
 
@@ -549,7 +593,24 @@ export function saveAttachment(bytes: Buffer, filename: string): string {
       }
       return candidate;
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        // Wrap in a PLAIN Error (no errno `code`): handleGmailError treats any
+        // string-coded error as a transport failure and would report a local
+        // disk/config problem as "Network error (...) reaching Gmail. Check
+        // connectivity and retry." — the wrong diagnosis and futile advice.
+        // The send path keeps the same invariant (resolveAttachments throws
+        // codeless Errors for every fs failure). Deliberately NO `cause`
+        // either: handleGmailError also sniffs cause.code as a transport
+        // signal, which would resurrect the exact misreport this wrap
+        // prevents; the errno and original message are embedded in the text.
+        // eslint-disable-next-line preserve-caught-error
+        throw new Error(
+          `Could not save attachment to '${dir}' ` +
+            `(${code ?? "error"}: ${(e as Error).message}). Check that the ` +
+            `GMAIL_MCP_ATTACHMENTS_DIR directory exists and is writable.`
+        );
+      }
     }
   }
   throw new Error(

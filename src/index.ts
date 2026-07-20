@@ -11,6 +11,7 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import path from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { cleanupStaleTokenTemps, listAccounts } from "./auth.js";
@@ -544,7 +545,7 @@ Args:
   - mode ("auto" | "inline" | "save", optional): "inline" returns content_base64 (attachments up to ${MAX_INLINE_ATTACHMENT_BYTES} bytes); "save" writes the file into the first GMAIL_MCP_ATTACHMENTS_DIR directory and returns its path; "auto" (default) returns inline when small enough, otherwise saves.
   - account (string, optional): Which connected account to read from.
 
-Returns: JSON { "account": string, "message_id": string, "attachment_id": string, "filename": string, "size": number } plus either "content_base64" (standard base64) or "saved_to" (absolute path). Saving never overwrites: name collisions get a " (n)" suffix.`,
+Returns: JSON { "account": string, "message_id": string, "attachment_id": string, "filename": string, "size": number } plus either "content_base64" (standard base64) or "saved_to" (absolute path). Saving never overwrites: name collisions get a " (n)" suffix, and in save mode "filename" echoes the name actually saved (sanitized, possibly uniquified) — matching saved_to.`,
     inputSchema: {
       message_id: z
         .string()
@@ -607,10 +608,17 @@ Returns: JSON { "account": string, "message_id": string, "attachment_id": string
             `(requires GMAIL_MCP_ATTACHMENTS_DIR).`
         );
       }
-      const output =
-        chosen === "save" || !inlineOk
-          ? { ...base, saved_to: saveAttachment(bytes, name) }
-          : { ...base, content_base64: bytes.toString("base64") };
+      let output;
+      if (chosen === "save" || !inlineOk) {
+        const savedTo = saveAttachment(bytes, name);
+        // Echo the name ACTUALLY saved (sanitized, possibly uniquified with
+        // " (n)"), not the raw caller-supplied string — a client that records
+        // `filename` as the saved name must not get a traversal-looking or
+        // pre-collision value that contradicts saved_to.
+        output = { ...base, filename: path.basename(savedTo), saved_to: savedTo };
+      } else {
+        output = { ...base, content_base64: bytes.toString("base64") };
+      }
       const text = renderJsonText(
         output,
         "Attachment content is in structuredContent."

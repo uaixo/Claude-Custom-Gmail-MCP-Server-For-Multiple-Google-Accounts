@@ -233,7 +233,7 @@ Then restart Claude Desktop. Your connected accounts persist across updates — 
 | --- | --- | --- |
 | `GMAIL_MCP_DATA_DIR` | `~/.gmail-mcp` | Where tokens and `credentials*.json` files live |
 | `GMAIL_OAUTH_CREDENTIALS` | (unset) | Force a single OAuth client JSON path; disables `credentials*.json` auto-discovery |
-| `GMAIL_MCP_ATTACHMENTS_DIR` | (unset) | Allowlist of directories (separated by the platform path delimiter) that `path` attachments may be read from. Unset means `path` is disabled and only `content_base64` works |
+| `GMAIL_MCP_ATTACHMENTS_DIR` | (unset) | Allowlist of directories (separated by the platform path delimiter) with two roles: outgoing `path` attachments may be read from any of them, and `gmail_get_attachment` saves downloads into the **first** one. Unset means outgoing `path` is disabled (only `content_base64` works) and downloads are inline-only (saving/large attachments unavailable) |
 | `GMAIL_MCP_LOCK_TIMEOUT_MS` | `12000` | How long to wait for the token-store lock before failing a write rather than risking a lost update |
 | `GMAIL_MCP_REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout for Gmail API calls; a stalled request fails fast (and is retried for read operations) instead of hanging |
 

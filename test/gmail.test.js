@@ -2200,6 +2200,31 @@ test("sanitizeAttachmentFilename strips traversal, control chars, and reserved c
   assert.equal(sanitizeAttachmentFilename("日本語レポート.pdf"), "日本語レポート.pdf");
 });
 
+test("sanitizeAttachmentFilename neutralizes Windows-hostile names (devices, trailing dots, bidi, overlong)", () => {
+  // Reserved device stems — with or without an extension — are invalid on
+  // Windows (CreateFile resolves them to the device).
+  assert.equal(sanitizeAttachmentFilename("CON"), "_CON");
+  assert.equal(sanitizeAttachmentFilename("nul.txt"), "_nul.txt");
+  assert.equal(sanitizeAttachmentFilename("COM5.log"), "_COM5.log");
+  assert.equal(sanitizeAttachmentFilename("console.txt"), "console.txt", "only exact device stems");
+  // Windows silently strips trailing dots/spaces, so "evil.exe." would
+  // materialize as evil.exe — strip them ourselves, deterministically.
+  assert.equal(sanitizeAttachmentFilename("evil.exe."), "evil.exe");
+  assert.equal(sanitizeAttachmentFilename("report.pdf   "), "report.pdf");
+  // Bidi overrides visually reverse names ("annexe.txt" reading as ".exe").
+  assert.equal(sanitizeAttachmentFilename("report‮gnp.exe"), "report_gnp.exe");
+  // Overlong names are truncated (extension preserved) instead of failing
+  // every save attempt with ENAMETOOLONG.
+  const long = sanitizeAttachmentFilename("x".repeat(300) + ".pdf");
+  assert.ok(Buffer.byteLength(long, "utf-8") <= 200, `still ${Buffer.byteLength(long, "utf-8")} bytes`);
+  assert.ok(long.endsWith(".pdf"));
+  // Multi-byte truncation never splits a code point (round-trips cleanly).
+  const cjk = sanitizeAttachmentFilename("あ".repeat(120) + ".txt");
+  assert.ok(Buffer.byteLength(cjk, "utf-8") <= 200);
+  assert.ok(cjk.endsWith(".txt"));
+  assert.equal(Buffer.from(cjk, "utf-8").toString("utf-8"), cjk, "no split code points");
+});
+
 test("saveAttachment requires the allowlist, saves inside it, and uniquifies collisions", () => {
   const prev = process.env.GMAIL_MCP_ATTACHMENTS_DIR;
   delete process.env.GMAIL_MCP_ATTACHMENTS_DIR;
